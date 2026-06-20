@@ -8,10 +8,12 @@ pub mod interpreter;
 pub mod local_vars;
 pub mod operand_stack;
 pub mod slot;
+pub mod vm;
 
 pub use frame::{Frame, FrameError};
 pub use heap::Heap;
-pub use interpreter::{ClassProvider, Interpreter, Value, VmError};
+pub use interpreter::{Interpreter, Value, VmError};
 pub use local_vars::LocalVars;
 pub use operand_stack::OperandStack;
 pub use slot::{Reference, Slot};
+pub use vm::Vm;

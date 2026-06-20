@@ -7,14 +7,13 @@
 
 mod invoke;
 
-pub use invoke::ClassProvider;
-
 use crate::bytecode::opcode::{BytecodeError, Opcode};
 use crate::classfile::ClassFileError;
 use crate::constant_pool::entry::ConstantPoolEntry;
 use crate::constant_pool::ConstantPool;
 
 use super::frame::{Frame, FrameError};
+use super::Vm;
 
 /// 解释器执行结果值。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,30 +76,11 @@ impl From<BytecodeError> for VmError {
 pub struct Interpreter<'a> {
     code: &'a [u8],
     cp: &'a ConstantPool,
-    /// 类解析上下文;`Some` 时 `invokestatic` 可解析同类内目标方法并递归执行。
-    classes: Option<&'a dyn ClassProvider>,
 }
 
 impl<'a> Interpreter<'a> {
     pub fn new(code: &'a [u8], cp: &'a ConstantPool) -> Self {
-        Self {
-            code,
-            cp,
-            classes: None,
-        }
-    }
-
-    /// 构造带类解析上下文的解释器:使 `invokestatic` 能解析同类内目标方法。
-    pub fn with_classes(
-        code: &'a [u8],
-        cp: &'a ConstantPool,
-        classes: &'a dyn ClassProvider,
-    ) -> Self {
-        Self {
-            code,
-            cp,
-            classes: Some(classes),
-        }
+        Self { code, cp }
     }
 
     /// 当前字节码所属的常量池(供 invoke 子模块解析 Methodref)。
@@ -108,13 +88,16 @@ impl<'a> Interpreter<'a> {
         self.cp
     }
 
-    /// 类解析上下文(供 invoke 子模块查找目标类);无则 `invokestatic` 失败。
-    pub(crate) fn classes(&self) -> Option<&'a dyn ClassProvider> {
-        self.classes
+    /// 便捷入口:无对象/类上下文,用默认空 [`Vm`] 执行(纯数值路径)。
+    ///
+    /// 既有单帧测试与此路径兼容;需要对象/字段/`invokestatic` 时用 [`Self::interpret_with`]。
+    pub fn interpret(&self, frame: &mut Frame) -> Result<Value, VmError> {
+        let mut vm = Vm::default();
+        self.interpret_with(frame, &mut vm)
     }
 
-    /// 在 `frame` 上执行至 `*return`;返回结果值。
-    pub fn interpret(&self, frame: &mut Frame) -> Result<Value, VmError> {
+    /// 带 [`Vm`](对象堆 + 类注册表)执行至 `*return`;对象/字段/`invokestatic` 经此路径。
+    pub fn interpret_with(&self, frame: &mut Frame, vm: &mut Vm<'_>) -> Result<Value, VmError> {
         let mut pc: usize = 0;
         loop {
             if pc >= self.code.len() {
@@ -775,7 +758,7 @@ impl<'a> Interpreter<'a> {
                 // ---- 方法调用(invokestatic:同类内,含递归与互调)----
                 Opcode::Invokestatic => {
                     let index = self.read_u2(pc + 1)?;
-                    invoke::invoke_static(self, frame, index)?;
+                    invoke::invoke_static(self, frame, vm, index)?;
                     pc += 3;
                 }
                 Opcode::Return => return Ok(Value::Void),

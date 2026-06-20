@@ -3,27 +3,18 @@
 //! 对应 HotSpot `interpreter/zero/bytecodeInterpreter.cpp` 的 `CASE(_invokestatic)`
 //! 分支与 `Bytecode_invoke::static_target()`。本增量实现**同类内**(含递归与互调)
 //! 的 `invokestatic`;`invokevirtual`/`invokespecial`/`invokeinterface` 需要对象模型,
-//! 留待后续层。跨类调用只需在 [`ClassProvider`] 上扩展即可。
+//! 留待后续层。跨类调用只需在类注册表([`crate::oops::ClassRegistry`])中加载更多类即可。
 //!
-//! **帧管理**:用 Rust 调用栈作为隐式调用栈(每次 `invokestatic` 递归 `interpret`)。
+//! **帧管理**:用 Rust 调用栈作为隐式调用栈(每次 `invokestatic` 递归 `interpret_with`)。
 //! 这是"简易帧管理器":正确、安全、零额外结构。显式帧栈(用于深度上限 /
 //! `StackOverflowError` 检测)留待对象模型层。
 
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_method_descriptor, FieldType, ReturnDescriptor};
 use crate::metadata::{ClassFile, MethodInfo};
-use crate::runtime::{Frame, LocalVars};
+use crate::runtime::{Frame, LocalVars, Vm};
 
 use super::{Interpreter, Value, VmError};
-
-/// 按类的内部名提供已加载的 [`ClassFile`],用于解析 `invokestatic` 的目标方法。
-///
-/// 本增量只需一个实现需求:返回当前已加载的同一个类(同类自调/递归)。
-/// 后续类加载器实现该 trait 即可支持跨类调用。
-pub trait ClassProvider {
-    /// 按内部名(如 `java/lang/String`)取已加载的类;未加载返回 `None`。
-    fn class_by_name(&self, name: &str) -> Option<&ClassFile>;
-}
 
 /// 解析 `Methodref` 常量池条目 → `(类内部名, 方法名, 描述符)`。
 ///
@@ -152,21 +143,22 @@ fn push_return(frame: &mut Frame, v: Value) -> Result<(), VmError> {
 /// 执行 `invokestatic`:解析目标方法、传递实参、递归解释、回填返回值。
 ///
 /// 由分派循环读取 u2 索引后调用;返回后由调用方推进 `pc += 3`。
-/// "帧管理"即 Rust 调用栈:此处构造被调用者栈帧并递归 `interpret`,
+/// "帧管理"即 Rust 调用栈:此处构造被调用者栈帧并递归 `interpret_with`,
 /// 返回后回到本帧继续执行。
 pub(super) fn invoke_static(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
+    vm: &mut Vm<'_>,
     methodref_index: u16,
 ) -> Result<(), VmError> {
-    let classes = interp.classes().ok_or(VmError::BadConstant(
-        "invokestatic 需要类解析上下文(ClassProvider)",
-    ))?;
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("invokestatic 需要类注册表"))?;
     let (class_name, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
-    let target_cf = classes
-        .class_by_name(&class_name)
+    let target_lc = registry
+        .get(&class_name)
         .ok_or(VmError::BadConstant("invokestatic 目标类未加载"))?;
-    let target_method = find_method(target_cf, &method_name, &desc)?;
+    let target_method = find_method(&target_lc.cf, &method_name, &desc)?;
     let code = target_method
         .code
         .as_ref()
@@ -191,9 +183,9 @@ pub(super) fn invoke_static(
             .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
     }
 
-    // 递归:用目标方法的字节码与常量池构造新解释器,沿用同一类解析上下文。
-    let callee_interp = Interpreter::with_classes(&code.code, &target_cf.constant_pool, classes);
-    let result = callee_interp.interpret(&mut callee)?;
+    // 递归:用目标方法的字节码与常量池构造新解释器,沿用同一 Vm(堆 + 注册表)。
+    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
+    let result = callee_interp.interpret_with(&mut callee, vm)?;
 
     // 按描述符返回类型回填:void 不压栈;非 void 压返回值;类型不符报错。
     match (md.return_type, result) {

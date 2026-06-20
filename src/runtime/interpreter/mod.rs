@@ -5,6 +5,10 @@
 //!
 //! 3.1:仅 int 核心子集;清单外指令返回 [`VmError::UnsupportedOpcode`]。
 
+mod invoke;
+
+pub use invoke::ClassProvider;
+
 use crate::bytecode::opcode::{BytecodeError, Opcode};
 use crate::classfile::ClassFileError;
 use crate::constant_pool::entry::ConstantPoolEntry;
@@ -73,11 +77,40 @@ impl From<BytecodeError> for VmError {
 pub struct Interpreter<'a> {
     code: &'a [u8],
     cp: &'a ConstantPool,
+    /// 类解析上下文;`Some` 时 `invokestatic` 可解析同类内目标方法并递归执行。
+    classes: Option<&'a dyn ClassProvider>,
 }
 
 impl<'a> Interpreter<'a> {
     pub fn new(code: &'a [u8], cp: &'a ConstantPool) -> Self {
-        Self { code, cp }
+        Self {
+            code,
+            cp,
+            classes: None,
+        }
+    }
+
+    /// 构造带类解析上下文的解释器:使 `invokestatic` 能解析同类内目标方法。
+    pub fn with_classes(
+        code: &'a [u8],
+        cp: &'a ConstantPool,
+        classes: &'a dyn ClassProvider,
+    ) -> Self {
+        Self {
+            code,
+            cp,
+            classes: Some(classes),
+        }
+    }
+
+    /// 当前字节码所属的常量池(供 invoke 子模块解析 Methodref)。
+    pub(crate) fn cp(&self) -> &'a ConstantPool {
+        self.cp
+    }
+
+    /// 类解析上下文(供 invoke 子模块查找目标类);无则 `invokestatic` 失败。
+    pub(crate) fn classes(&self) -> Option<&'a dyn ClassProvider> {
+        self.classes
     }
 
     /// 在 `frame` 上执行至 `*return`;返回结果值。
@@ -738,6 +771,12 @@ impl<'a> Interpreter<'a> {
                 Opcode::Goto => {
                     let off = self.read_s2(pc + 1)?;
                     pc = Self::branch_target(pc, off)?;
+                }
+                // ---- 方法调用(invokestatic:同类内,含递归与互调)----
+                Opcode::Invokestatic => {
+                    let index = self.read_u2(pc + 1)?;
+                    invoke::invoke_static(self, frame, index)?;
+                    pc += 3;
                 }
                 Opcode::Return => return Ok(Value::Void),
                 Opcode::Ireturn => {

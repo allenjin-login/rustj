@@ -207,3 +207,72 @@ fn branch(pc: usize, offset: i64) -> Result<usize, VmError> {
 | 分支 `usize` 下溢 | `branch()` 用 `i64` 中间量 + 符号判定 |
 | 整数语义细微偏差(irem 截断方向、移位掩码) | 每个 opcode 一条专门单测锁定;对照 JVMS |
 | 操作数读取越界导致 panic | 全部走 `read_u1/u2/s1/s2` 返回 `VmError`,循环内 `?` 传播,无 unwrap/索引裸用 |
+
+## 11. 3.3 方法调用(实现纪要)
+
+**范围**:同类内 `invokestatic`(含递归与互调)。`invokevirtual`/`invokespecial`/
+`invokeinterface` 需要对象模型(`this`/虚分派),留待后续层;跨类 `invokestatic`
+(如 `java.lang.Math.sqrt`)需要类加载器,后续实现 `ClassProvider` 即可。
+
+### 11.1 模块拆分
+
+`runtime::interpreter` 增 `invoke.rs` 子模块,承载全部调用逻辑,`mod.rs` 仅在分派循环
+加一个 `Invokestatic` 臂调用 `invoke::invoke_static`:
+
+```
+src/runtime/interpreter/
+  mod.rs     // 分派循环 + Invokestatic 臂(read u2 → invoke_static → pc+=3)
+  invoke.rs  // ClassProvider、resolve_methodref、find_method、实参传递、invoke_static
+```
+
+### 11.2 类解析上下文(`ClassProvider`)
+
+```rust
+pub trait ClassProvider {
+    fn class_by_name(&self, name: &str) -> Option<&ClassFile>;
+}
+```
+
+`Interpreter` 增 `classes: Option<&'a dyn ClassProvider>` 字段。`new()` 置 `None`
+(单帧语义不变,既有测试零改动);`with_classes(code, cp, classes)` 启用调用支持。
+集成测试用一个只持单类的 `OneClass` 实现该 trait。
+
+### 11.3 帧管理:Rust 调用栈即隐式调用栈
+
+每次 `invokestatic` 构造被调用者 `Frame`,用目标方法的 `code`+`cp`+同一 `classes`
+新建 `Interpreter` 并**递归** `interpret`,返回后回填返回值。这是"简易帧管理器":
+正确、安全、零额外结构。显式帧栈(用于深度上限 / `StackOverflowError` 检测)留待
+对象模型层。深度递归受 Rust 栈约束(测试用例深度有限,安全)。
+
+### 11.4 `invokestatic` 流程
+
+1. `read_u2(pc+1)` 取 Methodref 索引。
+2. `resolve_methodref(cp, idx)` → `(类内部名, 方法名, 描述符)`(解 `Methodref`→
+   `Class`→`Utf8`、`NameAndType`→`Utf8`)。
+3. `class_by_name` → 目标 `ClassFile`;`find_method` 按名+描述符定位 `MethodInfo`
+   → 取 `Code`。
+4. `parse_method_descriptor` → 形参 `FieldType` 列表 + 返回类型。
+5. **实参传递**:形参逆序 `pop_arg`(long/double `pop2`,其余 `pop1`;引用类型报错)
+   → 翻转正序 → `store_arg` 按槽位写入被调用者局部变量(long/double 占 2 槽)。
+6. 递归 `interpret`;按返回类型回填:`Void` 不压栈,`FieldType` 压对应类型返回值,
+   类型不符报 `BadConstant`。
+7. `pc += 3`(`invokestatic` 为 opcode + u2)。
+
+### 11.5 与 HotSpot 的差异
+
+| 点 | HotSpot (C++) | rustj |
+|----|---------------|-------|
+| 帧管理 | 显式 `JavaThread::_stack` 压/弹栈帧 | Rust 调用栈递归(简易) |
+| 实参 | `stack` 指针搬运 | `pop_arg`/`store_arg` 类型化传递 |
+| 解析 | `LinkResolver::resolve_static_call` | `ClassProvider` + `find_method` |
+| 校验 | 链接期 `invokestatic` 静态性检查 | 信任 `javac`,不查 `ACC_STATIC` |
+
+### 11.6 测试
+
+- 单元(`invoke.rs`):`resolve_methodref` 用手搓常量池(Methodref/Class/NameAndType/Utf8
+  链)锁定解析。
+- 集成(`tests/interpret_method_invocation.rs`):`javac` 编译 `Recursion`(递归
+  `factorial`/`fib`/`ackermann`、互调 `sumOfSquares`→`square`)与 `Mixed`
+  (混合数值实参 `pow(JI)J`/`shift(IJ)J`/`powDouble(DI)D`/`powFloat(FI)F`),执行结果
+  与 JVM 一致。
+

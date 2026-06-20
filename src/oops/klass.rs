@@ -69,6 +69,22 @@ impl LoadedClass {
         self.super_class_name.as_deref()
     }
 
+    /// 直接实现的接口内部名(解析 `cf.interfaces` 的 `Class` 条目)。
+    pub fn interface_names(&self) -> Vec<String> {
+        let cp = &self.cf.constant_pool;
+        self.cf
+            .interfaces
+            .iter()
+            .filter_map(|&idx| match cp.get(idx).ok()? {
+                ConstantPoolEntry::Class { name_index } => match cp.get(*name_index).ok()? {
+                    ConstantPoolEntry::Utf8(s) => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
     /// 从 `ClassFile` 解析字段布局(本类字段;静态字段默认初始化)+ 超类名。
     fn from_cf(cf: ClassFile) -> Result<Self, ClassFileError> {
         let layout = resolve_fields(&cf.constant_pool, &cf.fields)?;
@@ -325,5 +341,56 @@ mod tests {
         assert_eq!(stat[0].name, "count");
         assert_eq!(stat[0].descriptor, FieldType::Int);
         assert_eq!(storage, vec![Slot::Int(0)]); // 静态默认值
+    }
+
+    /// 构建常量池:先放 utf8s(索引从 1 起),再放 classes(每个 = 指向某 utf8 索引的 Class 条目)。
+    fn mk_cp(utf8s: &[&str], classes: &[u16]) -> ConstantPool {
+        let count = (utf8s.len() + classes.len() + 1) as u16;
+        let mut b = count.to_be_bytes().to_vec();
+        for s in utf8s {
+            b.push(0x01); // Utf8
+            b.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            b.extend_from_slice(s.as_bytes());
+        }
+        for &name_idx in classes {
+            b.push(0x07); // Class
+            b.extend_from_slice(&name_idx.to_be_bytes());
+        }
+        ConstantPool::parse(&mut Reader::new(&b)).unwrap()
+    }
+
+    /// 构造 ClassFile(空字段表;方法表可填)。
+    fn mk_cf(
+        cp: ConstantPool,
+        this: u16,
+        super_c: u16,
+        interfaces: Vec<u16>,
+        methods: Vec<MethodInfo>,
+    ) -> ClassFile {
+        ClassFile {
+            minor_version: 0,
+            major_version: 52,
+            constant_pool: cp,
+            access_flags: AccessFlags::from_bits(0),
+            this_class: this,
+            super_class: super_c,
+            interfaces,
+            fields: Vec::new(),
+            methods,
+            attributes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn interface_names_resolves_cp_class_entries() {
+        // utf8: [1]="C",[2]="java/lang/Object",[3]="I1",[4]="I2"
+        // classes[1,2,3,4] → [5]=Class{1}="C",[6]=Class{2}=Object,[7]=Class{3}="I1",[8]=Class{4}="I2"
+        let pool = mk_cp(&["C", "java/lang/Object", "I1", "I2"], &[1, 2, 3, 4]);
+        let cf = mk_cf(pool, 5, 6, vec![7, 8], vec![]);
+        let lc = LoadedClass::from_cf(cf).unwrap();
+        assert_eq!(
+            lc.interface_names(),
+            vec!["I1".to_string(), "I2".to_string()]
+        );
     }
 }

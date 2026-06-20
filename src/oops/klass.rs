@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use std::cell::RefCell;
+
 use crate::classfile::ClassFileError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_field_descriptor, FieldType};
@@ -22,11 +24,15 @@ pub struct ResolvedField {
 }
 
 /// 已加载的类:`ClassFile` + 实例/静态字段布局 + 静态字段存储。
+///
+/// `static_storage` 用 [`RefCell`] 承载:静态字段是**类级可变状态**(putstatic 写入),
+/// 对应 HotSpot `InstanceKlass` 中就地持有的静态字段区;注册表以不可变引用暴露
+/// `LoadedClass`,静态字段经 `RefCell` 内部可变性写入。
 pub struct LoadedClass {
     pub cf: ClassFile,
     instance_fields: Vec<ResolvedField>,
     static_fields: Vec<ResolvedField>,
-    pub static_storage: Vec<Slot>,
+    pub static_storage: RefCell<Vec<Slot>>,
 }
 
 impl LoadedClass {
@@ -72,7 +78,7 @@ impl LoadedClass {
             cf,
             instance_fields: layout.instance_fields,
             static_fields: layout.static_fields,
-            static_storage: layout.static_storage,
+            static_storage: RefCell::new(layout.static_storage),
         })
     }
 }

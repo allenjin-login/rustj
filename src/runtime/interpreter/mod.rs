@@ -5,6 +5,7 @@
 //!
 //! 3.1:仅 int 核心子集;清单外指令返回 [`VmError::UnsupportedOpcode`]。
 
+mod field;
 mod invoke;
 
 use crate::bytecode::opcode::{BytecodeError, Opcode};
@@ -13,6 +14,7 @@ use crate::constant_pool::entry::ConstantPoolEntry;
 use crate::constant_pool::ConstantPool;
 
 use super::frame::{Frame, FrameError};
+use super::slot::Reference;
 use super::Vm;
 
 /// 解释器执行结果值。
@@ -40,6 +42,8 @@ pub enum VmError {
     ConstantPool(ClassFileError),
     /// ldc 等取到非预期类型的常量。
     BadConstant(&'static str),
+    /// NullPointerException:对 null 引用取字段/数组。
+    NullPointer,
 }
 
 impl std::fmt::Display for VmError {
@@ -51,6 +55,7 @@ impl std::fmt::Display for VmError {
             Self::Frame(e) => write!(f, "frame error: {e:?}"),
             Self::ConstantPool(e) => write!(f, "constant pool: {e:?}"),
             Self::BadConstant(msg) => write!(f, "bad constant: {msg}"),
+            Self::NullPointer => write!(f, "NullPointerException"),
         }
     }
 }
@@ -200,6 +205,54 @@ impl<'a> Interpreter<'a> {
                 Opcode::Istore3 => {
                     let v = frame.operands.pop_int()?;
                     frame.locals.set_int(3, v)?;
+                    pc += 1;
+                }
+                // ---- 引用局部变量(aload/astore)----
+                Opcode::Aload => {
+                    let idx = self.read_u1(pc + 1)? as u16;
+                    frame.operands.push_reference(frame.locals.get_reference(idx)?)?;
+                    pc += 2;
+                }
+                Opcode::Aload0 => {
+                    frame.operands.push_reference(frame.locals.get_reference(0)?)?;
+                    pc += 1;
+                }
+                Opcode::Aload1 => {
+                    frame.operands.push_reference(frame.locals.get_reference(1)?)?;
+                    pc += 1;
+                }
+                Opcode::Aload2 => {
+                    frame.operands.push_reference(frame.locals.get_reference(2)?)?;
+                    pc += 1;
+                }
+                Opcode::Aload3 => {
+                    frame.operands.push_reference(frame.locals.get_reference(3)?)?;
+                    pc += 1;
+                }
+                Opcode::Astore => {
+                    let idx = self.read_u1(pc + 1)? as u16;
+                    let v = frame.operands.pop_reference()?;
+                    frame.locals.set_reference(idx, v)?;
+                    pc += 2;
+                }
+                Opcode::Astore0 => {
+                    let v = frame.operands.pop_reference()?;
+                    frame.locals.set_reference(0, v)?;
+                    pc += 1;
+                }
+                Opcode::Astore1 => {
+                    let v = frame.operands.pop_reference()?;
+                    frame.locals.set_reference(1, v)?;
+                    pc += 1;
+                }
+                Opcode::Astore2 => {
+                    let v = frame.operands.pop_reference()?;
+                    frame.locals.set_reference(2, v)?;
+                    pc += 1;
+                }
+                Opcode::Astore3 => {
+                    let v = frame.operands.pop_reference()?;
+                    frame.locals.set_reference(3, v)?;
                     pc += 1;
                 }
                 // ---- 整数算术(补码回绕)----
@@ -736,6 +789,36 @@ impl<'a> Interpreter<'a> {
                     frame.operands.pop_slot()?;
                     pc += 1;
                 }
+                // ---- 对象与字段(4.1)----
+                Opcode::AconstNull => {
+                    frame.operands.push_reference(Reference::null())?;
+                    pc += 1;
+                }
+                Opcode::New => {
+                    let index = self.read_u2(pc + 1)?;
+                    field::new_instance(self, frame, vm, index)?;
+                    pc += 3;
+                }
+                Opcode::Getfield => {
+                    let index = self.read_u2(pc + 1)?;
+                    field::get_field(self, frame, vm, index)?;
+                    pc += 3;
+                }
+                Opcode::Putfield => {
+                    let index = self.read_u2(pc + 1)?;
+                    field::put_field(self, frame, vm, index)?;
+                    pc += 3;
+                }
+                Opcode::Getstatic => {
+                    let index = self.read_u2(pc + 1)?;
+                    field::get_static(self, frame, vm, index)?;
+                    pc += 3;
+                }
+                Opcode::Putstatic => {
+                    let index = self.read_u2(pc + 1)?;
+                    field::put_static(self, frame, vm, index)?;
+                    pc += 3;
+                }
                 // ---- 单操作数条件分支 ----
                 Opcode::Ifeq => pc = self.cond1(pc, |v| v == 0, frame)?,
                 Opcode::Ifne => pc = self.cond1(pc, |v| v != 0, frame)?,
@@ -759,6 +842,11 @@ impl<'a> Interpreter<'a> {
                 Opcode::Invokestatic => {
                     let index = self.read_u2(pc + 1)?;
                     invoke::invoke_static(self, frame, vm, index)?;
+                    pc += 3;
+                }
+                Opcode::Invokespecial => {
+                    let index = self.read_u2(pc + 1)?;
+                    invoke::invoke_special(self, frame, vm, index)?;
                     pc += 3;
                 }
                 Opcode::Return => return Ok(Value::Void),

@@ -73,6 +73,46 @@ fn run_static_int(cf: &ClassFile, name: &str, desc: &str, args: &[i32]) -> i32 {
     }
 }
 
+/// 实参:支持 int/long/float/double,按 JVM 调用约定(long/double 占两槽)写入局部变量。
+enum Arg {
+    I(i32),
+    L(i64),
+    F(f32),
+    D(f64),
+}
+
+/// 执行静态方法,按实参类型与槽位约定写入局部变量,返回结果值。
+fn run_static_value(cf: &ClassFile, name: &str, desc: &str, args: &[Arg]) -> Value {
+    let method = find_method(cf, name, desc);
+    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
+    let mut frame = Frame::new(code.max_locals, code.max_stack);
+    let mut slot: u16 = 0;
+    for a in args {
+        match a {
+            Arg::I(v) => {
+                frame.locals.set_int(slot, *v).unwrap();
+                slot += 1;
+            }
+            Arg::L(v) => {
+                frame.locals.set_long(slot, *v).unwrap();
+                slot += 2;
+            }
+            Arg::F(v) => {
+                frame.locals.set_float(slot, *v).unwrap();
+                slot += 1;
+            }
+            Arg::D(v) => {
+                frame.locals.set_double(slot, *v).unwrap();
+                slot += 2;
+            }
+        }
+    }
+    let interp = Interpreter::new(&code.code, &cf.constant_pool);
+    interp
+        .interpret(&mut frame)
+        .unwrap_or_else(|e| panic!("{name} 执行失败:{e}"))
+}
+
 #[test]
 fn executes_real_static_int_methods() {
     if !javac_available() {
@@ -134,4 +174,67 @@ public class IntMath {
     assert_eq!(run_static_int(&cf, "gcd", "(II)I", &[48, 36]), 12);
     assert_eq!(run_static_int(&cf, "gcd", "(II)I", &[17, 5]), 1);
     assert_eq!(run_static_int(&cf, "gcd", "(II)I", &[100, 0]), 100);
+}
+
+#[test]
+fn executes_real_numeric_methods() {
+    if !javac_available() {
+        eprintln!("跳过:未找到 javac");
+        return;
+    }
+
+    let source = r#"
+public class NumMath {
+    public static long longAdd(long a, long b) {
+        return a + b;
+    }
+    public static long factorialLong(int n) {
+        long r = 1;
+        for (long i = 2; i <= n; i++) r *= i;
+        return r;
+    }
+    public static double avg(int a, int b) {
+        return (a + b) / 2.0;
+    }
+    public static double distanceSquared(double dx, double dy) {
+        return dx * dx + dy * dy;
+    }
+    public static float sumFloat(float a, float b) {
+        return a + b;
+    }
+}
+"#;
+    let class_path = compile(source, "NumMath");
+    let bytes = std::fs::read(&class_path).unwrap();
+    let cf = parse(&bytes).expect("解析应成功");
+
+    // longAdd:超过 int 范围,证明是 long
+    assert_eq!(
+        run_static_value(&cf, "longAdd", "(JJ)J", &[Arg::L(1_000_000_000), Arg::L(2_000_000_000)]),
+        Value::Long(3_000_000_000)
+    );
+
+    // factorialLong(20) = 2432902008176640000(long 累乘 + i2l 比较)
+    assert_eq!(
+        run_static_value(&cf, "factorialLong", "(I)J", &[Arg::I(20)]),
+        Value::Long(2_432_902_008_176_640_000)
+    );
+
+    // avg(3, 4) = 3.5(int 算术 + i2d 提升 + ddiv)
+    match run_static_value(&cf, "avg", "(II)D", &[Arg::I(3), Arg::I(4)]) {
+        Value::Double(v) => assert!((v - 3.5).abs() < 1e-9),
+        other => panic!("avg 返回非 double:{other:?}"),
+    }
+
+    // distanceSquared(3.0, 4.0) = 25.0
+    match run_static_value(&cf, "distanceSquared", "(DD)D", &[Arg::D(3.0), Arg::D(4.0)]) {
+        Value::Double(v) => assert!((v - 25.0).abs() < 1e-9),
+        other => panic!("distanceSquared 返回非 double:{other:?}"),
+    }
+
+    // sumFloat(1.5, 2.5) = 4.0
+    match run_static_value(&cf, "sumFloat", "(FF)F", &[Arg::F(1.5), Arg::F(2.5)]) {
+        Value::Float(v) => assert!((v - 4.0).abs() < 1e-6),
+        other => panic!("sumFloat 返回非 float:{other:?}"),
+    }
 }

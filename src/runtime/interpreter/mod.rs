@@ -42,8 +42,12 @@ pub enum VmError {
     ConstantPool(ClassFileError),
     /// ldc 等取到非预期类型的常量。
     BadConstant(&'static str),
-    /// NullPointerException:对 null 引用取字段/数组。
+    /// NullPointerException:对 null 引用取字段/数组/调用方法。
     NullPointer,
+    /// AbstractMethodError:invokeinterface/invokevirtual 命中抽象方法(无 Code)。
+    AbstractMethodError,
+    /// StackOverflowError:帧嵌套深度超 `stack_limit`。
+    StackOverflow,
 }
 
 impl std::fmt::Display for VmError {
@@ -56,6 +60,8 @@ impl std::fmt::Display for VmError {
             Self::ConstantPool(e) => write!(f, "constant pool: {e:?}"),
             Self::BadConstant(msg) => write!(f, "bad constant: {msg}"),
             Self::NullPointer => write!(f, "NullPointerException"),
+            Self::AbstractMethodError => write!(f, "AbstractMethodError"),
+            Self::StackOverflow => write!(f, "StackOverflowError"),
         }
     }
 }

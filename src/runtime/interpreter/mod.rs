@@ -849,6 +849,11 @@ impl<'a> Interpreter<'a> {
                     invoke::invoke_special(self, frame, vm, index)?;
                     pc += 3;
                 }
+                Opcode::Invokevirtual => {
+                    let index = self.read_u2(pc + 1)?;
+                    invoke::invoke_virtual(self, frame, vm, index)?;
+                    pc += 3;
+                }
                 Opcode::Return => return Ok(Value::Void),
                 Opcode::Ireturn => {
                     let v = frame.operands.pop_int()?;

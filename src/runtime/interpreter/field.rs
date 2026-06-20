@@ -138,7 +138,7 @@ fn push_field_value(frame: &mut Frame, ft: &FieldType, slot: Slot) -> Result<(),
     Ok(())
 }
 
-/// `new`:解析类 → 默认实例 → 堆分配 → 压引用。由分派循环读 u2 后调用。
+/// `new`:解析类 → 扁平化默认实例 → 堆分配 → 压引用。由分派循环读 u2 后调用。
 pub(super) fn new_instance(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
@@ -146,14 +146,19 @@ pub(super) fn new_instance(
     class_index: u16,
 ) -> Result<(), VmError> {
     let class_name = resolve_class_name(interp.cp(), class_index)?;
-    let lc = require_class(vm, &class_name)?;
-    let oop = Oop::Instance(lc.new_instance());
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("new 需要类注册表"))?;
+    let lc = registry
+        .get(&class_name)
+        .ok_or(VmError::BadConstant("new 目标类未加载"))?;
+    let oop = Oop::Instance(registry.new_instance(lc));
     let reference = vm.heap_mut().alloc(oop);
     frame.operands.push_reference(reference)?;
     Ok(())
 }
 
-/// `getfield`:解析 → 弹 objref → null 检查 → 读实例槽 → 按类型压值。
+/// `getfield`:解析 → 定位(扁平)序号 → 弹 objref → null 检查 → 读实例槽 → 按类型压值。
 pub(super) fn get_field(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
@@ -162,9 +167,14 @@ pub(super) fn get_field(
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
     let ft = parse_field_descriptor(&desc)?;
-    let lc = require_class(vm, &class_name)?;
-    let ordinal = lc
-        .instance_field(&field_name, &ft)
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("字段指令需要类注册表"))?;
+    let lc = registry
+        .get(&class_name)
+        .ok_or(VmError::BadConstant("目标类未加载"))?;
+    let ordinal = registry
+        .instance_field(lc, &field_name, &ft)
         .ok_or(VmError::BadConstant("getfield 未找到实例字段"))?;
 
     let objref = frame.operands.pop_reference()?;
@@ -182,7 +192,7 @@ pub(super) fn get_field(
     Ok(())
 }
 
-/// `putfield`:解析 → 弹值、弹 objref → null 检查 → 写实例槽。
+/// `putfield`:解析 → 定位(扁平)序号 → 弹值、弹 objref → null 检查 → 写实例槽。
 ///
 /// 栈布局:`... objref, value`(value 在顶)。先弹值,后弹 objref。
 pub(super) fn put_field(
@@ -193,9 +203,14 @@ pub(super) fn put_field(
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
     let ft = parse_field_descriptor(&desc)?;
-    let lc = require_class(vm, &class_name)?;
-    let ordinal = lc
-        .instance_field(&field_name, &ft)
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("字段指令需要类注册表"))?;
+    let lc = registry
+        .get(&class_name)
+        .ok_or(VmError::BadConstant("目标类未加载"))?;
+    let ordinal = registry
+        .instance_field(lc, &field_name, &ft)
         .ok_or(VmError::BadConstant("putfield 未找到实例字段"))?;
 
     let value = pop_field_value(frame, &ft)?;

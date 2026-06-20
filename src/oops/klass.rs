@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use crate::classfile::ClassFileError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_field_descriptor, FieldType};
-use crate::metadata::{ClassFile, FieldInfo};
+use crate::metadata::{ClassFile, FieldInfo, MethodInfo};
 use crate::runtime::Slot;
 
 use super::instance::InstanceOop;
@@ -23,7 +23,10 @@ pub struct ResolvedField {
     pub descriptor: FieldType,
 }
 
-/// 已加载的类:`ClassFile` + 实例/静态字段布局 + 静态字段存储。
+/// 已加载的类:`ClassFile` + 本类实例/静态字段布局 + 静态字段存储 + 超类关系。
+///
+/// `instance_fields` 为**本类声明**的实例字段;**继承字段**经
+/// [`ClassRegistry::flattened_instance_fields`] 惰性扁平化(超类链 ++ 本类)并缓存于 `flat_cache`。
 ///
 /// `static_storage` 用 [`RefCell`] 承载:静态字段是**类级可变状态**(putstatic 写入),
 /// 对应 HotSpot `InstanceKlass` 中就地持有的静态字段区;注册表以不可变引用暴露
@@ -33,6 +36,8 @@ pub struct LoadedClass {
     instance_fields: Vec<ResolvedField>,
     static_fields: Vec<ResolvedField>,
     pub static_storage: RefCell<Vec<Slot>>,
+    super_class_name: Option<String>,
+    flat_cache: RefCell<Option<Vec<ResolvedField>>>,
 }
 
 impl LoadedClass {
@@ -41,7 +46,7 @@ impl LoadedClass {
         self.cf.this_class_name().unwrap_or("")
     }
 
-    /// 实例字段(声明序)。
+    /// 实例字段(本类声明序)。
     pub fn instance_fields(&self) -> &[ResolvedField] {
         &self.instance_fields
     }
@@ -51,34 +56,30 @@ impl LoadedClass {
         &self.static_fields
     }
 
-    /// 按名 + 类型定位实例字段 → 序号(实例槽位序)。
-    pub fn instance_field(&self, name: &str, ft: &FieldType) -> Option<usize> {
-        self.instance_fields
-            .iter()
-            .position(|f| f.name == name && f.descriptor == *ft)
-    }
-
-    /// 按名 + 类型定位静态字段 → 序号(`static_storage` 索引)。
+    /// 按名 + 类型定位**静态**字段 → 序号(`static_storage` 索引)。静态字段不扁平化
+    /// (归属声明类;getstatic/putstatic 的 Fieldref 已指向声明类)。
     pub fn static_field(&self, name: &str, ft: &FieldType) -> Option<usize> {
         self.static_fields
             .iter()
             .position(|f| f.name == name && f.descriptor == *ft)
     }
 
-    /// 构造一个默认初始化的实例(所有字段置零/null)。
-    pub fn new_instance(&self) -> InstanceOop {
-        let fields = default_fields(&self.instance_fields);
-        InstanceOop::new(self.name().to_string(), fields)
+    /// 超类内部名;`None` 表示 `java/lang/Object` 或无超类。
+    pub fn super_class_name(&self) -> Option<&str> {
+        self.super_class_name.as_deref()
     }
 
-    /// 从 `ClassFile` 解析字段布局(本类字段;静态字段默认初始化)。
+    /// 从 `ClassFile` 解析字段布局(本类字段;静态字段默认初始化)+ 超类名。
     fn from_cf(cf: ClassFile) -> Result<Self, ClassFileError> {
         let layout = resolve_fields(&cf.constant_pool, &cf.fields)?;
+        let super_class_name = cf.super_class_name().map(String::from);
         Ok(Self {
             cf,
             instance_fields: layout.instance_fields,
             static_fields: layout.static_fields,
             static_storage: RefCell::new(layout.static_storage),
+            super_class_name,
+            flat_cache: RefCell::new(None),
         })
     }
 }
@@ -116,6 +117,71 @@ impl ClassRegistry {
     pub fn get(&self, name: &str) -> Option<&LoadedClass> {
         self.classes.get(name)
     }
+
+    /// 扁平化实例字段(超类链 ++ 本类),惰性缓存于 `flat_cache`。
+    ///
+    /// 超类链置前、本类在后;`java/lang/Object`(未加载)作根终止。解耦加载顺序。
+    pub fn flattened_instance_fields(&self, lc: &LoadedClass) -> Vec<ResolvedField> {
+        if let Some(cached) = lc.flat_cache.borrow().clone() {
+            return cached;
+        }
+        let mut fields = Vec::new();
+        if let Some(super_name) = &lc.super_class_name
+            && super_name.as_str() != "java/lang/Object"
+            && let Some(super_lc) = self.get(super_name)
+        {
+            fields.extend(self.flattened_instance_fields(super_lc));
+        }
+        fields.extend(lc.instance_fields.iter().cloned());
+        *lc.flat_cache.borrow_mut() = Some(fields.clone());
+        fields
+    }
+
+    /// 按名 + 类型在 lc 的**扁平布局**中定位实例字段 → 全局序号(与实际对象对齐)。
+    pub fn instance_field(
+        &self,
+        lc: &LoadedClass,
+        name: &str,
+        ft: &FieldType,
+    ) -> Option<usize> {
+        self.flattened_instance_fields(lc)
+            .iter()
+            .position(|f| f.name == name && f.descriptor == *ft)
+    }
+
+    /// 创建默认初始化实例(扁平布局全零/null)。对应 `new`。
+    pub fn new_instance(&self, lc: &LoadedClass) -> InstanceOop {
+        let fields = default_fields(&self.flattened_instance_fields(lc));
+        InstanceOop::new(lc.name().to_string(), fields)
+    }
+
+    /// 虚分派:从 `class_name` 沿超类链找首个 (name, desc) 方法 → (声明类, 方法)。
+    ///
+    /// 对应 HotSpot `InstanceKlass::find_method` 上行查找(我们用线性查找,不用 vtable)。
+    pub fn find_virtual_method<'a>(
+        &'a self,
+        class_name: &str,
+        name: &str,
+        desc: &str,
+    ) -> Option<(&'a LoadedClass, &'a MethodInfo)> {
+        let mut current = self.get(class_name);
+        while let Some(lc) = current {
+            if let Some(m) = lc
+                .cf
+                .methods
+                .iter()
+                .find(|m| method_matches(&lc.cf, m, name, desc))
+            {
+                return Some((lc, m));
+            }
+            current = lc
+                .super_class_name
+                .as_deref()
+                .filter(|s| *s != "java/lang/Object")
+                .and_then(|s| self.get(s));
+        }
+        None
+    }
 }
 
 impl Default for ClassRegistry {
@@ -130,6 +196,19 @@ fn utf8(cp: &ConstantPool, index: u16) -> Result<String, ClassFileError> {
         ConstantPoolEntry::Utf8(s) => Ok(s.clone()),
         _ => Err(ClassFileError::Unsupported("字段名/描述符须为 Utf8 条目")),
     }
+}
+
+/// 方法名与描述符是否同时匹配(查常量池 Utf8)。
+fn method_matches(cf: &ClassFile, m: &MethodInfo, name: &str, desc: &str) -> bool {
+    let name_ok = matches!(
+        cf.constant_pool.get(m.name_index),
+        Ok(ConstantPoolEntry::Utf8(n)) if n == name
+    );
+    let desc_ok = matches!(
+        cf.constant_pool.get(m.descriptor_index),
+        Ok(ConstantPoolEntry::Utf8(d)) if d == desc
+    );
+    name_ok && desc_ok
 }
 
 /// 字段类型的默认槽(零值/null)。

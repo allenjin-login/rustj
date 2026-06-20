@@ -17,6 +17,7 @@
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_method_descriptor, FieldType, ReturnDescriptor};
 use crate::metadata::{ClassFile, MethodInfo};
+use crate::oops::Oop;
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
 use super::{Interpreter, Value, VmError};
@@ -274,6 +275,75 @@ pub(super) fn invoke_special(
         (ReturnDescriptor::FieldType(_), v) => push_return(frame, v)?,
         (ReturnDescriptor::Void, _) => {
             return Err(VmError::BadConstant("invokespecial void 方法返回了值"));
+        }
+    }
+    Ok(())
+}
+
+/// 执行 `invokevirtual`:按对象**运行时实际类**沿超类链虚分派。
+///
+/// 栈布局:`... objref, arg0..argN`(argN 在顶)。逆序弹 args,再弹 objref;null →
+/// `NullPointer`。运行时类取自对象本身(`InstanceOop.class_name`),沿超类链找首个
+/// (name, desc) 方法执行。Methodref 的声明类仅用于校验,**不参与分派**。
+pub(super) fn invoke_virtual(
+    interp: &Interpreter<'_>,
+    frame: &mut Frame,
+    vm: &mut Vm<'_>,
+    methodref_index: u16,
+) -> Result<(), VmError> {
+    let (_declared_class, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
+    let md = parse_method_descriptor(&desc)?;
+
+    let mut args: Vec<Arg> = Vec::with_capacity(md.parameters.len());
+    for ft in md.parameters.iter().rev() {
+        args.push(pop_arg(frame, ft)?);
+    }
+    let objref = frame.operands.pop_reference()?;
+    if objref.is_null() {
+        return Err(VmError::NullPointer);
+    }
+
+    // 运行时类 = 对象实际类(owned String,释放堆借用)。
+    let runtime_class = vm
+        .heap()
+        .get(objref)
+        .ok_or(VmError::BadConstant("invokevirtual 引用悬空"))?;
+    let runtime_class = match runtime_class {
+        Oop::Instance(i) => i.class_name().to_string(),
+    };
+
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("invokevirtual 需要类注册表"))?;
+    let (target_lc, target_method) = registry
+        .find_virtual_method(&runtime_class, &method_name, &desc)
+        .ok_or(VmError::BadConstant("invokevirtual 未找到目标方法"))?;
+    let code = target_method
+        .code
+        .as_ref()
+        .ok_or(VmError::BadConstant("invokevirtual 目标方法无 Code(抽象/原生)"))?;
+
+    let mut callee = Frame::new(code.max_locals, code.max_stack);
+    callee.locals.set_reference(0, objref)?;
+    let mut slot: u16 = 1;
+    for a in args {
+        let advance = store_arg(&mut callee.locals, slot, a)?;
+        slot = slot
+            .checked_add(advance)
+            .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
+    }
+
+    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
+    let result = callee_interp.interpret_with(&mut callee, vm)?;
+
+    match (md.return_type, result) {
+        (ReturnDescriptor::Void, Value::Void) => {}
+        (ReturnDescriptor::FieldType(_), Value::Void) => {
+            return Err(VmError::BadConstant("invokevirtual 期望返回值,被调用者返回 void"));
+        }
+        (ReturnDescriptor::FieldType(_), v) => push_return(frame, v)?,
+        (ReturnDescriptor::Void, _) => {
+            return Err(VmError::BadConstant("invokevirtual void 方法返回了值"));
         }
     }
     Ok(())

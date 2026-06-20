@@ -3,12 +3,14 @@
 //! 本层定义数据与存取语义;字节码分派循环(执行)见 [`interpreter`]。
 
 pub mod frame;
+pub mod heap;
 pub mod interpreter;
 pub mod local_vars;
 pub mod operand_stack;
 pub mod slot;
 
 pub use frame::{Frame, FrameError};
+pub use heap::Heap;
 pub use interpreter::{ClassProvider, Interpreter, Value, VmError};
 pub use local_vars::LocalVars;
 pub use operand_stack::OperandStack;

@@ -13,4 +13,5 @@ pub mod bytecode;
 pub mod classfile;
 pub mod constant_pool;
 pub mod metadata;
+pub mod oops;
 pub mod runtime;

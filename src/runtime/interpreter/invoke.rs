@@ -22,6 +22,21 @@ use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
 use super::{Interpreter, Value, VmError};
 
+/// 进入一帧:`frame_depth +1`,执行 `f`,返回前 `−1`(Ok/Err 两路对称)。
+/// `frame_depth >= stack_limit` 时直接 [`VmError::StackOverflow`],不进入 `f`。
+pub(crate) fn run_with_depth<R>(
+    vm: &mut Vm<'_>,
+    f: impl FnOnce(&mut Vm<'_>) -> Result<R, VmError>,
+) -> Result<R, VmError> {
+    if vm.frame_depth >= vm.stack_limit {
+        return Err(VmError::StackOverflow);
+    }
+    vm.frame_depth += 1;
+    let r = f(vm);
+    vm.frame_depth -= 1;
+    r
+}
+
 /// 解析 `Methodref` 常量池条目 → `(类内部名, 方法名, 描述符)`。
 ///
 /// 返回 owned `String`,避免常量池借用与后续栈帧操作纠缠。
@@ -200,7 +215,7 @@ pub(super) fn invoke_static(
 
     // 递归:用目标方法的字节码与常量池构造新解释器,沿用同一 Vm(堆 + 注册表)。
     let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
-    let result = callee_interp.interpret_with(&mut callee, vm)?;
+    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm))?;
 
     // 按描述符返回类型回填:void 不压栈;非 void 压返回值;类型不符报错。
     match (md.return_type, result) {
@@ -265,7 +280,7 @@ pub(super) fn invoke_special(
     }
 
     let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
-    let result = callee_interp.interpret_with(&mut callee, vm)?;
+    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm))?;
 
     match (md.return_type, result) {
         (ReturnDescriptor::Void, Value::Void) => {}
@@ -334,7 +349,7 @@ pub(super) fn invoke_virtual(
     }
 
     let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
-    let result = callee_interp.interpret_with(&mut callee, vm)?;
+    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm))?;
 
     match (md.return_type, result) {
         (ReturnDescriptor::Void, Value::Void) => {}
@@ -377,5 +392,32 @@ mod tests {
         assert_eq!(class, "MyClass");
         assert_eq!(name, "doThing");
         assert_eq!(desc, "(IJ)I");
+    }
+
+    #[test]
+    fn run_with_depth_counts_symmetrically() {
+        // Ok 路径:进入 +1、退出 −1(嵌套两层验证递增)。
+        let mut vm = crate::runtime::Vm::default();
+        let r = super::run_with_depth(&mut vm, |vm| {
+            let d1 = vm.frame_depth;
+            let inner = super::run_with_depth(vm, |vm| Ok(vm.frame_depth));
+            assert_eq!(d1, 1);
+            assert_eq!(inner.unwrap(), 2);
+            Ok(())
+        });
+        assert!(r.is_ok());
+        assert_eq!(vm.frame_depth, 0);
+    }
+
+    #[test]
+    fn run_with_depth_overflow_returns_stackoverflow() {
+        // limit=2:外层→depth1,中层→depth2,内层 depth>=limit → StackOverflow;
+        // 异常路径仍对称归零。
+        let mut vm = crate::runtime::Vm::default().with_stack_limit(2);
+        let r = super::run_with_depth(&mut vm, |vm| {
+            super::run_with_depth(vm, |vm| super::run_with_depth(vm, |_| Ok(())))
+        });
+        assert_eq!(r.unwrap_err(), super::VmError::StackOverflow);
+        assert_eq!(vm.frame_depth, 0);
     }
 }

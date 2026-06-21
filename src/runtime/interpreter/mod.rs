@@ -6,11 +6,13 @@
 //! 3.1:仅 int 核心子集;清单外指令返回 [`VmError::UnsupportedOpcode`]。
 
 mod array;
+mod exception;
 mod field;
 mod invoke;
 mod type_check;
 
 use crate::bytecode::opcode::{BytecodeError, Opcode};
+use crate::classfile::attributes::ExceptionTableEntry;
 use crate::classfile::ClassFileError;
 use crate::constant_pool::entry::ConstantPoolEntry;
 use crate::constant_pool::ConstantPool;
@@ -102,11 +104,29 @@ impl From<BytecodeError> for VmError {
 pub struct Interpreter<'a> {
     code: &'a [u8],
     cp: &'a ConstantPool,
+    exception_table: &'a [ExceptionTableEntry],
 }
 
 impl<'a> Interpreter<'a> {
     pub fn new(code: &'a [u8], cp: &'a ConstantPool) -> Self {
-        Self { code, cp }
+        Self {
+            code,
+            cp,
+            exception_table: &[],
+        }
+    }
+
+    /// 带 `Code` 属性的异常表构造(4 处 invoke 被调用者解释器、集成闸门入口用之)。
+    pub fn new_with_exception_table(
+        code: &'a [u8],
+        cp: &'a ConstantPool,
+        exception_table: &'a [ExceptionTableEntry],
+    ) -> Self {
+        Self {
+            code,
+            cp,
+            exception_table,
+        }
     }
 
     /// 当前字节码所属的常量池(供 invoke 子模块解析 Methodref)。
@@ -1009,6 +1029,20 @@ impl<'a> Interpreter<'a> {
                     let v = frame.operands.pop_reference()?;
                     return Ok(Value::Reference(v));
                 }
+                Opcode::Athrow => {
+                    let exc = frame.operands.pop_reference()?;
+                    if exc.is_null() {
+                        return Err(VmError::NullPointer);
+                    }
+                    match exception::find_handler(self, vm, self.exception_table, pc, exc)? {
+                        Some(h) => {
+                            frame.operands.clear();
+                            frame.operands.push_reference(exc)?;
+                            pc = h;
+                        }
+                        None => return Err(VmError::ThrownException(exc)),
+                    }
+                }
                 other => return Err(VmError::UnsupportedOpcode(other)),
             }
         }
@@ -1578,6 +1612,109 @@ mod tests {
         assert_eq!(
             interp.interpret(&mut frame).unwrap(),
             Value::Reference(Reference::from_id(7))
+        );
+    }
+
+    // ===== Layer 4.7:athrow =====
+
+    /// 构 BaseExc←SubExc 注册表 + 含异常类的 cp。
+    /// 实例在各测试的 Vm 内建(避免跨 Vm 句柄失效)。
+    /// cp:utf8 1=Throwable 2=BaseExc 3=SubExc ;class 4=Throwable 5=BaseExc 6=SubExc。
+    fn athrow_setup() -> (crate::oops::ClassRegistry, crate::constant_pool::ConstantPool) {
+        use crate::classfile::Reader;
+        use crate::constant_pool::ConstantPool;
+        use crate::metadata::{AccessFlags, ClassFile};
+        let cp_bytes = {
+            let mut b = vec![0x00, 0x07]; // count = 6 entries + 1
+            for s in ["java/lang/Throwable", "BaseExc", "SubExc"] {
+                b.push(0x01);
+                b.extend_from_slice(&(s.len() as u16).to_be_bytes());
+                b.extend_from_slice(s.as_bytes());
+            }
+            for idx in [1u16, 2, 3] {
+                b.push(0x07);
+                b.extend_from_slice(&idx.to_be_bytes());
+            }
+            b
+        };
+        let mk_cp = || ConstantPool::parse(&mut Reader::new(&cp_bytes)).unwrap();
+        let mk_cf = |this: u16, super_c: u16| ClassFile {
+            minor_version: 0,
+            major_version: 52,
+            constant_pool: mk_cp(),
+            access_flags: AccessFlags::from_bits(0),
+            this_class: this,
+            super_class: super_c,
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            attributes: Vec::new(),
+        };
+        let mut reg = crate::oops::ClassRegistry::new();
+        reg.load(mk_cf(5, 4)).unwrap(); // BaseExc(#5) extends Throwable(#4)
+        reg.load(mk_cf(6, 5)).unwrap(); // SubExc(#6) extends BaseExc
+        (reg, mk_cp())
+    }
+
+    #[test]
+    fn athrow_caught_jumps_to_handler() {
+        use crate::classfile::attributes::ExceptionTableEntry;
+        let (reg, cp) = athrow_setup();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        let lc = reg.get("SubExc").unwrap();
+        let inst = vm
+            .heap_mut()
+            .alloc(crate::oops::Oop::Instance(reg.new_instance(lc)));
+        // [aload0(0) athrow(1) iconst1(2) ireturn(3)];try [0,2) handler=2 catch SubExc(#6)
+        let code = [
+            Opcode::Aload0 as u8,
+            Opcode::Athrow as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let table = [ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 2,
+            handler_pc: 2,
+            catch_type: 6,
+        }];
+        let mut frame = Frame::new(1, 2);
+        frame.locals.set_reference(0, inst).unwrap();
+        let interp = Interpreter::new_with_exception_table(&code, &cp, &table);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn athrow_uncaught_propagates() {
+        let (reg, cp) = athrow_setup();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        let lc = reg.get("SubExc").unwrap();
+        let inst = vm
+            .heap_mut()
+            .alloc(crate::oops::Oop::Instance(reg.new_instance(lc)));
+        let code = [Opcode::Aload0 as u8, Opcode::Athrow as u8];
+        let mut frame = Frame::new(1, 2);
+        frame.locals.set_reference(0, inst).unwrap();
+        let interp = Interpreter::new_with_exception_table(&code, &cp, &[]);
+        match interp.interpret_with(&mut frame, &mut vm).unwrap_err() {
+            VmError::ThrownException(r) => assert_eq!(r, inst),
+            other => panic!("期望 ThrownException,得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn athrow_null_throws_nullpointer() {
+        let (reg, cp) = athrow_setup();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        let code = [Opcode::AconstNull as u8, Opcode::Athrow as u8];
+        let mut frame = Frame::new(0, 2);
+        let interp = Interpreter::new_with_exception_table(&code, &cp, &[]);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
+            VmError::NullPointer
         );
     }
 

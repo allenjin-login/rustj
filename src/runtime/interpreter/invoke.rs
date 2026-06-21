@@ -344,6 +344,9 @@ pub(super) fn invoke_virtual(
         .ok_or(VmError::BadConstant("invokevirtual 引用悬空"))?;
     let runtime_class = match runtime_class {
         Oop::Instance(i) => i.class_name().to_string(),
+        Oop::Array(_) => {
+            return Err(VmError::BadConstant("invoke 目标为数组(数组方法 clone 等顺延)"))
+        }
     };
 
     let registry = vm
@@ -413,6 +416,9 @@ pub(super) fn invoke_interface(
         .ok_or(VmError::BadConstant("invokeinterface 引用悬空"))?;
     let runtime_class = match runtime_class {
         Oop::Instance(i) => i.class_name().to_string(),
+        Oop::Array(_) => {
+            return Err(VmError::BadConstant("invoke 目标为数组(数组方法 clone 等顺延)"))
+        }
     };
 
     let registry = vm

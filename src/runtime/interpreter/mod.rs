@@ -8,6 +8,7 @@
 mod array;
 mod field;
 mod invoke;
+mod type_check;
 
 use crate::bytecode::opcode::{BytecodeError, Opcode};
 use crate::classfile::ClassFileError;
@@ -54,6 +55,8 @@ pub enum VmError {
     ArrayIndexOutOfBounds,
     /// NegativeArraySizeException:newarray/anewarray 负长度。
     NegativeArraySize,
+    /// ClassCastException:checkcast 不匹配。
+    ClassCastException,
 }
 
 impl std::fmt::Display for VmError {
@@ -70,6 +73,7 @@ impl std::fmt::Display for VmError {
             Self::StackOverflow => write!(f, "StackOverflowError"),
             Self::ArrayIndexOutOfBounds => write!(f, "ArrayIndexOutOfBoundsException"),
             Self::NegativeArraySize => write!(f, "NegativeArraySizeException"),
+            Self::ClassCastException => write!(f, "ClassCastException"),
         }
     }
 }
@@ -902,6 +906,16 @@ impl<'a> Interpreter<'a> {
                     let dims = self.read_u1(pc + 3)?;
                     array::multi_new_array(self, frame, vm, index, dims)?;
                     pc += 4;
+                }
+                Opcode::Checkcast => {
+                    let index = self.read_u2(pc + 1)?;
+                    type_check::check_cast(self, frame, vm, index)?;
+                    pc += 3;
+                }
+                Opcode::Instanceof => {
+                    let index = self.read_u2(pc + 1)?;
+                    type_check::instance_of(self, frame, vm, index)?;
+                    pc += 3;
                 }
                 Opcode::Arraylength => {
                     array::array_length(frame, vm)?;

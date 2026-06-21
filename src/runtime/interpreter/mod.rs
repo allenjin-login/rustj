@@ -5,6 +5,7 @@
 //!
 //! 3.1:仅 int 核心子集;清单外指令返回 [`VmError::UnsupportedOpcode`]。
 
+mod array;
 mod field;
 mod invoke;
 
@@ -48,6 +49,10 @@ pub enum VmError {
     AbstractMethodError,
     /// StackOverflowError:帧嵌套深度超 `stack_limit`。
     StackOverflow,
+    /// ArrayIndexOutOfBoundsException:*aload/*astore 索引越界。
+    ArrayIndexOutOfBounds,
+    /// NegativeArraySizeException:newarray/anewarray 负长度。
+    NegativeArraySize,
 }
 
 impl std::fmt::Display for VmError {
@@ -62,6 +67,8 @@ impl std::fmt::Display for VmError {
             Self::NullPointer => write!(f, "NullPointerException"),
             Self::AbstractMethodError => write!(f, "AbstractMethodError"),
             Self::StackOverflow => write!(f, "StackOverflowError"),
+            Self::ArrayIndexOutOfBounds => write!(f, "ArrayIndexOutOfBoundsException"),
+            Self::NegativeArraySize => write!(f, "NegativeArraySizeException"),
         }
     }
 }
@@ -865,6 +872,21 @@ impl<'a> Interpreter<'a> {
                     // count(pc+3) 与尾 0(pc+4)对运行时冗余,随 pc += 5 丢弃。
                     invoke::invoke_interface(self, frame, vm, index)?;
                     pc += 5;
+                }
+                // ---- 数组(4.3a)----
+                Opcode::Newarray => {
+                    let atype = self.read_u1(pc + 1)?;
+                    array::new_array(frame, vm, atype)?;
+                    pc += 2;
+                }
+                Opcode::Anewarray => {
+                    let index = self.read_u2(pc + 1)?;
+                    array::a_new_array(self, frame, vm, index)?;
+                    pc += 3;
+                }
+                Opcode::Arraylength => {
+                    array::array_length(frame, vm)?;
+                    pc += 1;
                 }
                 Opcode::Return => return Ok(Value::Void),
                 Opcode::Ireturn => {
@@ -1780,5 +1802,58 @@ mod tests {
         let interp3 = Interpreter::new(&[Opcode::Ldc as u8, 0x01, Opcode::I2s as u8, Opcode::Ireturn as u8], &cp3);
         let mut frame3 = Frame::new(0, 1);
         assert_eq!(interp3.interpret(&mut frame3).unwrap(), Value::Int(-32768));
+    }
+
+    // ===== Layer 4.3a:数组分配 =====
+
+    #[test]
+    fn newarray_int_defaults_zero_and_length() {
+        // bipush 3; newarray int(10); dup; arraylength; ireturn -> 3
+        let code = [
+            Opcode::Bipush as u8, 0x03,
+            Opcode::Newarray as u8, 10, // atype=int
+            Opcode::Dup as u8,
+            Opcode::Arraylength as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(0, 2);
+        let mut vm = Vm::default();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn newarray_negative_count_is_negativearraysize() {
+        // iconst_m1; newarray int -> NegativeArraySize
+        let code = [Opcode::IconstM1 as u8, Opcode::Newarray as u8, 10];
+        let cp = empty_cp();
+        let mut frame = Frame::new(0, 1);
+        let mut vm = Vm::default();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
+            VmError::NegativeArraySize
+        );
+    }
+
+    #[test]
+    fn arraylength_on_null_is_nullpointer() {
+        let code = [
+            Opcode::AconstNull as u8,
+            Opcode::Arraylength as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(0, 1);
+        let mut vm = Vm::default();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
+            VmError::NullPointer
+        );
     }
 }

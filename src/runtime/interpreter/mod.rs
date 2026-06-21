@@ -851,6 +851,18 @@ impl<'a> Interpreter<'a> {
                     let off = self.read_s2(pc + 1)?;
                     pc = Self::branch_target(pc, off)?;
                 }
+                Opcode::GotoW => {
+                    let off = self.read_s4(pc + 1)?;
+                    pc = Self::branch_target_w(pc, off)?;
+                }
+                // ---- 引用比较分支(4.4)----
+                Opcode::IfAcmpeq => pc = self.cond_ref2(pc, |a, b| a == b, frame)?,
+                Opcode::IfAcmpne => pc = self.cond_ref2(pc, |a, b| a != b, frame)?,
+                Opcode::Ifnull => pc = self.cond_ref1(pc, |v| v.is_null(), frame)?,
+                Opcode::Ifnonnull => pc = self.cond_ref1(pc, |v| !v.is_null(), frame)?,
+                // ---- switch(4.4)----
+                Opcode::Tableswitch => pc = self.table_switch(pc, frame)?,
+                Opcode::Lookupswitch => pc = self.lookup_switch(pc, frame)?,
                 // ---- 方法调用(invokestatic:同类内,含递归与互调)----
                 Opcode::Invokestatic => {
                     let index = self.read_u2(pc + 1)?;
@@ -996,6 +1008,15 @@ impl<'a> Interpreter<'a> {
         Ok(u16::from_be_bytes([b0, b1]))
     }
 
+    /// 4 字节有符号整数(大端)。
+    fn read_s4(&self, at: usize) -> Result<i32, VmError> {
+        let b0 = self.read_u1(at)?;
+        let b1 = self.read_u1(at + 1)?;
+        let b2 = self.read_u1(at + 2)?;
+        let b3 = self.read_u1(at + 3)?;
+        Ok(i32::from_be_bytes([b0, b1, b2, b3]))
+    }
+
     /// 单操作数条件分支:弹出 v,`pred(v)` 为真则跳到 `pc+offset`,否则 `pc+3`。
     fn cond1(&self, pc: usize, pred: impl Fn(i32) -> bool, frame: &mut Frame) -> Result<usize, VmError> {
         let v = frame.operands.pop_int()?;
@@ -1019,6 +1040,39 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// 单引用分支:弹 v,`pred(v)` 为真则跳到 `pc+offset`,否则 `pc+3`。
+    fn cond_ref1(
+        &self,
+        pc: usize,
+        pred: impl Fn(Reference) -> bool,
+        frame: &mut Frame,
+    ) -> Result<usize, VmError> {
+        let v = frame.operands.pop_reference()?;
+        let off = self.read_s2(pc + 1)?;
+        Ok(if pred(v) {
+            Self::branch_target(pc, off)?
+        } else {
+            pc + 3
+        })
+    }
+
+    /// 双引用分支:弹 b(顶)、a(底),`pred(a,b)` 为真则跳,否则 `pc+3`。
+    fn cond_ref2(
+        &self,
+        pc: usize,
+        pred: impl Fn(Reference, Reference) -> bool,
+        frame: &mut Frame,
+    ) -> Result<usize, VmError> {
+        let b = frame.operands.pop_reference()?;
+        let a = frame.operands.pop_reference()?;
+        let off = self.read_s2(pc + 1)?;
+        Ok(if pred(a, b) {
+            Self::branch_target(pc, off)?
+        } else {
+            pc + 3
+        })
+    }
+
     /// 分支目标 = `pc + offset`;offset 负到下溢则 `BadPc`。
     fn branch_target(pc: usize, offset: i16) -> Result<usize, VmError> {
         let target = (pc as i64) + (offset as i64);
@@ -1026,6 +1080,52 @@ impl<'a> Interpreter<'a> {
             return Err(VmError::BadPc(pc));
         }
         Ok(target as usize)
+    }
+
+    /// 宽(i32)分支目标:`pc + offset`,负下溢 → `BadPc`。供 switch / goto_w。
+    fn branch_target_w(pc: usize, offset: i32) -> Result<usize, VmError> {
+        let target = (pc as i64) + (offset as i64);
+        if target < 0 {
+            return Err(VmError::BadPc(pc));
+        }
+        Ok(target as usize)
+    }
+
+    /// `tableswitch`:填充对齐 → 读 default/low/high/jump 表 → 按栈顶 index 跳。
+    /// 所有偏移 i32,相对 switch 指令地址(`pc`)。
+    fn table_switch(&self, pc: usize, frame: &mut Frame) -> Result<usize, VmError> {
+        let index = frame.operands.pop_int()?;
+        let pad = (4 - ((pc + 1) % 4)) % 4;
+        let base = pc + 1 + pad;
+        let default = self.read_s4(base)?;
+        let low = self.read_s4(base + 4)?;
+        let high = self.read_s4(base + 8)?;
+        let off = if index < low || index > high {
+            default
+        } else {
+            let entry = base + 12 + ((index - low) as usize) * 4;
+            self.read_s4(entry)?
+        };
+        Self::branch_target_w(pc, off)
+    }
+
+    /// `lookupswitch`:填充对齐 → 读 default/npairs/对 → 线性匹配栈顶 key。
+    /// 校验器保证按 match 升序;此处线性扫描(npairs 通常很小),命中取其 offset。
+    fn lookup_switch(&self, pc: usize, frame: &mut Frame) -> Result<usize, VmError> {
+        let key = frame.operands.pop_int()?;
+        let pad = (4 - ((pc + 1) % 4)) % 4;
+        let base = pc + 1 + pad;
+        let default = self.read_s4(base)?;
+        let npairs = self.read_s4(base + 4)?;
+        let mut off = default;
+        for i in 0..npairs as usize {
+            let pair = base + 8 + i * 8;
+            if self.read_s4(pair)? == key {
+                off = self.read_s4(pair + 4)?;
+                break;
+            }
+        }
+        Self::branch_target_w(pc, off)
     }
 }
 
@@ -2079,5 +2179,223 @@ mod tests {
             interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
             VmError::ArrayIndexOutOfBounds
         );
+    }
+
+    // ===== Layer 4.4:控制流(引用分支)=====
+
+    #[test]
+    fn ifnull_branches_on_null() {
+        use crate::runtime::Reference;
+        // local0 = null; aload_0; ifnull +7; iconst_0; ireturn; iconst_1; ireturn
+        // null → 跳到 iconst_1 → 返回 1
+        let code = [
+            Opcode::Aload0 as u8,
+            Opcode::Ifnull as u8, 0x00, 0x05,
+            Opcode::Iconst0 as u8,
+            Opcode::Ireturn as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(1, 1);
+        frame.locals.set_reference(0, Reference::null()).unwrap();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(1));
+    }
+
+    #[test]
+    fn ifnonnull_branches_on_nonnull() {
+        use crate::runtime::Reference;
+        // local0 = 非空引用; aload_0; ifnonnull +7 → iconst_1
+        let code = [
+            Opcode::Aload0 as u8,
+            Opcode::Ifnonnull as u8, 0x00, 0x05,
+            Opcode::Iconst0 as u8,
+            Opcode::Ireturn as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(1, 1);
+        frame.locals.set_reference(0, Reference::from_id(5)).unwrap();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(1));
+    }
+
+    #[test]
+    fn if_acmpeq_equal_references_jumps() {
+        use crate::runtime::Reference;
+        // 同一引用; aload_0; aload_1; if_acmpeq +8 → iconst_1
+        let code = [
+            Opcode::Aload0 as u8,
+            Opcode::Aload1 as u8,
+            Opcode::IfAcmpeq as u8, 0x00, 0x05,
+            Opcode::Iconst0 as u8,
+            Opcode::Ireturn as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(2, 2);
+        frame.locals.set_reference(0, Reference::from_id(9)).unwrap();
+        frame.locals.set_reference(1, Reference::from_id(9)).unwrap();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(1));
+    }
+
+    #[test]
+    fn if_acmpne_distinct_references_jumps() {
+        use crate::runtime::Reference;
+        // 不同引用; if_acmpne 跳
+        let code = [
+            Opcode::Aload0 as u8,
+            Opcode::Aload1 as u8,
+            Opcode::IfAcmpne as u8, 0x00, 0x05,
+            Opcode::Iconst0 as u8,
+            Opcode::Ireturn as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(2, 2);
+        frame.locals.set_reference(0, Reference::from_id(1)).unwrap();
+        frame.locals.set_reference(1, Reference::from_id(2)).unwrap();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(1));
+    }
+
+    // ===== Layer 4.4:goto_w =====
+
+    #[test]
+    fn goto_w_unconditionally_jumps() {
+        // iconst_1; goto_w +6(4 字节,相对 opcode pc=1 → 落点 7=ireturn); iconst_2(跳过) -> 1
+        let code = [
+            Opcode::Iconst1 as u8,
+            Opcode::GotoW as u8, 0x00, 0x00, 0x00, 0x06,
+            Opcode::Iconst2 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(0, 1);
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(1));
+    }
+
+    // ===== Layer 4.4:tableswitch / lookupswitch =====
+
+    /// 构造 tableswitch:iload_0 取 index,low=0 high=2;
+    /// 命中 0→1, 1→2, 2→3,越界→0。
+    fn tableswitch_code() -> Vec<u8> {
+        let mut c = vec![Opcode::Iload0 as u8]; // index 从 local0
+        let sw = c.len();                       // switch opcode 地址
+        c.push(Opcode::Tableswitch as u8);
+        let pad = (4 - ((sw + 1) % 4)) % 4;
+        c.extend(std::iter::repeat_n(0u8, pad));
+        // 落点紧跟数据之后;先记录预期绝对下标,再算相对偏移。
+        // 数据 = default/low/high(3×4) + 3×offset(12) = 24 字节
+        let data_start = c.len();
+        c.extend_from_slice(&[0u8; 24]); // 占位,稍后回填
+        let targets_base = c.len(); // 落点起始
+        let at = |n: usize| targets_base + n; // 绝对下标
+        c.push(Opcode::Iconst0 as u8); c.push(Opcode::Ireturn as u8); // default
+        c.push(Opcode::Iconst1 as u8); c.push(Opcode::Ireturn as u8); // idx 0
+        c.push(Opcode::Iconst2 as u8); c.push(Opcode::Ireturn as u8); // idx 1
+        c.push(Opcode::Iconst3 as u8); c.push(Opcode::Ireturn as u8); // idx 2
+        // 回填
+        let default_off = (at(0) - sw) as i32;
+        let low: i32 = 0;
+        let high: i32 = 2;
+        let j0 = (at(2) - sw) as i32;
+        let j1 = (at(4) - sw) as i32;
+        let j2 = (at(6) - sw) as i32;
+        c[data_start..data_start + 4].copy_from_slice(&default_off.to_be_bytes());
+        c[data_start + 4..data_start + 8].copy_from_slice(&low.to_be_bytes());
+        c[data_start + 8..data_start + 12].copy_from_slice(&high.to_be_bytes());
+        c[data_start + 12..data_start + 16].copy_from_slice(&j0.to_be_bytes());
+        c[data_start + 16..data_start + 20].copy_from_slice(&j1.to_be_bytes());
+        c[data_start + 20..data_start + 24].copy_from_slice(&j2.to_be_bytes());
+        c
+    }
+
+    #[test]
+    fn tableswitch_hits_each_slot() {
+        let cp = empty_cp();
+        for (idx, expect) in [(0, 1i32), (1, 2), (2, 3)] {
+            let code = tableswitch_code();
+            let interp = Interpreter::new(&code, &cp);
+            let mut frame = Frame::new(1, 1);
+            frame.locals.set_int(0, idx).unwrap();
+            assert_eq!(
+                interp.interpret(&mut frame).unwrap(),
+                Value::Int(expect),
+                "index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn tableswitch_out_of_range_hits_default() {
+        let code = tableswitch_code();
+        let cp = empty_cp();
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(1, 1);
+        frame.locals.set_int(0, 99).unwrap();
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(0));
+    }
+
+    /// 构造 lookupswitch:稀疏 key=10→1, key=20→2,未命中→0。
+    fn lookupswitch_code() -> Vec<u8> {
+        let mut c = vec![Opcode::Iload0 as u8];
+        let sw = c.len();
+        c.push(Opcode::Lookupswitch as u8);
+        let pad = (4 - ((sw + 1) % 4)) % 4;
+        c.extend(std::iter::repeat_n(0u8, pad));
+        let data_start = c.len();
+        // default(4)+npairs(4)+2×(match,offset)(16)=24
+        c.extend_from_slice(&[0u8; 24]);
+        let targets_base = c.len();
+        let at = |n: usize| targets_base + n;
+        c.push(Opcode::Iconst0 as u8); c.push(Opcode::Ireturn as u8); // default
+        c.push(Opcode::Iconst1 as u8); c.push(Opcode::Ireturn as u8); // key 10
+        c.push(Opcode::Iconst2 as u8); c.push(Opcode::Ireturn as u8); // key 20
+        let default_off = (at(0) - sw) as i32;
+        let npairs: i32 = 2;
+        let m0 = 10i32;
+        let o0 = (at(2) - sw) as i32;
+        let m1 = 20i32;
+        let o1 = (at(4) - sw) as i32;
+        c[data_start..data_start + 4].copy_from_slice(&default_off.to_be_bytes());
+        c[data_start + 4..data_start + 8].copy_from_slice(&npairs.to_be_bytes());
+        c[data_start + 8..data_start + 12].copy_from_slice(&m0.to_be_bytes());
+        c[data_start + 12..data_start + 16].copy_from_slice(&o0.to_be_bytes());
+        c[data_start + 16..data_start + 20].copy_from_slice(&m1.to_be_bytes());
+        c[data_start + 20..data_start + 24].copy_from_slice(&o1.to_be_bytes());
+        c
+    }
+
+    #[test]
+    fn lookupswitch_matches_key() {
+        let cp = empty_cp();
+        for (key, expect) in [(10, 1i32), (20, 2)] {
+            let code = lookupswitch_code();
+            let interp = Interpreter::new(&code, &cp);
+            let mut frame = Frame::new(1, 1);
+            frame.locals.set_int(0, key).unwrap();
+            assert_eq!(
+                interp.interpret(&mut frame).unwrap(),
+                Value::Int(expect),
+                "key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookupswitch_unmatched_hits_default() {
+        let code = lookupswitch_code();
+        let cp = empty_cp();
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(1, 1);
+        frame.locals.set_int(0, 999).unwrap();
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(0));
     }
 }

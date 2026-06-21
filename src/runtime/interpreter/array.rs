@@ -59,6 +59,28 @@ pub(super) fn a_new_array(
     Ok(())
 }
 
+/// 解析数组类型描述符(`[[I` 等)→ (总维数, 叶子默认槽)。
+/// 组件类型决定叶子默认值(基本零值 / 引用 null);非数组描述符报错。
+fn parse_array_descriptor(desc: &str) -> Result<(usize, Slot), VmError> {
+    let b = desc.as_bytes();
+    let mut ndim = 0;
+    while ndim < b.len() && b[ndim] == b'[' {
+        ndim += 1;
+    }
+    if ndim == 0 {
+        return Err(VmError::BadConstant("multianewarray 描述符非数组"));
+    }
+    let base = match b.get(ndim) {
+        Some(b'I' | b'Z' | b'B' | b'C' | b'S') => Slot::Int(0),
+        Some(b'J') => Slot::Long(0),
+        Some(b'F') => Slot::Float(0.0),
+        Some(b'D') => Slot::Double(0.0),
+        Some(b'L') => Slot::Reference(Reference::null()),
+        _ => return Err(VmError::BadConstant("multianewarray 非法组件类型")),
+    };
+    Ok((ndim, base))
+}
+
 /// `arraylength`:弹 arrayref,null 检查,压长度。
 pub(super) fn array_length(frame: &mut Frame, vm: &mut Vm<'_>) -> Result<(), VmError> {
     let arrayref = frame.operands.pop_reference()?;
@@ -204,4 +226,36 @@ fn pop_array_value(frame: &mut Frame, kind: ArrayKind) -> Result<Slot, VmError> 
         ArrayKind::Double => Slot::Double(frame.operands.pop_double()?),
         ArrayKind::Ref => Slot::Reference(frame.operands.pop_reference()?),
     })
+}
+
+#[cfg(test)]
+mod multi_tests {
+    use super::*;
+    use crate::runtime::Slot;
+
+    #[test]
+    fn parse_int_2d() {
+        let (n, base) = parse_array_descriptor("[[I").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(base, Slot::Int(0));
+    }
+
+    #[test]
+    fn parse_object_2d() {
+        let (n, base) = parse_array_descriptor("[[Ljava/lang/Object;").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(base, Slot::Reference(crate::runtime::Reference::null()));
+    }
+
+    #[test]
+    fn parse_long_1d() {
+        let (n, base) = parse_array_descriptor("[J").unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(base, Slot::Long(0));
+    }
+
+    #[test]
+    fn parse_non_array_rejected() {
+        assert!(parse_array_descriptor("Ljava/lang/String;").is_err());
+    }
 }

@@ -896,6 +896,12 @@ impl<'a> Interpreter<'a> {
                     array::a_new_array(self, frame, vm, index)?;
                     pc += 3;
                 }
+                Opcode::Multianewarray => {
+                    let index = self.read_u2(pc + 1)?;
+                    let dims = self.read_u1(pc + 3)?;
+                    array::multi_new_array(self, frame, vm, index, dims)?;
+                    pc += 4;
+                }
                 Opcode::Arraylength => {
                     array::array_length(frame, vm)?;
                     pc += 1;
@@ -1397,6 +1403,128 @@ mod tests {
         let mut bytes = vec![0x00, 0x02, 0x03]; // count=2, Integer tag
         bytes.extend_from_slice(&value.to_be_bytes());
         ConstantPool::parse(&mut crate::classfile::Reader::new(&bytes)).unwrap()
+    }
+
+    /// CP:#1=Class(name_index=#2),#2=Utf8(name)。multianewarray 用索引 1。
+    fn cp_with_class(name: &str) -> ConstantPool {
+        let mut bytes = vec![0x00, 0x03, 0x07, 0x00, 0x02]; // count=3, Class@1->Utf8@2
+        bytes.push(0x01); // Utf8 tag
+        bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        ConstantPool::parse(&mut crate::classfile::Reader::new(&bytes)).unwrap()
+    }
+
+    // ===== Layer 4.3b:multianewarray(完全分配)=====
+
+    #[test]
+    fn multianewarray_full_outer_length() {
+        // iconst_2; iconst_3; multianewarray [[I dims=2; arraylength -> 2
+        let cp = cp_with_class("[[I");
+        let code = [
+            Opcode::Iconst2 as u8,
+            Opcode::Iconst3 as u8,
+            Opcode::Multianewarray as u8,
+            0x00,
+            0x01,
+            0x02,
+            Opcode::Arraylength as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(0, 4);
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(2));
+    }
+
+    #[test]
+    fn multianewarray_full_inner_length_and_leaf() {
+        // iconst_2; iconst_3; multianewarray [[I dims=2; iconst_0; aaload; arraylength -> 3
+        let cp = cp_with_class("[[I");
+        let code = [
+            Opcode::Iconst2 as u8,
+            Opcode::Iconst3 as u8,
+            Opcode::Multianewarray as u8,
+            0x00,
+            0x01,
+            0x02,
+            Opcode::Iconst0 as u8,
+            Opcode::Aaload as u8,
+            Opcode::Arraylength as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(0, 4);
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(3));
+    }
+
+    // ===== Layer 4.3b:multianewarray(部分分配 + 错误)=====
+
+    /// dims=2 < ndim=3:a[0][0] 应为 null(ifnonnull 不跳 → 返回 0)。
+    #[test]
+    fn multianewarray_partial_inner_is_null() {
+        let cp = cp_with_class("[[[I");
+        let code = [
+            Opcode::Iconst2 as u8,
+            Opcode::Iconst3 as u8,
+            Opcode::Multianewarray as u8,
+            0x00,
+            0x01,
+            0x02,
+            Opcode::Iconst0 as u8,
+            Opcode::Aaload as u8, // a[0] = int[][] len 3
+            Opcode::Iconst0 as u8,
+            Opcode::Aaload as u8, // a[0][0] = null(部分分配)
+            Opcode::Ifnonnull as u8,
+            0x00,
+            0x05, // 非空跳到 iconst_1
+            Opcode::Iconst0 as u8,
+            Opcode::Ireturn as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(0, 4);
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(0));
+    }
+
+    #[test]
+    fn multianewarray_negative_size_rejected() {
+        let cp = cp_with_class("[[I");
+        let code = [
+            Opcode::IconstM1 as u8, // 外层 -1
+            Opcode::Iconst3 as u8,
+            Opcode::Multianewarray as u8,
+            0x00,
+            0x01,
+            0x02,
+            Opcode::Ireturn as u8,
+        ];
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(0, 4);
+        assert_eq!(
+            interp.interpret(&mut frame),
+            Err(crate::runtime::VmError::NegativeArraySize)
+        );
+    }
+
+    #[test]
+    fn multianewarray_dims_exceeds_ndim_rejected() {
+        let cp = cp_with_class("[[I"); // ndim=2
+        let code = [
+            Opcode::Iconst1 as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Multianewarray as u8,
+            0x00,
+            0x01,
+            0x03, // dims=3 > 2
+            Opcode::Ireturn as u8,
+        ];
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(0, 4);
+        assert!(matches!(
+            interp.interpret(&mut frame),
+            Err(crate::runtime::VmError::BadConstant(_))
+        ));
     }
 
     #[test]

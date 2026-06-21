@@ -81,6 +81,59 @@ fn parse_array_descriptor(desc: &str) -> Result<(usize, Slot), VmError> {
     Ok((ndim, base))
 }
 
+/// 递归分配嵌套数组树。`counts[depth]` 为当前层长度。
+/// 最后一层:`dims == ndim` 填叶子默认值;`dims < ndim` 填 null(余下维度未分配)。
+fn alloc_multi(
+    vm: &mut Vm<'_>,
+    counts: &[i32],
+    depth: usize,
+    ndim: usize,
+    base: Slot,
+) -> Result<Reference, VmError> {
+    let len = counts[depth] as usize;
+    let last = depth + 1 == counts.len();
+    let mut elements = Vec::with_capacity(len);
+    for _ in 0..len {
+        if last {
+            if counts.len() < ndim {
+                elements.push(Slot::Reference(Reference::null()));
+            } else {
+                elements.push(base);
+            }
+        } else {
+            let child = alloc_multi(vm, counts, depth + 1, ndim, base)?;
+            elements.push(Slot::Reference(child));
+        }
+    }
+    Ok(vm.heap_mut().alloc(Oop::Array(ArrayOop::new(elements))))
+}
+
+/// `multianewarray`:解析描述符 → 弹 dims 个 count → 递归分配 → 压外层引用。
+pub(super) fn multi_new_array(
+    interp: &Interpreter<'_>,
+    frame: &mut Frame,
+    vm: &mut Vm<'_>,
+    class_index: u16,
+    dims: u8,
+) -> Result<(), VmError> {
+    let name = resolve_class_name(interp.cp(), class_index)?;
+    let (ndim, base) = parse_array_descriptor(&name)?;
+    if dims == 0 || dims as usize > ndim {
+        return Err(VmError::BadConstant("multianewarray dims 与 ndim 不符"));
+    }
+    let mut counts: Vec<i32> = Vec::with_capacity(dims as usize);
+    for _ in 0..dims {
+        counts.push(frame.operands.pop_int()?);
+    }
+    counts.reverse(); // counts[0] = 最外层
+    if counts.iter().any(|&c| c < 0) {
+        return Err(VmError::NegativeArraySize);
+    }
+    let r = alloc_multi(vm, &counts, 0, ndim, base)?;
+    frame.operands.push_reference(r)?;
+    Ok(())
+}
+
 /// `arraylength`:弹 arrayref,null 检查,压长度。
 pub(super) fn array_length(frame: &mut Frame, vm: &mut Vm<'_>) -> Result<(), VmError> {
     let arrayref = frame.operands.pop_reference()?;

@@ -920,6 +920,38 @@ impl<'a> Interpreter<'a> {
                     array::array_load(frame, vm, array::ArrayKind::Short)?;
                     pc += 1;
                 }
+                Opcode::Iastore => {
+                    array::array_store(frame, vm, array::ArrayKind::Int)?;
+                    pc += 1;
+                }
+                Opcode::Lastore => {
+                    array::array_store(frame, vm, array::ArrayKind::Long)?;
+                    pc += 1;
+                }
+                Opcode::Fastore => {
+                    array::array_store(frame, vm, array::ArrayKind::Float)?;
+                    pc += 1;
+                }
+                Opcode::Dastore => {
+                    array::array_store(frame, vm, array::ArrayKind::Double)?;
+                    pc += 1;
+                }
+                Opcode::Aastore => {
+                    array::array_store(frame, vm, array::ArrayKind::Ref)?;
+                    pc += 1;
+                }
+                Opcode::Bastore => {
+                    array::array_store(frame, vm, array::ArrayKind::Byte)?;
+                    pc += 1;
+                }
+                Opcode::Castore => {
+                    array::array_store(frame, vm, array::ArrayKind::Char)?;
+                    pc += 1;
+                }
+                Opcode::Sastore => {
+                    array::array_store(frame, vm, array::ArrayKind::Short)?;
+                    pc += 1;
+                }
                 Opcode::Return => return Ok(Value::Void),
                 Opcode::Ireturn => {
                     let v = frame.operands.pop_int()?;
@@ -1960,6 +1992,88 @@ mod tests {
         let cp = empty_cp();
         let mut frame = Frame::new(1, 2);
         frame.locals.set_reference(0, arr).unwrap();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
+            VmError::ArrayIndexOutOfBounds
+        );
+    }
+
+    // ===== Layer 4.3a:数组存储 =====
+
+    #[test]
+    fn iastore_then_iaload_round_trip() {
+        // iconst_2(count); newarray int; astore_0(arr);
+        // aload_0; iconst_1(idx); bipush 42(val); iastore;
+        // aload_0; iconst_1; iaload; ireturn -> 42
+        let code = [
+            Opcode::Iconst2 as u8,
+            Opcode::Newarray as u8, 10,
+            Opcode::Astore0 as u8,
+            Opcode::Aload0 as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Bipush as u8, 0x2A,
+            Opcode::Iastore as u8,
+            Opcode::Aload0 as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Iaload as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(1, 3);
+        let mut vm = Vm::default();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn bastore_baload_sign_extension() {
+        // iconst_1; newarray byte(8); astore_0;
+        // aload_0; iconst_0; sipush 200; bastore;
+        // aload_0; iconst_0; baload; ireturn -> -56
+        let code = [
+            Opcode::Iconst1 as u8,
+            Opcode::Newarray as u8, 8,
+            Opcode::Astore0 as u8,
+            Opcode::Aload0 as u8,
+            Opcode::Iconst0 as u8,
+            Opcode::Sipush as u8, 0x00, 0xC8,
+            Opcode::Bastore as u8,
+            Opcode::Aload0 as u8,
+            Opcode::Iconst0 as u8,
+            Opcode::Baload as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(1, 3);
+        let mut vm = Vm::default();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            Value::Int(-56)
+        );
+    }
+
+    #[test]
+    fn iastore_out_of_bounds_is_aioobe() {
+        // int[1]; 存到 index 5 越界 -> AIOOBE
+        let code = [
+            Opcode::Iconst1 as u8,
+            Opcode::Newarray as u8, 10,
+            Opcode::Astore0 as u8,
+            Opcode::Aload0 as u8,
+            Opcode::Iconst5 as u8,
+            Opcode::Bipush as u8, 0x09,
+            Opcode::Iastore as u8,
+            Opcode::Iconst0 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(1, 3);
+        let mut vm = Vm::default();
         let interp = Interpreter::new(&code, &cp);
         assert_eq!(
             interp.interpret_with(&mut frame, &mut vm).unwrap_err(),

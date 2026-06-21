@@ -158,3 +158,50 @@ fn push_array_value(frame: &mut Frame, kind: ArrayKind, slot: Slot) -> Result<()
     }
     Ok(())
 }
+
+/// `*astore`:弹 value、弹 index、弹 arrayref,null + 越界检查后写。
+/// byte/char/short 存原始 int(扩展统一推迟到加载侧,与符号/零扩展等价)。
+pub(super) fn array_store(
+    frame: &mut Frame,
+    vm: &mut Vm<'_>,
+    kind: ArrayKind,
+) -> Result<(), VmError> {
+    let value = pop_array_value(frame, kind)?;
+    let index = frame.operands.pop_int()?;
+    let arrayref = frame.operands.pop_reference()?;
+    if arrayref.is_null() {
+        return Err(VmError::NullPointer);
+    }
+    let idx = if index < 0 {
+        return Err(VmError::ArrayIndexOutOfBounds);
+    } else {
+        index as usize
+    };
+    match vm
+        .heap_mut()
+        .get_mut(arrayref)
+        .ok_or(VmError::BadConstant("astore 引用悬空"))?
+    {
+        Oop::Array(a) => {
+            if idx >= a.length() {
+                return Err(VmError::ArrayIndexOutOfBounds);
+            }
+            a.set_element(idx, value);
+        }
+        Oop::Instance(_) => return Err(VmError::BadConstant("astore 目标非数组")),
+    }
+    Ok(())
+}
+
+/// 按种类弹栈取值(byte/char/short 取 int;cat-2 取 long/double)。
+fn pop_array_value(frame: &mut Frame, kind: ArrayKind) -> Result<Slot, VmError> {
+    Ok(match kind {
+        ArrayKind::Int | ArrayKind::Byte | ArrayKind::Char | ArrayKind::Short => {
+            Slot::Int(frame.operands.pop_int()?)
+        }
+        ArrayKind::Long => Slot::Long(frame.operands.pop_long()?),
+        ArrayKind::Float => Slot::Float(frame.operands.pop_float()?),
+        ArrayKind::Double => Slot::Double(frame.operands.pop_double()?),
+        ArrayKind::Ref => Slot::Reference(frame.operands.pop_reference()?),
+    })
+}

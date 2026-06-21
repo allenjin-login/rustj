@@ -16,4 +16,4 @@ pub use interpreter::{Interpreter, Value, VmError};
 pub use local_vars::LocalVars;
 pub use operand_stack::OperandStack;
 pub use slot::{Reference, Slot};
-pub use vm::Vm;
+pub use vm::{DEFAULT_STACK_LIMIT, Vm};

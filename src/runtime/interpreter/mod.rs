@@ -860,6 +860,12 @@ impl<'a> Interpreter<'a> {
                     invoke::invoke_virtual(self, frame, vm, index)?;
                     pc += 3;
                 }
+                Opcode::Invokeinterface => {
+                    let index = self.read_u2(pc + 1)?;
+                    // count(pc+3) 与尾 0(pc+4)对运行时冗余,随 pc += 5 丢弃。
+                    invoke::invoke_interface(self, frame, vm, index)?;
+                    pc += 5;
+                }
                 Opcode::Return => return Ok(Value::Void),
                 Opcode::Ireturn => {
                     let v = frame.operands.pop_int()?;

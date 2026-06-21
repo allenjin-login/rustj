@@ -37,22 +37,28 @@ pub(crate) fn run_with_depth<R>(
     r
 }
 
-/// 解析 `Methodref` 常量池条目 → `(类内部名, 方法名, 描述符)`。
+/// 解析 `Methodref` / `InterfaceMethodref` 常量池条目 → `(类内部名, 方法名, 描述符)`。
 ///
-/// 返回 owned `String`,避免常量池借用与后续栈帧操作纠缠。
+/// `invokestatic`/`special`/`virtual` 指向 `Methodref`;`invokeinterface` 指向
+/// `InterfaceMethodref`——两者结构相同,此处一并接受。返回 owned `String`,
+/// 避免常量池借用与后续栈帧操作纠缠。
 pub(super) fn resolve_methodref(
     cp: &ConstantPool,
     index: u16,
 ) -> Result<(String, String, String), VmError> {
-    let ConstantPoolEntry::Methodref {
-        class_index,
-        name_and_type_index,
-    } = cp.get(index)?
-    else {
-        return Err(VmError::BadConstant("invokestatic 操作数须为 Methodref"));
+    let (class_index, name_and_type_index) = match cp.get(index)? {
+        ConstantPoolEntry::Methodref {
+            class_index,
+            name_and_type_index,
+        }
+        | ConstantPoolEntry::InterfaceMethodref {
+            class_index,
+            name_and_type_index,
+        } => (*class_index, *name_and_type_index),
+        _ => return Err(VmError::BadConstant("invoke 操作数须为 Methodref/InterfaceMethodref")),
     };
-    let class_name = class_name(cp, *class_index)?;
-    let (name, desc) = name_and_type(cp, *name_and_type_index)?;
+    let class_name = class_name(cp, class_index)?;
+    let (name, desc) = name_and_type(cp, name_and_type_index)?;
     Ok((class_name, name, desc))
 }
 
@@ -251,19 +257,32 @@ pub(super) fn invoke_special(
     }
     let objref = frame.operands.pop_reference()?;
 
-    let Some(target_lc) = vm
+    let registry = vm
         .registry()
-        .ok_or(VmError::BadConstant("invokespecial 需要类注册表"))?
-        .get(&class_name)
-    else {
-        // 未加载类(根类 java/lang/Object 等):仅放行 <init>()V 空构造器。
-        if method_name == "<init>" && matches!(md.return_type, ReturnDescriptor::Void) {
-            return Ok(());
+        .ok_or(VmError::BadConstant("invokespecial 需要类注册表"))?;
+    // 解析目标 (类, 方法):
+    //   <init> → 声明类精确(未加载根类 ()V → 空操作,沿用 4.1);
+    //   私有   → 声明类精确(私有不可继承,无需虚查);
+    //   其余   → super 虚查(声明类 = 调用者直接超类,上行)。
+    let (target_lc, target_method) = if method_name == "<init>" {
+        match registry.get(&class_name) {
+            None => {
+                // 未加载类(根类 java/lang/Object 等):仅放行 <init>()V 空构造器。
+                if matches!(md.return_type, ReturnDescriptor::Void) {
+                    return Ok(());
+                }
+                return Err(VmError::BadConstant("invokespecial 目标类未加载"));
+            }
+            Some(lc) => (lc, find_method(&lc.cf, &method_name, &desc)?),
         }
-        return Err(VmError::BadConstant("invokespecial 目标类未加载"));
+    } else {
+        match registry.find_exact_method(&class_name, &method_name, &desc) {
+            Some((lc, m)) if m.access_flags.is_private() => (lc, m),
+            _ => registry
+                .find_virtual_method(&class_name, &method_name, &desc)
+                .ok_or(VmError::BadConstant("invokespecial 未找到目标方法"))?,
+        }
     };
-
-    let target_method = find_method(&target_lc.cf, &method_name, &desc)?;
     let code = target_method
         .code
         .as_ref()
@@ -330,13 +349,14 @@ pub(super) fn invoke_virtual(
     let registry = vm
         .registry()
         .ok_or(VmError::BadConstant("invokevirtual 需要类注册表"))?;
+    // 类链先行,落空走接口 default(Java 8+ 类类型调用 default 亦走此路);
+    // 命中抽象方法 → AbstractMethodError。
     let (target_lc, target_method) = registry
-        .find_virtual_method(&runtime_class, &method_name, &desc)
-        .ok_or(VmError::BadConstant("invokevirtual 未找到目标方法"))?;
-    let code = target_method
-        .code
-        .as_ref()
-        .ok_or(VmError::BadConstant("invokevirtual 目标方法无 Code(抽象/原生)"))?;
+        .resolve_dispatch(&runtime_class, &method_name, &desc)
+        .ok_or(VmError::AbstractMethodError)?;
+    let Some(code) = target_method.code.as_ref() else {
+        return Err(VmError::AbstractMethodError);
+    };
 
     let mut callee = Frame::new(code.max_locals, code.max_stack);
     callee.locals.set_reference(0, objref)?;
@@ -359,6 +379,74 @@ pub(super) fn invoke_virtual(
         (ReturnDescriptor::FieldType(_), v) => push_return(frame, v)?,
         (ReturnDescriptor::Void, _) => {
             return Err(VmError::BadConstant("invokevirtual void 方法返回了值"));
+        }
+    }
+    Ok(())
+}
+
+/// 执行 `invokeinterface`:按对象运行时实际类分派。语义与 `invokevirtual` 一致
+/// (类链先行 → 接口 default 兜底,经 `resolve_dispatch`),差别仅在操作数 5 字节
+/// (由分派循环 `pc += 5` 处理)与命中抽象方法报 `AbstractMethodError`。Methodref
+/// 声明接口仅参与解析校验,**不参与分派**。
+pub(super) fn invoke_interface(
+    interp: &Interpreter<'_>,
+    frame: &mut Frame,
+    vm: &mut Vm<'_>,
+    methodref_index: u16,
+) -> Result<(), VmError> {
+    let (_declared_iface, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
+    let md = parse_method_descriptor(&desc)?;
+
+    let mut args: Vec<Arg> = Vec::with_capacity(md.parameters.len());
+    for ft in md.parameters.iter().rev() {
+        args.push(pop_arg(frame, ft)?);
+    }
+    let objref = frame.operands.pop_reference()?;
+    if objref.is_null() {
+        return Err(VmError::NullPointer);
+    }
+
+    // 运行时类 = 对象实际类(owned String,释放堆借用)。
+    let runtime_class = vm
+        .heap()
+        .get(objref)
+        .ok_or(VmError::BadConstant("invokeinterface 引用悬空"))?;
+    let runtime_class = match runtime_class {
+        Oop::Instance(i) => i.class_name().to_string(),
+    };
+
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("invokeinterface 需要类注册表"))?;
+    // 类链先行,落空走接口 default;命中抽象方法 → AbstractMethodError。
+    let (target_lc, target_method) = registry
+        .resolve_dispatch(&runtime_class, &method_name, &desc)
+        .ok_or(VmError::AbstractMethodError)?;
+    let Some(code) = target_method.code.as_ref() else {
+        return Err(VmError::AbstractMethodError);
+    };
+
+    let mut callee = Frame::new(code.max_locals, code.max_stack);
+    callee.locals.set_reference(0, objref)?;
+    let mut slot: u16 = 1;
+    for a in args {
+        let advance = store_arg(&mut callee.locals, slot, a)?;
+        slot = slot
+            .checked_add(advance)
+            .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
+    }
+
+    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
+    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm))?;
+
+    match (md.return_type, result) {
+        (ReturnDescriptor::Void, Value::Void) => {}
+        (ReturnDescriptor::FieldType(_), Value::Void) => {
+            return Err(VmError::BadConstant("invokeinterface 期望返回值,被调用者返回 void"));
+        }
+        (ReturnDescriptor::FieldType(_), v) => push_return(frame, v)?,
+        (ReturnDescriptor::Void, _) => {
+            return Err(VmError::BadConstant("invokeinterface void 方法返回了值"));
         }
     }
     Ok(())

@@ -260,6 +260,50 @@ impl ClassRegistry {
         None
     }
 
+    /// `class_name` 的所有超类型名集合:自身 + 超类链 + 各类的传递接口闭包。
+    fn supertypes_of(&self, class_name: &str) -> HashSet<String> {
+        let mut set = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut cur = self.get(class_name);
+        while let Some(lc) = cur {
+            set.insert(lc.name().to_string());
+            for iface in lc.interface_names() {
+                if !set.contains(&iface) {
+                    queue.push_back(iface);
+                }
+            }
+            cur = lc.super_class_name().and_then(|s| self.get(s));
+        }
+        while let Some(name) = queue.pop_front() {
+            if !set.insert(name.clone()) {
+                continue;
+            }
+            if let Some(ilc) = self.get(&name) {
+                for si in ilc.interface_names() {
+                    if !set.contains(&si) {
+                        queue.push_back(si);
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    /// `class_name` 是否 `target` 的实例(子类型)。数组对象仅匹配 Object;
+    /// 数组目标不匹配类对象(数组目标/协变顺延)。
+    pub fn is_instance(&self, class_name: &str, target: &str) -> bool {
+        if class_name.starts_with('[') {
+            return target == "java/lang/Object";
+        }
+        if target == "java/lang/Object" {
+            return true;
+        }
+        if target.starts_with('[') {
+            return false;
+        }
+        self.supertypes_of(class_name).contains(target)
+    }
+
     /// 虚/接口分派解析:类链先行(`find_virtual_method`),落空走接口 default
     /// (`find_default_method`)。命中抽象类方法(无 Code)时仍返回(由调用方判
     /// `AbstractMethodError`);default 路径必带 Code。
@@ -557,5 +601,45 @@ mod tests {
         reg.load(i_cf).unwrap();
         reg.load(c_cf).unwrap();
         assert!(reg.find_default_method("C", "m", "()I").is_none());
+    }
+
+    // utf8: 1=Object 2=Shape 3=Square 4=Rect 5=Drawable
+    // class: 6=Object 7=Shape 8=Square 9=Rect 10=Drawable
+    fn checkcast_hierarchy() -> ClassRegistry {
+        let mk = || {
+            mk_cp(
+                &["java/lang/Object", "Shape", "Square", "Rect", "Drawable"],
+                &[1, 2, 3, 4, 5],
+            )
+        };
+        let mut reg = ClassRegistry::new();
+        reg.load(mk_cf(mk(), 7, 6, vec![], vec![])).unwrap(); // Shape extends Object
+        reg.load(mk_cf(mk(), 8, 7, vec![10], vec![])).unwrap(); // Square extends Shape, impl Drawable
+        reg.load(mk_cf(mk(), 9, 7, vec![], vec![])).unwrap(); // Rect extends Shape
+        reg.load(mk_cf(mk(), 10, 6, vec![], vec![])).unwrap(); // Drawable (interface)
+        reg
+    }
+
+    #[test]
+    fn is_instance_class_and_super() {
+        let reg = checkcast_hierarchy();
+        assert!(reg.is_instance("Square", "Square"));
+        assert!(reg.is_instance("Square", "Shape"));
+        assert!(reg.is_instance("Square", "java/lang/Object"));
+        assert!(!reg.is_instance("Square", "Rect"));
+    }
+
+    #[test]
+    fn is_instance_interface() {
+        let reg = checkcast_hierarchy();
+        assert!(reg.is_instance("Square", "Drawable"));
+        assert!(!reg.is_instance("Rect", "Drawable"));
+    }
+
+    #[test]
+    fn is_instance_array_only_object() {
+        let reg = checkcast_hierarchy();
+        assert!(reg.is_instance("[I", "java/lang/Object"));
+        assert!(!reg.is_instance("[I", "Shape"));
     }
 }

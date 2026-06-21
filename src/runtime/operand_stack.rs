@@ -29,6 +29,11 @@ impl OperandStack {
         self.slots.is_empty()
     }
 
+    /// 清空操作数栈(异常处理者进入前调用;容量不变)。
+    pub fn clear(&mut self) {
+        self.slots.clear();
+    }
+
     // ---- category-1 ----
 
     pub fn push_int(&mut self, v: i32) -> Result<(), FrameError> {
@@ -203,5 +208,19 @@ mod tests {
         assert_eq!(s.pop_int().unwrap(), 3);
         assert_eq!(s.pop_long().unwrap(), 2);
         assert_eq!(s.pop_int().unwrap(), 1);
+    }
+
+    #[test]
+    fn clear_empties_a_populated_stack() {
+        let mut s = OperandStack::new(4);
+        s.push_int(1).unwrap();
+        s.push_int(2).unwrap();
+        assert_eq!(s.depth(), 2);
+        s.clear();
+        assert!(s.is_empty());
+        assert_eq!(s.depth(), 0);
+        // clear 后仍可正常压栈(容量不变)
+        s.push_int(9).unwrap();
+        assert_eq!(s.depth(), 1);
     }
 }

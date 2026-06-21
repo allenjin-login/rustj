@@ -57,6 +57,8 @@ pub enum VmError {
     NegativeArraySize,
     /// ClassCastException:checkcast 不匹配。
     ClassCastException,
+    /// 用户 athrow 抛出的异常(沿调用栈传播,直至被异常表处理者捕获)。
+    ThrownException(crate::runtime::Reference),
 }
 
 impl std::fmt::Display for VmError {
@@ -74,6 +76,7 @@ impl std::fmt::Display for VmError {
             Self::ArrayIndexOutOfBounds => write!(f, "ArrayIndexOutOfBoundsException"),
             Self::NegativeArraySize => write!(f, "NegativeArraySizeException"),
             Self::ClassCastException => write!(f, "ClassCastException"),
+            Self::ThrownException(_) => write!(f, "ThrownException"),
         }
     }
 }

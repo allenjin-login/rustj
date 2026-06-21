@@ -888,6 +888,38 @@ impl<'a> Interpreter<'a> {
                     array::array_length(frame, vm)?;
                     pc += 1;
                 }
+                Opcode::Iaload => {
+                    array::array_load(frame, vm, array::ArrayKind::Int)?;
+                    pc += 1;
+                }
+                Opcode::Laload => {
+                    array::array_load(frame, vm, array::ArrayKind::Long)?;
+                    pc += 1;
+                }
+                Opcode::Faload => {
+                    array::array_load(frame, vm, array::ArrayKind::Float)?;
+                    pc += 1;
+                }
+                Opcode::Daload => {
+                    array::array_load(frame, vm, array::ArrayKind::Double)?;
+                    pc += 1;
+                }
+                Opcode::Aaload => {
+                    array::array_load(frame, vm, array::ArrayKind::Ref)?;
+                    pc += 1;
+                }
+                Opcode::Baload => {
+                    array::array_load(frame, vm, array::ArrayKind::Byte)?;
+                    pc += 1;
+                }
+                Opcode::Caload => {
+                    array::array_load(frame, vm, array::ArrayKind::Char)?;
+                    pc += 1;
+                }
+                Opcode::Saload => {
+                    array::array_load(frame, vm, array::ArrayKind::Short)?;
+                    pc += 1;
+                }
                 Opcode::Return => return Ok(Value::Void),
                 Opcode::Ireturn => {
                     let v = frame.operands.pop_int()?;
@@ -1854,6 +1886,84 @@ mod tests {
         assert_eq!(
             interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
             VmError::NullPointer
+        );
+    }
+
+    // ===== Layer 4.3a:数组加载 =====
+
+    #[test]
+    fn baload_sign_extends_byte() {
+        use crate::oops::{ArrayOop, Oop};
+        use crate::runtime::Slot;
+        // 元素存 Int(200),baload 符号扩展 -> (200 as i8) as i32 = -56。
+        let mut vm = Vm::default();
+        let arr = vm
+            .heap_mut()
+            .alloc(Oop::Array(ArrayOop::new(vec![Slot::Int(200)])));
+        // aload_0(引用); iconst_0(下标); baload; ireturn
+        let code = [
+            Opcode::Aload0 as u8,
+            Opcode::Iconst0 as u8,
+            Opcode::Baload as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(1, 2);
+        frame.locals.set_reference(0, arr).unwrap();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            Value::Int(-56)
+        );
+    }
+
+    #[test]
+    fn caload_zero_extends_char() {
+        use crate::oops::{ArrayOop, Oop};
+        use crate::runtime::Slot;
+        // 存 Int(0xFFFF),caload 零扩展 -> (0xFFFF as u16) as i32 = 65535。
+        let mut vm = Vm::default();
+        let arr = vm
+            .heap_mut()
+            .alloc(Oop::Array(ArrayOop::new(vec![Slot::Int(0xFFFF)])));
+        let code = [
+            Opcode::Aload0 as u8,
+            Opcode::Iconst0 as u8,
+            Opcode::Caload as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(1, 2);
+        frame.locals.set_reference(0, arr).unwrap();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            Value::Int(65535)
+        );
+    }
+
+    #[test]
+    fn array_load_out_of_bounds_is_aioobe() {
+        use crate::oops::{ArrayOop, Oop};
+        use crate::runtime::Slot;
+        let mut vm = Vm::default();
+        let arr = vm
+            .heap_mut()
+            .alloc(Oop::Array(ArrayOop::new(vec![Slot::Int(0)]))); // len 1
+        // 下标 5 越界
+        let code = [
+            Opcode::Aload0 as u8,
+            Opcode::Iconst5 as u8,
+            Opcode::Iaload as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let cp = empty_cp();
+        let mut frame = Frame::new(1, 2);
+        frame.locals.set_reference(0, arr).unwrap();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
+            VmError::ArrayIndexOutOfBounds
         );
     }
 }

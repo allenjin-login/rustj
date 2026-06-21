@@ -25,6 +25,7 @@ pub enum Value {
     Long(i64),
     Float(f32),
     Double(f64),
+    Reference(Reference),
     Void,
 }
 
@@ -987,6 +988,10 @@ impl<'a> Interpreter<'a> {
                     let v = frame.operands.pop_double()?;
                     return Ok(Value::Double(v));
                 }
+                Opcode::Areturn => {
+                    let v = frame.operands.pop_reference()?;
+                    return Ok(Value::Reference(v));
+                }
                 other => return Err(VmError::UnsupportedOpcode(other)),
             }
         }
@@ -1525,6 +1530,38 @@ mod tests {
             interp.interpret(&mut frame),
             Err(crate::runtime::VmError::BadConstant(_))
         ));
+    }
+
+    // ===== Layer 4.5:areturn =====
+
+    #[test]
+    fn areturn_returns_null_reference() {
+        use crate::runtime::Reference;
+        let code = [Opcode::AconstNull as u8, Opcode::Areturn as u8];
+        let cp = empty_cp();
+        let mut frame = Frame::new(0, 1);
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret(&mut frame).unwrap(),
+            Value::Reference(Reference::null())
+        );
+    }
+
+    #[test]
+    fn areturn_returns_local_reference() {
+        use crate::runtime::Reference;
+        let code = [Opcode::Aload0 as u8, Opcode::Areturn as u8];
+        let cp = empty_cp();
+        let mut frame = Frame::new(1, 1);
+        frame
+            .locals
+            .set_reference(0, Reference::from_id(7))
+            .unwrap();
+        let interp = Interpreter::new(&code, &cp);
+        assert_eq!(
+            interp.interpret(&mut frame).unwrap(),
+            Value::Reference(Reference::from_id(7))
+        );
     }
 
     #[test]

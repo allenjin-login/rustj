@@ -171,6 +171,7 @@ fn push_return(frame: &mut Frame, v: Value) -> Result<(), VmError> {
         Value::Long(x) => frame.operands.push_long(x)?,
         Value::Float(x) => frame.operands.push_float(x)?,
         Value::Double(x) => frame.operands.push_double(x)?,
+        Value::Reference(r) => frame.operands.push_reference(r)?,
         Value::Void => {}
     }
     Ok(())

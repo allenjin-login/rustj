@@ -4,6 +4,7 @@
 //! 数组(`typeArrayOop`/`objArrayOop`)留待 4.3。
 
 pub mod array;
+pub mod bootstrap;
 pub mod instance;
 pub mod klass;
 pub mod oop;

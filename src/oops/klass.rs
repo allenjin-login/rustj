@@ -114,9 +114,13 @@ pub struct ClassRegistry {
 
 impl ClassRegistry {
     pub fn new() -> Self {
-        Self {
+        let mut reg = Self {
             classes: HashMap::new(),
-        }
+        };
+        // 预装标准 java.lang.* 异常层次(合成桩),使 catch(Throwable/Exception/NPE …)
+        // 与运行时异常抛出无需额外加载即可解析。Vm 以不可变借用持注册表,故须在构造期装好。
+        super::bootstrap::install_bootstrap(&mut reg);
+        reg
     }
 
     /// 加载(解析字段布局)并按 `this_class_name` 注册;返回已注册类的引用。

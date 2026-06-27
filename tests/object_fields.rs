@@ -126,6 +126,28 @@ fn run_result(
     interp.interpret_with(&mut frame, &mut vm)
 }
 
+/// 执行方法,断言其抛出运行时异常(统一为 `ThrownException`),返回异常对象的类内部名。
+fn run_thrown_class(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> String {
+    let lc = registry
+        .get(class_name)
+        .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
+    let method = find_method(&lc.cf, name, desc);
+    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
+    let mut frame = Frame::new(code.max_locals, code.max_stack);
+    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
+    let mut vm = Vm::new(registry);
+    let err = interp
+        .interpret_with(&mut frame, &mut vm)
+        .expect_err("期望抛出异常");
+    let VmError::ThrownException(exc) = err else {
+        panic!("应抛 ThrownException, 得 {err:?}")
+    };
+    match vm.heap().get(exc) {
+        Some(rustj::oops::Oop::Instance(i)) => i.class_name().to_string(),
+        other => panic!("异常应为实例对象, 得 {other:?}"),
+    }
+}
+
 const SOURCE: &str = r#"
 class Point { int x; int y; long tag; }
 class Counter { static int value; static long total; }
@@ -280,7 +302,7 @@ fn getfield_on_null_is_nullpointer() {
     }
     let registry = compile_and_load_all(SOURCE, "Objects");
     assert_eq!(
-        run_result(&registry, "Objects", "nullField", "()I", &[]).unwrap_err(),
-        VmError::NullPointer
+        run_thrown_class(&registry, "Objects", "nullField", "()I"),
+        "java/lang/NullPointerException"
     );
 }

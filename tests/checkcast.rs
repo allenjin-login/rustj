@@ -86,7 +86,8 @@ fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
 }
 
-fn run_err(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> VmError {
+/// 执行方法,断言其抛出运行时异常(统一为 `ThrownException`),返回异常对象的类内部名。
+fn run_thrown_class(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> String {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -98,9 +99,16 @@ fn run_err(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> VmE
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
     let mut vm = Vm::new(reg);
-    interp
+    let err = interp
         .interpret_with(&mut frame, &mut vm)
-        .expect_err("期望失败")
+        .expect_err("期望抛出异常");
+    let VmError::ThrownException(exc) = err else {
+        panic!("应抛 ThrownException, 得 {err:?}")
+    };
+    match vm.heap().get(exc) {
+        Some(rustj::oops::Oop::Instance(i)) => i.class_name().to_string(),
+        other => panic!("异常应为实例对象, 得 {other:?}"),
+    }
 }
 
 const SOURCE: &str = r#"
@@ -210,7 +218,7 @@ fn checkcast_fails_with_classcastexception() {
     }
     let reg = compile_and_load(SOURCE, "CheckCast");
     assert_eq!(
-        run_err(&reg, "CheckCast", "castFail", "()I"),
-        VmError::ClassCastException
+        run_thrown_class(&reg, "CheckCast", "castFail", "()I"),
+        "java/lang/ClassCastException"
     );
 }

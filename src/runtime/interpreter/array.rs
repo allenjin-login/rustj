@@ -5,7 +5,7 @@
 //! [`ArrayOop`] 统一存 `Vec<Slot>`(不记组件类型;4.3a 不做 ArrayStoreException)。
 
 use super::field::resolve_class_name;
-use super::{Interpreter, VmError};
+use super::{throw_exception, Interpreter, VmError};
 use crate::oops::{ArrayOop, Oop};
 use crate::runtime::{Frame, Reference, Slot, Vm};
 
@@ -26,7 +26,7 @@ pub(super) enum ArrayKind {
 pub(super) fn new_array(frame: &mut Frame, vm: &mut Vm<'_>, atype: u8) -> Result<(), VmError> {
     let count = frame.operands.pop_int()?;
     if count < 0 {
-        return Err(VmError::NegativeArraySize);
+        return Err(throw_exception(vm, "java/lang/NegativeArraySizeException"));
     }
     let default = match atype {
         4 | 5 | 8 | 9 | 10 => Slot::Int(0), // boolean/char/byte/short/int
@@ -51,7 +51,7 @@ pub(super) fn a_new_array(
     let _component = resolve_class_name(interp.cp(), class_index)?;
     let count = frame.operands.pop_int()?;
     if count < 0 {
-        return Err(VmError::NegativeArraySize);
+        return Err(throw_exception(vm, "java/lang/NegativeArraySizeException"));
     }
     let elements = vec![Slot::Reference(Reference::null()); count as usize];
     let r = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(elements)));
@@ -127,7 +127,7 @@ pub(super) fn multi_new_array(
     }
     counts.reverse(); // counts[0] = 最外层
     if counts.iter().any(|&c| c < 0) {
-        return Err(VmError::NegativeArraySize);
+        return Err(throw_exception(vm, "java/lang/NegativeArraySizeException"));
     }
     let r = alloc_multi(vm, &counts, 0, ndim, base)?;
     frame.operands.push_reference(r)?;
@@ -138,7 +138,7 @@ pub(super) fn multi_new_array(
 pub(super) fn array_length(frame: &mut Frame, vm: &mut Vm<'_>) -> Result<(), VmError> {
     let arrayref = frame.operands.pop_reference()?;
     if arrayref.is_null() {
-        return Err(VmError::NullPointer);
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
     let len = match vm
         .heap()
@@ -161,19 +161,30 @@ pub(super) fn array_load(
     let index = frame.operands.pop_int()?;
     let arrayref = frame.operands.pop_reference()?;
     if arrayref.is_null() {
-        return Err(VmError::NullPointer);
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
+    }
+    // 先取长度(借用释放后再抛 AIOOBE),再取元素——避免 `&mut vm`(抛异常)与
+    // `&Oop`(取元素)的借用冲突。
+    let length = match vm
+        .heap()
+        .get(arrayref)
+        .ok_or(VmError::BadConstant("aload 引用悬空"))?
+    {
+        Oop::Array(a) => a.length(),
+        Oop::Instance(_) => return Err(VmError::BadConstant("aload 目标非数组")),
+    };
+    if index < 0 || (index as usize) >= length {
+        return Err(throw_exception(
+            vm,
+            "java/lang/ArrayIndexOutOfBoundsException",
+        ));
     }
     let slot = match vm
         .heap()
         .get(arrayref)
         .ok_or(VmError::BadConstant("aload 引用悬空"))?
     {
-        Oop::Array(a) => {
-            if index < 0 || (index as usize) >= a.length() {
-                return Err(VmError::ArrayIndexOutOfBounds);
-            }
-            a.element(index as usize)
-        }
+        Oop::Array(a) => a.element(index as usize),
         Oop::Instance(_) => return Err(VmError::BadConstant("aload 目标非数组")),
     };
     push_array_value(frame, kind, slot)
@@ -245,24 +256,37 @@ pub(super) fn array_store(
     let index = frame.operands.pop_int()?;
     let arrayref = frame.operands.pop_reference()?;
     if arrayref.is_null() {
-        return Err(VmError::NullPointer);
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
-    let idx = if index < 0 {
-        return Err(VmError::ArrayIndexOutOfBounds);
-    } else {
-        index as usize
+    if index < 0 {
+        return Err(throw_exception(
+            vm,
+            "java/lang/ArrayIndexOutOfBoundsException",
+        ));
+    }
+    let idx = index as usize;
+    // 先以不可变借用查长度(释放后再抛 AIOOBE),再以可变借用写——避免 `&mut vm`
+    // (抛异常)与 `&mut Oop`(写)的借用冲突。
+    let length = match vm
+        .heap()
+        .get(arrayref)
+        .ok_or(VmError::BadConstant("astore 引用悬空"))?
+    {
+        Oop::Array(a) => a.length(),
+        Oop::Instance(_) => return Err(VmError::BadConstant("astore 目标非数组")),
     };
+    if idx >= length {
+        return Err(throw_exception(
+            vm,
+            "java/lang/ArrayIndexOutOfBoundsException",
+        ));
+    }
     match vm
         .heap_mut()
         .get_mut(arrayref)
         .ok_or(VmError::BadConstant("astore 引用悬空"))?
     {
-        Oop::Array(a) => {
-            if idx >= a.length() {
-                return Err(VmError::ArrayIndexOutOfBounds);
-            }
-            a.set_element(idx, value);
-        }
+        Oop::Array(a) => a.set_element(idx, value),
         Oop::Instance(_) => return Err(VmError::BadConstant("astore 目标非数组")),
     }
     Ok(())

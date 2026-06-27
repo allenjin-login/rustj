@@ -4,7 +4,7 @@
 //! 子类型判定经 `ClassRegistry::is_instance`(超类链 ∪ 接口闭包)。
 
 use super::field::resolve_class_name;
-use super::{Interpreter, VmError};
+use super::{throw_exception, Interpreter, VmError};
 use crate::oops::Oop;
 use crate::runtime::{Frame, Reference, Vm};
 
@@ -56,7 +56,7 @@ pub(super) fn check_cast(
     if ok {
         Ok(())
     } else {
-        Err(VmError::ClassCastException)
+        Err(throw_exception(vm, "java/lang/ClassCastException"))
     }
 }
 

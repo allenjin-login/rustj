@@ -20,7 +20,7 @@ use crate::metadata::{ClassFile, MethodInfo};
 use crate::oops::Oop;
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
-use super::{exception, Interpreter, Value, VmError};
+use super::{exception, throw_exception, Interpreter, Value, VmError};
 
 /// invoke 后调用者分派循环的流向。
 pub(super) enum InvokeFlow {
@@ -78,13 +78,14 @@ fn finish_invoke(
 }
 
 /// 进入一帧:`frame_depth +1`,执行 `f`,返回前 `−1`(Ok/Err 两路对称)。
-/// `frame_depth >= stack_limit` 时直接 [`VmError::StackOverflow`],不进入 `f`。
+/// `frame_depth >= stack_limit` 时直接抛 `java/lang/StackOverflowError`
+/// ([`VmError::ThrownException`]),不进入 `f`。
 pub(crate) fn run_with_depth<R>(
     vm: &mut Vm<'_>,
     f: impl FnOnce(&mut Vm<'_>) -> Result<R, VmError>,
 ) -> Result<R, VmError> {
     if vm.frame_depth >= vm.stack_limit {
-        return Err(VmError::StackOverflow);
+        return Err(throw_exception(vm, "java/lang/StackOverflowError"));
     }
     vm.frame_depth += 1;
     let r = f(vm);
@@ -375,7 +376,7 @@ pub(super) fn invoke_virtual(
     }
     let objref = frame.operands.pop_reference()?;
     if objref.is_null() {
-        return Err(VmError::NullPointer);
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
 
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
@@ -395,11 +396,14 @@ pub(super) fn invoke_virtual(
         .ok_or(VmError::BadConstant("invokevirtual 需要类注册表"))?;
     // 类链先行,落空走接口 default(Java 8+ 类类型调用 default 亦走此路);
     // 命中抽象方法 → AbstractMethodError。
-    let (target_lc, target_method) = registry
+    let (target_lc, target_method) = match registry
         .resolve_dispatch(&runtime_class, &method_name, &desc)
-        .ok_or(VmError::AbstractMethodError)?;
+    {
+        Some(x) => x,
+        None => return Err(throw_exception(vm, "java/lang/AbstractMethodError")),
+    };
     let Some(code) = target_method.code.as_ref() else {
-        return Err(VmError::AbstractMethodError);
+        return Err(throw_exception(vm, "java/lang/AbstractMethodError"));
     };
 
     let mut callee = Frame::new(code.max_locals, code.max_stack);
@@ -439,7 +443,7 @@ pub(super) fn invoke_interface(
     }
     let objref = frame.operands.pop_reference()?;
     if objref.is_null() {
-        return Err(VmError::NullPointer);
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
 
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
@@ -458,11 +462,14 @@ pub(super) fn invoke_interface(
         .registry()
         .ok_or(VmError::BadConstant("invokeinterface 需要类注册表"))?;
     // 类链先行,落空走接口 default;命中抽象方法 → AbstractMethodError。
-    let (target_lc, target_method) = registry
+    let (target_lc, target_method) = match registry
         .resolve_dispatch(&runtime_class, &method_name, &desc)
-        .ok_or(VmError::AbstractMethodError)?;
+    {
+        Some(x) => x,
+        None => return Err(throw_exception(vm, "java/lang/AbstractMethodError")),
+    };
     let Some(code) = target_method.code.as_ref() else {
-        return Err(VmError::AbstractMethodError);
+        return Err(throw_exception(vm, "java/lang/AbstractMethodError"));
     };
 
     let mut callee = Frame::new(code.max_locals, code.max_stack);
@@ -528,14 +535,21 @@ mod tests {
     }
 
     #[test]
-    fn run_with_depth_overflow_returns_stackoverflow() {
-        // limit=2:外层→depth1,中层→depth2,内层 depth>=limit → StackOverflow;
+    fn run_with_depth_overflow_throws_stackoverflow_error() {
+        // limit=2:外层→depth1,中层→depth2,内层 depth>=limit → 抛 StackOverflowError;
         // 异常路径仍对称归零。
-        let mut vm = crate::runtime::Vm::default().with_stack_limit(2);
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg).with_stack_limit(2);
         let r = super::run_with_depth(&mut vm, |vm| {
             super::run_with_depth(vm, |vm| super::run_with_depth(vm, |_| Ok(())))
         });
-        assert_eq!(r.unwrap_err(), super::VmError::StackOverflow);
+        let super::VmError::ThrownException(exc) = r.unwrap_err() else {
+            panic!("应抛 StackOverflowError(ThrownException)");
+        };
+        let Some(crate::oops::Oop::Instance(i)) = vm.heap().get(exc) else {
+            panic!("StackOverflowError 应为由引导桩分配的实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/StackOverflowError");
         assert_eq!(vm.frame_depth, 0);
     }
 }

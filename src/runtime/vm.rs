@@ -1,10 +1,11 @@
 //! 执行上下文:对象堆 + 类注册表 + 帧深度计数。对应 HotSpot `JavaThread`
 //! 执行所需的共享状态 + 栈深度检查。
 //!
-//! 4.1:纯数值路径可不带注册表([`Vm::default`] 空堆 + 无注册表);对象/字段/
-//! `invokestatic` 路径需注册表([`Vm::new`])。4.2b:帧深度计数 + 可配置上限
-//! ([`Vm::with_stack_limit`]),用于
-//! [`VmError::StackOverflow`](crate::runtime::interpreter::VmError)。
+//! 4.1:对象/字段/`invokestatic` 路径需注册表([`Vm::new`])。运行时异常(NPE/算术
+//! 异常等)统一为 `ThrownException`、须在堆上分配异常对象——故即便纯数值字节码也可能
+//! 需要注册表(便捷入口 `interpret()` 自带注册表);[`Vm::default`] 仅空堆 + 无注册表,
+//! 供确不抛异常的纯数值测试。4.2b:帧深度计数 + 可配置上限([`Vm::with_stack_limit`]);
+//! 超限时解释器抛 `java/lang/StackOverflowError`(统一为 `ThrownException`)。
 
 use crate::oops::ClassRegistry;
 use crate::runtime::heap::Heap;
@@ -19,7 +20,7 @@ pub struct Vm<'a> {
     registry: Option<&'a ClassRegistry>,
     /// 当前嵌套帧数(进入一帧 +1,退出 −1)。
     pub(crate) frame_depth: u32,
-    /// 帧深度上限;`frame_depth >= stack_limit` 时再调用 → StackOverflow。
+    /// 帧深度上限;`frame_depth >= stack_limit` 时再调用 → 抛 `StackOverflowError`。
     pub(crate) stack_limit: u32,
 }
 

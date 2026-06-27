@@ -89,6 +89,34 @@ fn run_with_limit(
     interp.interpret_with(&mut frame, &mut vm)
 }
 
+/// 执行方法(给定深度上限),断言其抛出运行时异常(统一为 `ThrownException`),返回异常类名。
+fn run_thrown_class_with_limit(
+    registry: &ClassRegistry,
+    class_name: &str,
+    name: &str,
+    desc: &str,
+    stack_limit: u32,
+) -> String {
+    let lc = registry
+        .get(class_name)
+        .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
+    let method = find_method(&lc.cf, name, desc);
+    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
+    let mut frame = Frame::new(code.max_locals, code.max_stack);
+    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
+    let mut vm = Vm::new(registry).with_stack_limit(stack_limit);
+    let err = interp
+        .interpret_with(&mut frame, &mut vm)
+        .expect_err("期望抛出异常");
+    let VmError::ThrownException(exc) = err else {
+        panic!("应抛 ThrownException, 得 {err:?}")
+    };
+    match vm.heap().get(exc) {
+        Some(rustj::oops::Oop::Instance(i)) => i.class_name().to_string(),
+        other => panic!("异常应为实例对象, 得 {other:?}"),
+    }
+}
+
 fn run(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
     run_with_limit(registry, class_name, name, desc, DEFAULT_STACK_LIMIT)
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
@@ -196,8 +224,8 @@ fn infinite_recursion_is_stackoverflow() {
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
     assert_eq!(
-        run_with_limit(&registry, "Vm", "infinite", "()I", 16).unwrap_err(),
-        VmError::StackOverflow
+        run_thrown_class_with_limit(&registry, "Vm", "infinite", "()I", 16),
+        "java/lang/StackOverflowError"
     );
 }
 
@@ -209,7 +237,7 @@ fn invokeinterface_on_null_is_nullpointer() {
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
     assert_eq!(
-        run_with_limit(&registry, "Vm", "nullIface", "()I", DEFAULT_STACK_LIMIT).unwrap_err(),
-        VmError::NullPointer
+        run_thrown_class_with_limit(&registry, "Vm", "nullIface", "()I", DEFAULT_STACK_LIMIT),
+        "java/lang/NullPointerException"
     );
 }

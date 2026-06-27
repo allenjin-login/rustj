@@ -32,11 +32,43 @@ pub enum Value {
     Void,
 }
 
-/// 运行时错误(JVM 语义层面)。
+/// 单步分派后,调用方循环应如何继续。
+pub(super) enum Step {
+    /// 继续下一条指令(`pc` 已由 dispatch 写回推进)。
+    Continue,
+    /// 当前方法返回(`*return`);携带返回值(void 用 [`Value::Void`])。
+    Return(Value),
+}
+
+/// 抛出一个 Java 异常:取引导桩类(`class_name` 须已由 [`ClassRegistry::new`] 预装)
+/// → `new_instance` → 在堆上分配 → 包装为 [`VmError::ThrownException`]。统一的 Java
+/// 异常通道——所有运行时异常(NPE/CCE/ArithmeticException/…)与用户 `athrow` 同源,
+/// 均经异常表分派、可被 `try/catch` 捕获。
+///
+/// 沿用 4.2 的 `'a` 借用技巧:[`Vm::registry`] 返回 `&'a ClassRegistry`(寿命不绑 `&self`),
+/// 故取出 `&'a LoadedClass` 后仍可 `&mut vm` 写堆。
+pub(super) fn throw_exception(vm: &mut Vm<'_>, class_name: &str) -> VmError {
+    use crate::oops::Oop;
+    let reg = vm
+        .registry()
+        .expect("抛异常需类注册表(内部不变量:引导桩须在 Vm 构造期装好)");
+    let lc = reg
+        .get(class_name)
+        .unwrap_or_else(|| panic!("{class_name} 应作为引导桩已加载(内部不变量)"));
+    let oop = Oop::Instance(reg.new_instance(lc));
+    let reference = vm.heap_mut().alloc(oop);
+    VmError::ThrownException(reference)
+}
+
+/// 运行时错误——二分:**Java 异常**(可捕获)vs **内部故障**(不可捕获)。
+///
+/// - [`VmError::ThrownException`]:唯一的 Java 异常通道——用户 `athrow` 与 JVM 自动抛出
+///   (NPE/CCE/ArithmeticException/AIOOBE/…)统一经此,沿异常表分派,**同帧/跨帧均可捕获**。
+/// - 其余变体:解释器内部故障(`UnsupportedOpcode`/`BadPc`/`Frame`/`ConstantPool`/
+///   `BadConstant`),对应 `VerifyError`/`InternalError` 性质,本层**不**抛给用户代码捕获,
+///   直接传播出 `interpret_with`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmError {
-    /// ArithmeticException:int 除零。
-    DivideByZero,
     /// 当前子集不支持的指令(随增量推进而收敛)。
     UnsupportedOpcode(Opcode),
     /// PC 越过字节码末尾仍未返回。
@@ -47,37 +79,20 @@ pub enum VmError {
     ConstantPool(ClassFileError),
     /// ldc 等取到非预期类型的常量。
     BadConstant(&'static str),
-    /// NullPointerException:对 null 引用取字段/数组/调用方法。
-    NullPointer,
-    /// AbstractMethodError:invokeinterface/invokevirtual 命中抽象方法(无 Code)。
-    AbstractMethodError,
-    /// StackOverflowError:帧嵌套深度超 `stack_limit`。
-    StackOverflow,
-    /// ArrayIndexOutOfBoundsException:*aload/*astore 索引越界。
-    ArrayIndexOutOfBounds,
-    /// NegativeArraySizeException:newarray/anewarray 负长度。
-    NegativeArraySize,
-    /// ClassCastException:checkcast 不匹配。
-    ClassCastException,
-    /// 用户 athrow 抛出的异常(沿调用栈传播,直至被异常表处理者捕获)。
+    /// Java 异常(用户 athrow 或 JVM 自动抛出):异常对象引用,沿异常表分派直至捕获。
     ThrownException(crate::runtime::Reference),
 }
 
 impl std::fmt::Display for VmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DivideByZero => write!(f, "ArithmeticException: / by zero"),
-            Self::UnsupportedOpcode(op) => write!(f, "unsupported opcode: {} (0x{:02X})", op.name(), *op as u8),
+            Self::UnsupportedOpcode(op) => {
+                write!(f, "unsupported opcode: {} (0x{:02X})", op.name(), *op as u8)
+            }
             Self::BadPc(pc) => write!(f, "pc ran off bytecode end: {pc}"),
             Self::Frame(e) => write!(f, "frame error: {e:?}"),
             Self::ConstantPool(e) => write!(f, "constant pool: {e:?}"),
             Self::BadConstant(msg) => write!(f, "bad constant: {msg}"),
-            Self::NullPointer => write!(f, "NullPointerException"),
-            Self::AbstractMethodError => write!(f, "AbstractMethodError"),
-            Self::StackOverflow => write!(f, "StackOverflowError"),
-            Self::ArrayIndexOutOfBounds => write!(f, "ArrayIndexOutOfBoundsException"),
-            Self::NegativeArraySize => write!(f, "NegativeArraySizeException"),
-            Self::ClassCastException => write!(f, "ClassCastException"),
             Self::ThrownException(_) => write!(f, "ThrownException"),
         }
     }
@@ -137,7 +152,11 @@ impl<'a> Interpreter<'a> {
     ///
     /// 既有单帧测试与此路径兼容;需要对象/字段/`invokestatic` 时用 [`Self::interpret_with`]。
     pub fn interpret(&self, frame: &mut Frame) -> Result<Value, VmError> {
-        let mut vm = Vm::default();
+        // 便捷路径自带注册表(装好引导异常桩):即便纯算术字节码也可能抛运行时异常
+        // (idiv/irem 除零 → ArithmeticException),故构造 registry 而非空 Vm,让
+        // throw_exception 有类可分配、有堆可入——避免"无注册表却需抛异常"的 panic。
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = Vm::new(&reg);
         self.interpret_with(frame, &mut vm)
     }
 
@@ -149,898 +168,12 @@ impl<'a> Interpreter<'a> {
                 return Err(VmError::BadPc(pc));
             }
             let op = Opcode::from_u8(self.code[pc])?;
-            match op {
-                // ---- 常量压栈 ----
-                Opcode::IconstM1 => {
-                    frame.operands.push_int(-1)?;
-                    pc += 1;
-                }
-                Opcode::Iconst0 => {
-                    frame.operands.push_int(0)?;
-                    pc += 1;
-                }
-                Opcode::Iconst1 => {
-                    frame.operands.push_int(1)?;
-                    pc += 1;
-                }
-                Opcode::Iconst2 => {
-                    frame.operands.push_int(2)?;
-                    pc += 1;
-                }
-                Opcode::Iconst3 => {
-                    frame.operands.push_int(3)?;
-                    pc += 1;
-                }
-                Opcode::Iconst4 => {
-                    frame.operands.push_int(4)?;
-                    pc += 1;
-                }
-                Opcode::Iconst5 => {
-                    frame.operands.push_int(5)?;
-                    pc += 1;
-                }
-                Opcode::Bipush => {
-                    let v = self.read_s1(pc + 1)? as i32;
-                    frame.operands.push_int(v)?;
-                    pc += 2;
-                }
-                Opcode::Sipush => {
-                    let v = self.read_s2(pc + 1)? as i32;
-                    frame.operands.push_int(v)?;
-                    pc += 3;
-                }
-                Opcode::Ldc => {
-                    let index = self.read_u1(pc + 1)? as u16;
-                    match self.cp.get(index)? {
-                        ConstantPoolEntry::Integer(v) => frame.operands.push_int(*v)?,
-                        ConstantPoolEntry::Float(v) => frame.operands.push_float(*v)?,
-                        _ => return Err(VmError::BadConstant("ldc 期望 int/float(3.2 仅支持数值)")),
-                    }
-                    pc += 2;
-                }
-                // ---- 加载局部变量 ----
-                Opcode::Iload => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    frame.operands.push_int(frame.locals.get_int(idx)?)?;
-                    pc += 2;
-                }
-                Opcode::Iload0 => {
-                    frame.operands.push_int(frame.locals.get_int(0)?)?;
-                    pc += 1;
-                }
-                Opcode::Iload1 => {
-                    frame.operands.push_int(frame.locals.get_int(1)?)?;
-                    pc += 1;
-                }
-                Opcode::Iload2 => {
-                    frame.operands.push_int(frame.locals.get_int(2)?)?;
-                    pc += 1;
-                }
-                Opcode::Iload3 => {
-                    frame.operands.push_int(frame.locals.get_int(3)?)?;
-                    pc += 1;
-                }
-                // ---- 存入局部变量 ----
-                Opcode::Istore => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    let v = frame.operands.pop_int()?;
-                    frame.locals.set_int(idx, v)?;
-                    pc += 2;
-                }
-                Opcode::Istore0 => {
-                    let v = frame.operands.pop_int()?;
-                    frame.locals.set_int(0, v)?;
-                    pc += 1;
-                }
-                Opcode::Istore1 => {
-                    let v = frame.operands.pop_int()?;
-                    frame.locals.set_int(1, v)?;
-                    pc += 1;
-                }
-                Opcode::Istore2 => {
-                    let v = frame.operands.pop_int()?;
-                    frame.locals.set_int(2, v)?;
-                    pc += 1;
-                }
-                Opcode::Istore3 => {
-                    let v = frame.operands.pop_int()?;
-                    frame.locals.set_int(3, v)?;
-                    pc += 1;
-                }
-                // ---- 引用局部变量(aload/astore)----
-                Opcode::Aload => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    frame.operands.push_reference(frame.locals.get_reference(idx)?)?;
-                    pc += 2;
-                }
-                Opcode::Aload0 => {
-                    frame.operands.push_reference(frame.locals.get_reference(0)?)?;
-                    pc += 1;
-                }
-                Opcode::Aload1 => {
-                    frame.operands.push_reference(frame.locals.get_reference(1)?)?;
-                    pc += 1;
-                }
-                Opcode::Aload2 => {
-                    frame.operands.push_reference(frame.locals.get_reference(2)?)?;
-                    pc += 1;
-                }
-                Opcode::Aload3 => {
-                    frame.operands.push_reference(frame.locals.get_reference(3)?)?;
-                    pc += 1;
-                }
-                Opcode::Astore => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    let v = frame.operands.pop_reference()?;
-                    frame.locals.set_reference(idx, v)?;
-                    pc += 2;
-                }
-                Opcode::Astore0 => {
-                    let v = frame.operands.pop_reference()?;
-                    frame.locals.set_reference(0, v)?;
-                    pc += 1;
-                }
-                Opcode::Astore1 => {
-                    let v = frame.operands.pop_reference()?;
-                    frame.locals.set_reference(1, v)?;
-                    pc += 1;
-                }
-                Opcode::Astore2 => {
-                    let v = frame.operands.pop_reference()?;
-                    frame.locals.set_reference(2, v)?;
-                    pc += 1;
-                }
-                Opcode::Astore3 => {
-                    let v = frame.operands.pop_reference()?;
-                    frame.locals.set_reference(3, v)?;
-                    pc += 1;
-                }
-                // ---- 整数算术(补码回绕)----
-                Opcode::Iadd => {
-                    let r = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    frame.operands.push_int(l.wrapping_add(r))?;
-                    pc += 1;
-                }
-                Opcode::Isub => {
-                    let r = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    frame.operands.push_int(l.wrapping_sub(r))?;
-                    pc += 1;
-                }
-                Opcode::Imul => {
-                    let r = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    frame.operands.push_int(l.wrapping_mul(r))?;
-                    pc += 1;
-                }
-                Opcode::Idiv => {
-                    let r = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    if r == 0 {
-                        return Err(VmError::DivideByZero);
-                    }
-                    frame.operands.push_int(l.wrapping_div(r))?;
-                    pc += 1;
-                }
-                Opcode::Irem => {
-                    let r = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    if r == 0 {
-                        return Err(VmError::DivideByZero);
-                    }
-                    frame.operands.push_int(l.wrapping_rem(r))?;
-                    pc += 1;
-                }
-                Opcode::Ineg => {
-                    let v = frame.operands.pop_int()?;
-                    frame.operands.push_int(v.wrapping_neg())?;
-                    pc += 1;
-                }
-                Opcode::Iinc => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    let delta = self.read_s1(pc + 2)? as i32;
-                    let v = frame.locals.get_int(idx)?;
-                    frame.locals.set_int(idx, v.wrapping_add(delta))?;
-                    pc += 3;
-                }
-                Opcode::Iand => {
-                    let r = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    frame.operands.push_int(l & r)?;
-                    pc += 1;
-                }
-                Opcode::Ior => {
-                    let r = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    frame.operands.push_int(l | r)?;
-                    pc += 1;
-                }
-                Opcode::Ixor => {
-                    let r = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    frame.operands.push_int(l ^ r)?;
-                    pc += 1;
-                }
-                Opcode::Ishl => {
-                    let s = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    frame.operands.push_int(l.wrapping_shl(s as u32))?;
-                    pc += 1;
-                }
-                Opcode::Ishr => {
-                    let s = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    frame.operands.push_int(l.wrapping_shr(s as u32))?;
-                    pc += 1;
-                }
-                Opcode::Iushr => {
-                    let s = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_int()?;
-                    frame.operands.push_int(((l as u32).wrapping_shr(s as u32)) as i32)?;
-                    pc += 1;
-                }
-                // ---- long:常量与加载 ----
-                Opcode::Lconst0 => {
-                    frame.operands.push_long(0)?;
-                    pc += 1;
-                }
-                Opcode::Lconst1 => {
-                    frame.operands.push_long(1)?;
-                    pc += 1;
-                }
-                Opcode::Ldc2W => {
-                    let index = self.read_u2(pc + 1)?;
-                    match self.cp.get(index)? {
-                        ConstantPoolEntry::Long(v) => frame.operands.push_long(*v)?,
-                        ConstantPoolEntry::Double(v) => frame.operands.push_double(*v)?,
-                        _ => return Err(VmError::BadConstant("ldc2_w 期望 Long/Double")),
-                    }
-                    pc += 3;
-                }
-                Opcode::Lload => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    frame.operands.push_long(frame.locals.get_long(idx)?)?;
-                    pc += 2;
-                }
-                Opcode::Lload0 => {
-                    frame.operands.push_long(frame.locals.get_long(0)?)?;
-                    pc += 1;
-                }
-                Opcode::Lload1 => {
-                    frame.operands.push_long(frame.locals.get_long(1)?)?;
-                    pc += 1;
-                }
-                Opcode::Lload2 => {
-                    frame.operands.push_long(frame.locals.get_long(2)?)?;
-                    pc += 1;
-                }
-                Opcode::Lload3 => {
-                    frame.operands.push_long(frame.locals.get_long(3)?)?;
-                    pc += 1;
-                }
-                Opcode::Lstore => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    let v = frame.operands.pop_long()?;
-                    frame.locals.set_long(idx, v)?;
-                    pc += 2;
-                }
-                Opcode::Lstore0 => {
-                    let v = frame.operands.pop_long()?;
-                    frame.locals.set_long(0, v)?;
-                    pc += 1;
-                }
-                Opcode::Lstore1 => {
-                    let v = frame.operands.pop_long()?;
-                    frame.locals.set_long(1, v)?;
-                    pc += 1;
-                }
-                Opcode::Lstore2 => {
-                    let v = frame.operands.pop_long()?;
-                    frame.locals.set_long(2, v)?;
-                    pc += 1;
-                }
-                Opcode::Lstore3 => {
-                    let v = frame.operands.pop_long()?;
-                    frame.locals.set_long(3, v)?;
-                    pc += 1;
-                }
-                // ---- long:算术 ----
-                Opcode::Ladd => {
-                    let r = frame.operands.pop_long()?;
-                    let l = frame.operands.pop_long()?;
-                    frame.operands.push_long(l.wrapping_add(r))?;
-                    pc += 1;
-                }
-                Opcode::Lsub => {
-                    let r = frame.operands.pop_long()?;
-                    let l = frame.operands.pop_long()?;
-                    frame.operands.push_long(l.wrapping_sub(r))?;
-                    pc += 1;
-                }
-                Opcode::Lmul => {
-                    let r = frame.operands.pop_long()?;
-                    let l = frame.operands.pop_long()?;
-                    frame.operands.push_long(l.wrapping_mul(r))?;
-                    pc += 1;
-                }
-                Opcode::Ldiv => {
-                    let r = frame.operands.pop_long()?;
-                    let l = frame.operands.pop_long()?;
-                    if r == 0 {
-                        return Err(VmError::DivideByZero);
-                    }
-                    frame.operands.push_long(l.wrapping_div(r))?;
-                    pc += 1;
-                }
-                Opcode::Lrem => {
-                    let r = frame.operands.pop_long()?;
-                    let l = frame.operands.pop_long()?;
-                    if r == 0 {
-                        return Err(VmError::DivideByZero);
-                    }
-                    frame.operands.push_long(l.wrapping_rem(r))?;
-                    pc += 1;
-                }
-                Opcode::Lneg => {
-                    let v = frame.operands.pop_long()?;
-                    frame.operands.push_long(v.wrapping_neg())?;
-                    pc += 1;
-                }
-                // ---- long:位运算与移位 ----
-                Opcode::Land => {
-                    let r = frame.operands.pop_long()?;
-                    let l = frame.operands.pop_long()?;
-                    frame.operands.push_long(l & r)?;
-                    pc += 1;
-                }
-                Opcode::Lor => {
-                    let r = frame.operands.pop_long()?;
-                    let l = frame.operands.pop_long()?;
-                    frame.operands.push_long(l | r)?;
-                    pc += 1;
-                }
-                Opcode::Lxor => {
-                    let r = frame.operands.pop_long()?;
-                    let l = frame.operands.pop_long()?;
-                    frame.operands.push_long(l ^ r)?;
-                    pc += 1;
-                }
-                Opcode::Lshl => {
-                    let s = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_long()?;
-                    frame.operands.push_long(l.wrapping_shl(s as u32))?;
-                    pc += 1;
-                }
-                Opcode::Lshr => {
-                    let s = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_long()?;
-                    frame.operands.push_long(l.wrapping_shr(s as u32))?;
-                    pc += 1;
-                }
-                Opcode::Lushr => {
-                    let s = frame.operands.pop_int()?;
-                    let l = frame.operands.pop_long()?;
-                    frame.operands.push_long(((l as u64).wrapping_shr(s as u32)) as i64)?;
-                    pc += 1;
-                }
-                Opcode::Lcmp => {
-                    let b = frame.operands.pop_long()?;
-                    let a = frame.operands.pop_long()?;
-                    let r = if a < b { -1 } else if a > b { 1 } else { 0 };
-                    frame.operands.push_int(r)?;
-                    pc += 1;
-                }
-                Opcode::I2l => {
-                    let v = frame.operands.pop_int()?;
-                    frame.operands.push_long(v as i64)?;
-                    pc += 1;
-                }
-                Opcode::L2i => {
-                    let v = frame.operands.pop_long()?;
-                    frame.operands.push_int(v as i32)?;
-                    pc += 1;
-                }
-                // ---- float:常量与加载 ----
-                Opcode::Fconst0 => {
-                    frame.operands.push_float(0.0)?;
-                    pc += 1;
-                }
-                Opcode::Fconst1 => {
-                    frame.operands.push_float(1.0)?;
-                    pc += 1;
-                }
-                Opcode::Fconst2 => {
-                    frame.operands.push_float(2.0)?;
-                    pc += 1;
-                }
-                Opcode::Fload => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    frame.operands.push_float(frame.locals.get_float(idx)?)?;
-                    pc += 2;
-                }
-                Opcode::Fload0 => {
-                    frame.operands.push_float(frame.locals.get_float(0)?)?;
-                    pc += 1;
-                }
-                Opcode::Fload1 => {
-                    frame.operands.push_float(frame.locals.get_float(1)?)?;
-                    pc += 1;
-                }
-                Opcode::Fload2 => {
-                    frame.operands.push_float(frame.locals.get_float(2)?)?;
-                    pc += 1;
-                }
-                Opcode::Fload3 => {
-                    frame.operands.push_float(frame.locals.get_float(3)?)?;
-                    pc += 1;
-                }
-                Opcode::Fstore => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    let v = frame.operands.pop_float()?;
-                    frame.locals.set_float(idx, v)?;
-                    pc += 2;
-                }
-                Opcode::Fstore0 => {
-                    let v = frame.operands.pop_float()?;
-                    frame.locals.set_float(0, v)?;
-                    pc += 1;
-                }
-                Opcode::Fstore1 => {
-                    let v = frame.operands.pop_float()?;
-                    frame.locals.set_float(1, v)?;
-                    pc += 1;
-                }
-                Opcode::Fstore2 => {
-                    let v = frame.operands.pop_float()?;
-                    frame.locals.set_float(2, v)?;
-                    pc += 1;
-                }
-                Opcode::Fstore3 => {
-                    let v = frame.operands.pop_float()?;
-                    frame.locals.set_float(3, v)?;
-                    pc += 1;
-                }
-                // ---- float:算术 ----
-                Opcode::Fadd => {
-                    let r = frame.operands.pop_float()?;
-                    let l = frame.operands.pop_float()?;
-                    frame.operands.push_float(l + r)?;
-                    pc += 1;
-                }
-                Opcode::Fsub => {
-                    let r = frame.operands.pop_float()?;
-                    let l = frame.operands.pop_float()?;
-                    frame.operands.push_float(l - r)?;
-                    pc += 1;
-                }
-                Opcode::Fmul => {
-                    let r = frame.operands.pop_float()?;
-                    let l = frame.operands.pop_float()?;
-                    frame.operands.push_float(l * r)?;
-                    pc += 1;
-                }
-                Opcode::Fdiv => {
-                    let r = frame.operands.pop_float()?;
-                    let l = frame.operands.pop_float()?;
-                    frame.operands.push_float(l / r)?;
-                    pc += 1;
-                }
-                Opcode::Frem => {
-                    let r = frame.operands.pop_float()?;
-                    let l = frame.operands.pop_float()?;
-                    frame.operands.push_float(l % r)?;
-                    pc += 1;
-                }
-                Opcode::Fneg => {
-                    let v = frame.operands.pop_float()?;
-                    frame.operands.push_float(-v)?;
-                    pc += 1;
-                }
-                Opcode::Fcmpl => {
-                    let r = cmp_float(frame, false)?;
-                    frame.operands.push_int(r)?;
-                    pc += 1;
-                }
-                Opcode::Fcmpg => {
-                    let r = cmp_float(frame, true)?;
-                    frame.operands.push_int(r)?;
-                    pc += 1;
-                }
-                Opcode::I2f => {
-                    let v = frame.operands.pop_int()?;
-                    frame.operands.push_float(v as f32)?;
-                    pc += 1;
-                }
-                Opcode::F2i => {
-                    let v = frame.operands.pop_float()?;
-                    frame.operands.push_int(v as i32)?;
-                    pc += 1;
-                }
-                // ---- double:常量与加载 ----
-                Opcode::Dconst0 => {
-                    frame.operands.push_double(0.0)?;
-                    pc += 1;
-                }
-                Opcode::Dconst1 => {
-                    frame.operands.push_double(1.0)?;
-                    pc += 1;
-                }
-                Opcode::Dload => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    frame.operands.push_double(frame.locals.get_double(idx)?)?;
-                    pc += 2;
-                }
-                Opcode::Dload0 => {
-                    frame.operands.push_double(frame.locals.get_double(0)?)?;
-                    pc += 1;
-                }
-                Opcode::Dload1 => {
-                    frame.operands.push_double(frame.locals.get_double(1)?)?;
-                    pc += 1;
-                }
-                Opcode::Dload2 => {
-                    frame.operands.push_double(frame.locals.get_double(2)?)?;
-                    pc += 1;
-                }
-                Opcode::Dload3 => {
-                    frame.operands.push_double(frame.locals.get_double(3)?)?;
-                    pc += 1;
-                }
-                Opcode::Dstore => {
-                    let idx = self.read_u1(pc + 1)? as u16;
-                    let v = frame.operands.pop_double()?;
-                    frame.locals.set_double(idx, v)?;
-                    pc += 2;
-                }
-                Opcode::Dstore0 => {
-                    let v = frame.operands.pop_double()?;
-                    frame.locals.set_double(0, v)?;
-                    pc += 1;
-                }
-                Opcode::Dstore1 => {
-                    let v = frame.operands.pop_double()?;
-                    frame.locals.set_double(1, v)?;
-                    pc += 1;
-                }
-                Opcode::Dstore2 => {
-                    let v = frame.operands.pop_double()?;
-                    frame.locals.set_double(2, v)?;
-                    pc += 1;
-                }
-                Opcode::Dstore3 => {
-                    let v = frame.operands.pop_double()?;
-                    frame.locals.set_double(3, v)?;
-                    pc += 1;
-                }
-                // ---- double:算术 ----
-                Opcode::Dadd => {
-                    let r = frame.operands.pop_double()?;
-                    let l = frame.operands.pop_double()?;
-                    frame.operands.push_double(l + r)?;
-                    pc += 1;
-                }
-                Opcode::Dsub => {
-                    let r = frame.operands.pop_double()?;
-                    let l = frame.operands.pop_double()?;
-                    frame.operands.push_double(l - r)?;
-                    pc += 1;
-                }
-                Opcode::Dmul => {
-                    let r = frame.operands.pop_double()?;
-                    let l = frame.operands.pop_double()?;
-                    frame.operands.push_double(l * r)?;
-                    pc += 1;
-                }
-                Opcode::Ddiv => {
-                    let r = frame.operands.pop_double()?;
-                    let l = frame.operands.pop_double()?;
-                    frame.operands.push_double(l / r)?;
-                    pc += 1;
-                }
-                Opcode::Drem => {
-                    let r = frame.operands.pop_double()?;
-                    let l = frame.operands.pop_double()?;
-                    frame.operands.push_double(l % r)?;
-                    pc += 1;
-                }
-                Opcode::Dneg => {
-                    let v = frame.operands.pop_double()?;
-                    frame.operands.push_double(-v)?;
-                    pc += 1;
-                }
-                Opcode::Dcmpl => {
-                    let r = cmp_double(frame, false)?;
-                    frame.operands.push_int(r)?;
-                    pc += 1;
-                }
-                Opcode::Dcmpg => {
-                    let r = cmp_double(frame, true)?;
-                    frame.operands.push_int(r)?;
-                    pc += 1;
-                }
-                Opcode::I2d => {
-                    let v = frame.operands.pop_int()?;
-                    frame.operands.push_double(v as f64)?;
-                    pc += 1;
-                }
-                Opcode::D2i => {
-                    let v = frame.operands.pop_double()?;
-                    frame.operands.push_int(v as i32)?;
-                    pc += 1;
-                }
-                // ---- 跨数值类型转换 ----
-                Opcode::L2f => {
-                    let v = frame.operands.pop_long()?;
-                    frame.operands.push_float(v as f32)?;
-                    pc += 1;
-                }
-                Opcode::L2d => {
-                    let v = frame.operands.pop_long()?;
-                    frame.operands.push_double(v as f64)?;
-                    pc += 1;
-                }
-                Opcode::F2l => {
-                    let v = frame.operands.pop_float()?;
-                    frame.operands.push_long(v as i64)?;
-                    pc += 1;
-                }
-                Opcode::F2d => {
-                    let v = frame.operands.pop_float()?;
-                    frame.operands.push_double(v as f64)?;
-                    pc += 1;
-                }
-                Opcode::D2l => {
-                    let v = frame.operands.pop_double()?;
-                    frame.operands.push_long(v as i64)?;
-                    pc += 1;
-                }
-                Opcode::D2f => {
-                    let v = frame.operands.pop_double()?;
-                    frame.operands.push_float(v as f32)?;
-                    pc += 1;
-                }
-                Opcode::I2b => {
-                    let v = frame.operands.pop_int()?;
-                    frame.operands.push_int((v as i8) as i32)?;
-                    pc += 1;
-                }
-                Opcode::I2c => {
-                    let v = frame.operands.pop_int()?;
-                    frame.operands.push_int((v as u16) as i32)?;
-                    pc += 1;
-                }
-                Opcode::I2s => {
-                    let v = frame.operands.pop_int()?;
-                    frame.operands.push_int((v as i16) as i32)?;
-                    pc += 1;
-                }
-                // ---- 栈操作 ----
-                Opcode::Nop => {
-                    pc += 1;
-                }
-                Opcode::Dup => {
-                    let v = frame.operands.pop_slot()?;
-                    frame.operands.push_slot(v)?;
-                    frame.operands.push_slot(v)?;
-                    pc += 1;
-                }
-                Opcode::Pop => {
-                    frame.operands.pop_slot()?;
-                    pc += 1;
-                }
-                // ---- 对象与字段(4.1)----
-                Opcode::AconstNull => {
-                    frame.operands.push_reference(Reference::null())?;
-                    pc += 1;
-                }
-                Opcode::New => {
-                    let index = self.read_u2(pc + 1)?;
-                    field::new_instance(self, frame, vm, index)?;
-                    pc += 3;
-                }
-                Opcode::Getfield => {
-                    let index = self.read_u2(pc + 1)?;
-                    field::get_field(self, frame, vm, index)?;
-                    pc += 3;
-                }
-                Opcode::Putfield => {
-                    let index = self.read_u2(pc + 1)?;
-                    field::put_field(self, frame, vm, index)?;
-                    pc += 3;
-                }
-                Opcode::Getstatic => {
-                    let index = self.read_u2(pc + 1)?;
-                    field::get_static(self, frame, vm, index)?;
-                    pc += 3;
-                }
-                Opcode::Putstatic => {
-                    let index = self.read_u2(pc + 1)?;
-                    field::put_static(self, frame, vm, index)?;
-                    pc += 3;
-                }
-                // ---- 单操作数条件分支 ----
-                Opcode::Ifeq => pc = self.cond1(pc, |v| v == 0, frame)?,
-                Opcode::Ifne => pc = self.cond1(pc, |v| v != 0, frame)?,
-                Opcode::Iflt => pc = self.cond1(pc, |v| v < 0, frame)?,
-                Opcode::Ifge => pc = self.cond1(pc, |v| v >= 0, frame)?,
-                Opcode::Ifgt => pc = self.cond1(pc, |v| v > 0, frame)?,
-                Opcode::Ifle => pc = self.cond1(pc, |v| v <= 0, frame)?,
-                // ---- 双操作数条件分支 ----
-                Opcode::IfIcmpeq => pc = self.cond2(pc, |a, b| a == b, frame)?,
-                Opcode::IfIcmpne => pc = self.cond2(pc, |a, b| a != b, frame)?,
-                Opcode::IfIcmplt => pc = self.cond2(pc, |a, b| a < b, frame)?,
-                Opcode::IfIcmpge => pc = self.cond2(pc, |a, b| a >= b, frame)?,
-                Opcode::IfIcmpgt => pc = self.cond2(pc, |a, b| a > b, frame)?,
-                Opcode::IfIcmple => pc = self.cond2(pc, |a, b| a <= b, frame)?,
-                // ---- 无条件跳转 ----
-                Opcode::Goto => {
-                    let off = self.read_s2(pc + 1)?;
-                    pc = Self::branch_target(pc, off)?;
-                }
-                Opcode::GotoW => {
-                    let off = self.read_s4(pc + 1)?;
-                    pc = Self::branch_target_w(pc, off)?;
-                }
-                // ---- 引用比较分支(4.4)----
-                Opcode::IfAcmpeq => pc = self.cond_ref2(pc, |a, b| a == b, frame)?,
-                Opcode::IfAcmpne => pc = self.cond_ref2(pc, |a, b| a != b, frame)?,
-                Opcode::Ifnull => pc = self.cond_ref1(pc, |v| v.is_null(), frame)?,
-                Opcode::Ifnonnull => pc = self.cond_ref1(pc, |v| !v.is_null(), frame)?,
-                // ---- switch(4.4)----
-                Opcode::Tableswitch => pc = self.table_switch(pc, frame)?,
-                Opcode::Lookupswitch => pc = self.lookup_switch(pc, frame)?,
-                // ---- 方法调用(invokestatic:同类内,含递归与互调)----
-                Opcode::Invokestatic => {
-                    let index = self.read_u2(pc + 1)?;
-                    match invoke::invoke_static(self, frame, vm, index, pc)? {
-                        invoke::InvokeFlow::Fallthrough => pc += 3,
-                        invoke::InvokeFlow::Jump(h) => pc = h,
-                    }
-                }
-                Opcode::Invokespecial => {
-                    let index = self.read_u2(pc + 1)?;
-                    match invoke::invoke_special(self, frame, vm, index, pc)? {
-                        invoke::InvokeFlow::Fallthrough => pc += 3,
-                        invoke::InvokeFlow::Jump(h) => pc = h,
-                    }
-                }
-                Opcode::Invokevirtual => {
-                    let index = self.read_u2(pc + 1)?;
-                    match invoke::invoke_virtual(self, frame, vm, index, pc)? {
-                        invoke::InvokeFlow::Fallthrough => pc += 3,
-                        invoke::InvokeFlow::Jump(h) => pc = h,
-                    }
-                }
-                Opcode::Invokeinterface => {
-                    let index = self.read_u2(pc + 1)?;
-                    // count(pc+3) 与尾 0(pc+4)对运行时冗余,随 pc += 5 丢弃。
-                    match invoke::invoke_interface(self, frame, vm, index, pc)? {
-                        invoke::InvokeFlow::Fallthrough => pc += 5,
-                        invoke::InvokeFlow::Jump(h) => pc = h,
-                    }
-                }
-                // ---- 数组(4.3a)----
-                Opcode::Newarray => {
-                    let atype = self.read_u1(pc + 1)?;
-                    array::new_array(frame, vm, atype)?;
-                    pc += 2;
-                }
-                Opcode::Anewarray => {
-                    let index = self.read_u2(pc + 1)?;
-                    array::a_new_array(self, frame, vm, index)?;
-                    pc += 3;
-                }
-                Opcode::Multianewarray => {
-                    let index = self.read_u2(pc + 1)?;
-                    let dims = self.read_u1(pc + 3)?;
-                    array::multi_new_array(self, frame, vm, index, dims)?;
-                    pc += 4;
-                }
-                Opcode::Checkcast => {
-                    let index = self.read_u2(pc + 1)?;
-                    type_check::check_cast(self, frame, vm, index)?;
-                    pc += 3;
-                }
-                Opcode::Instanceof => {
-                    let index = self.read_u2(pc + 1)?;
-                    type_check::instance_of(self, frame, vm, index)?;
-                    pc += 3;
-                }
-                Opcode::Arraylength => {
-                    array::array_length(frame, vm)?;
-                    pc += 1;
-                }
-                Opcode::Iaload => {
-                    array::array_load(frame, vm, array::ArrayKind::Int)?;
-                    pc += 1;
-                }
-                Opcode::Laload => {
-                    array::array_load(frame, vm, array::ArrayKind::Long)?;
-                    pc += 1;
-                }
-                Opcode::Faload => {
-                    array::array_load(frame, vm, array::ArrayKind::Float)?;
-                    pc += 1;
-                }
-                Opcode::Daload => {
-                    array::array_load(frame, vm, array::ArrayKind::Double)?;
-                    pc += 1;
-                }
-                Opcode::Aaload => {
-                    array::array_load(frame, vm, array::ArrayKind::Ref)?;
-                    pc += 1;
-                }
-                Opcode::Baload => {
-                    array::array_load(frame, vm, array::ArrayKind::Byte)?;
-                    pc += 1;
-                }
-                Opcode::Caload => {
-                    array::array_load(frame, vm, array::ArrayKind::Char)?;
-                    pc += 1;
-                }
-                Opcode::Saload => {
-                    array::array_load(frame, vm, array::ArrayKind::Short)?;
-                    pc += 1;
-                }
-                Opcode::Iastore => {
-                    array::array_store(frame, vm, array::ArrayKind::Int)?;
-                    pc += 1;
-                }
-                Opcode::Lastore => {
-                    array::array_store(frame, vm, array::ArrayKind::Long)?;
-                    pc += 1;
-                }
-                Opcode::Fastore => {
-                    array::array_store(frame, vm, array::ArrayKind::Float)?;
-                    pc += 1;
-                }
-                Opcode::Dastore => {
-                    array::array_store(frame, vm, array::ArrayKind::Double)?;
-                    pc += 1;
-                }
-                Opcode::Aastore => {
-                    array::array_store(frame, vm, array::ArrayKind::Ref)?;
-                    pc += 1;
-                }
-                Opcode::Bastore => {
-                    array::array_store(frame, vm, array::ArrayKind::Byte)?;
-                    pc += 1;
-                }
-                Opcode::Castore => {
-                    array::array_store(frame, vm, array::ArrayKind::Char)?;
-                    pc += 1;
-                }
-                Opcode::Sastore => {
-                    array::array_store(frame, vm, array::ArrayKind::Short)?;
-                    pc += 1;
-                }
-                Opcode::Return => return Ok(Value::Void),
-                Opcode::Ireturn => {
-                    let v = frame.operands.pop_int()?;
-                    return Ok(Value::Int(v));
-                }
-                Opcode::Lreturn => {
-                    let v = frame.operands.pop_long()?;
-                    return Ok(Value::Long(v));
-                }
-                Opcode::Freturn => {
-                    let v = frame.operands.pop_float()?;
-                    return Ok(Value::Float(v));
-                }
-                Opcode::Dreturn => {
-                    let v = frame.operands.pop_double()?;
-                    return Ok(Value::Double(v));
-                }
-                Opcode::Areturn => {
-                    let v = frame.operands.pop_reference()?;
-                    return Ok(Value::Reference(v));
-                }
-                Opcode::Athrow => {
-                    let exc = frame.operands.pop_reference()?;
-                    if exc.is_null() {
-                        return Err(VmError::NullPointer);
-                    }
+            // 单步执行;运行时异常(ThrownException)由本帧异常表捕获,未命中才上传
+            // (跨帧则由上层 invoke 的 finish_invoke 扫调用者表)。同帧/跨帧共用 find_handler。
+            match self.dispatch(op, frame, vm, &mut pc) {
+                Ok(Step::Continue) => {}
+                Ok(Step::Return(v)) => return Ok(v),
+                Err(VmError::ThrownException(exc)) => {
                     match exception::find_handler(self, vm, self.exception_table, pc, exc)? {
                         Some(h) => {
                             frame.operands.clear();
@@ -1050,9 +183,928 @@ impl<'a> Interpreter<'a> {
                         None => return Err(VmError::ThrownException(exc)),
                     }
                 }
-                other => return Err(VmError::UnsupportedOpcode(other)),
+                Err(e) => return Err(e),
             }
         }
+    }
+
+    /// 单步分派:执行一条指令(`op` @ `*pc_slot`),返回 [`Step`] 或 `Err`。
+    ///
+    /// `pc` 为本指令起点;正常推进由各臂 `pc += n` / `pc = target` 后于函数尾写回
+    /// `*pc_slot`。`Err` 路径不写回 → `*pc_slot` 仍指**故障指令**,供
+    /// [`Self::interpret_with`] 的异常表扫描用对 pc。运行时异常经 [`throw_exception`]
+    /// 统一为 `ThrownException`(同帧可捕获);内部故障(BadConstant/BadPc/Frame/…)直接
+    /// 传播(不可捕获,对应 VerifyError/InternalError 性质)。
+    fn dispatch(
+        &self,
+        op: Opcode,
+        frame: &mut Frame,
+        vm: &mut Vm<'_>,
+        pc_slot: &mut usize,
+    ) -> Result<Step, VmError> {
+        let mut pc = *pc_slot;
+        match op {
+            // ---- 常量压栈 ----
+            Opcode::IconstM1 => {
+                frame.operands.push_int(-1)?;
+                pc += 1;
+            }
+            Opcode::Iconst0 => {
+                frame.operands.push_int(0)?;
+                pc += 1;
+            }
+            Opcode::Iconst1 => {
+                frame.operands.push_int(1)?;
+                pc += 1;
+            }
+            Opcode::Iconst2 => {
+                frame.operands.push_int(2)?;
+                pc += 1;
+            }
+            Opcode::Iconst3 => {
+                frame.operands.push_int(3)?;
+                pc += 1;
+            }
+            Opcode::Iconst4 => {
+                frame.operands.push_int(4)?;
+                pc += 1;
+            }
+            Opcode::Iconst5 => {
+                frame.operands.push_int(5)?;
+                pc += 1;
+            }
+            Opcode::Bipush => {
+                let v = self.read_s1(pc + 1)? as i32;
+                frame.operands.push_int(v)?;
+                pc += 2;
+            }
+            Opcode::Sipush => {
+                let v = self.read_s2(pc + 1)? as i32;
+                frame.operands.push_int(v)?;
+                pc += 3;
+            }
+            Opcode::Ldc => {
+                let index = self.read_u1(pc + 1)? as u16;
+                match self.cp.get(index)? {
+                    ConstantPoolEntry::Integer(v) => frame.operands.push_int(*v)?,
+                    ConstantPoolEntry::Float(v) => frame.operands.push_float(*v)?,
+                    _ => return Err(VmError::BadConstant("ldc 期望 int/float(3.2 仅支持数值)")),
+                }
+                pc += 2;
+            }
+            // ---- 加载局部变量 ----
+            Opcode::Iload => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                frame.operands.push_int(frame.locals.get_int(idx)?)?;
+                pc += 2;
+            }
+            Opcode::Iload0 => {
+                frame.operands.push_int(frame.locals.get_int(0)?)?;
+                pc += 1;
+            }
+            Opcode::Iload1 => {
+                frame.operands.push_int(frame.locals.get_int(1)?)?;
+                pc += 1;
+            }
+            Opcode::Iload2 => {
+                frame.operands.push_int(frame.locals.get_int(2)?)?;
+                pc += 1;
+            }
+            Opcode::Iload3 => {
+                frame.operands.push_int(frame.locals.get_int(3)?)?;
+                pc += 1;
+            }
+            // ---- 存入局部变量 ----
+            Opcode::Istore => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                let v = frame.operands.pop_int()?;
+                frame.locals.set_int(idx, v)?;
+                pc += 2;
+            }
+            Opcode::Istore0 => {
+                let v = frame.operands.pop_int()?;
+                frame.locals.set_int(0, v)?;
+                pc += 1;
+            }
+            Opcode::Istore1 => {
+                let v = frame.operands.pop_int()?;
+                frame.locals.set_int(1, v)?;
+                pc += 1;
+            }
+            Opcode::Istore2 => {
+                let v = frame.operands.pop_int()?;
+                frame.locals.set_int(2, v)?;
+                pc += 1;
+            }
+            Opcode::Istore3 => {
+                let v = frame.operands.pop_int()?;
+                frame.locals.set_int(3, v)?;
+                pc += 1;
+            }
+            // ---- 引用局部变量(aload/astore)----
+            Opcode::Aload => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                frame.operands.push_reference(frame.locals.get_reference(idx)?)?;
+                pc += 2;
+            }
+            Opcode::Aload0 => {
+                frame.operands.push_reference(frame.locals.get_reference(0)?)?;
+                pc += 1;
+            }
+            Opcode::Aload1 => {
+                frame.operands.push_reference(frame.locals.get_reference(1)?)?;
+                pc += 1;
+            }
+            Opcode::Aload2 => {
+                frame.operands.push_reference(frame.locals.get_reference(2)?)?;
+                pc += 1;
+            }
+            Opcode::Aload3 => {
+                frame.operands.push_reference(frame.locals.get_reference(3)?)?;
+                pc += 1;
+            }
+            Opcode::Astore => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                let v = frame.operands.pop_reference()?;
+                frame.locals.set_reference(idx, v)?;
+                pc += 2;
+            }
+            Opcode::Astore0 => {
+                let v = frame.operands.pop_reference()?;
+                frame.locals.set_reference(0, v)?;
+                pc += 1;
+            }
+            Opcode::Astore1 => {
+                let v = frame.operands.pop_reference()?;
+                frame.locals.set_reference(1, v)?;
+                pc += 1;
+            }
+            Opcode::Astore2 => {
+                let v = frame.operands.pop_reference()?;
+                frame.locals.set_reference(2, v)?;
+                pc += 1;
+            }
+            Opcode::Astore3 => {
+                let v = frame.operands.pop_reference()?;
+                frame.locals.set_reference(3, v)?;
+                pc += 1;
+            }
+            // ---- 整数算术(补码回绕)----
+            Opcode::Iadd => {
+                let r = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                frame.operands.push_int(l.wrapping_add(r))?;
+                pc += 1;
+            }
+            Opcode::Isub => {
+                let r = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                frame.operands.push_int(l.wrapping_sub(r))?;
+                pc += 1;
+            }
+            Opcode::Imul => {
+                let r = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                frame.operands.push_int(l.wrapping_mul(r))?;
+                pc += 1;
+            }
+            Opcode::Idiv => {
+                let r = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                if r == 0 {
+                    return Err(throw_exception(vm, "java/lang/ArithmeticException"));
+                }
+                frame.operands.push_int(l.wrapping_div(r))?;
+                pc += 1;
+            }
+            Opcode::Irem => {
+                let r = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                if r == 0 {
+                    return Err(throw_exception(vm, "java/lang/ArithmeticException"));
+                }
+                frame.operands.push_int(l.wrapping_rem(r))?;
+                pc += 1;
+            }
+            Opcode::Ineg => {
+                let v = frame.operands.pop_int()?;
+                frame.operands.push_int(v.wrapping_neg())?;
+                pc += 1;
+            }
+            Opcode::Iinc => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                let delta = self.read_s1(pc + 2)? as i32;
+                let v = frame.locals.get_int(idx)?;
+                frame.locals.set_int(idx, v.wrapping_add(delta))?;
+                pc += 3;
+            }
+            Opcode::Iand => {
+                let r = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                frame.operands.push_int(l & r)?;
+                pc += 1;
+            }
+            Opcode::Ior => {
+                let r = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                frame.operands.push_int(l | r)?;
+                pc += 1;
+            }
+            Opcode::Ixor => {
+                let r = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                frame.operands.push_int(l ^ r)?;
+                pc += 1;
+            }
+            Opcode::Ishl => {
+                let s = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                frame.operands.push_int(l.wrapping_shl(s as u32))?;
+                pc += 1;
+            }
+            Opcode::Ishr => {
+                let s = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                frame.operands.push_int(l.wrapping_shr(s as u32))?;
+                pc += 1;
+            }
+            Opcode::Iushr => {
+                let s = frame.operands.pop_int()?;
+                let l = frame.operands.pop_int()?;
+                frame.operands.push_int(((l as u32).wrapping_shr(s as u32)) as i32)?;
+                pc += 1;
+            }
+            // ---- long:常量与加载 ----
+            Opcode::Lconst0 => {
+                frame.operands.push_long(0)?;
+                pc += 1;
+            }
+            Opcode::Lconst1 => {
+                frame.operands.push_long(1)?;
+                pc += 1;
+            }
+            Opcode::Ldc2W => {
+                let index = self.read_u2(pc + 1)?;
+                match self.cp.get(index)? {
+                    ConstantPoolEntry::Long(v) => frame.operands.push_long(*v)?,
+                    ConstantPoolEntry::Double(v) => frame.operands.push_double(*v)?,
+                    _ => return Err(VmError::BadConstant("ldc2_w 期望 Long/Double")),
+                }
+                pc += 3;
+            }
+            Opcode::Lload => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                frame.operands.push_long(frame.locals.get_long(idx)?)?;
+                pc += 2;
+            }
+            Opcode::Lload0 => {
+                frame.operands.push_long(frame.locals.get_long(0)?)?;
+                pc += 1;
+            }
+            Opcode::Lload1 => {
+                frame.operands.push_long(frame.locals.get_long(1)?)?;
+                pc += 1;
+            }
+            Opcode::Lload2 => {
+                frame.operands.push_long(frame.locals.get_long(2)?)?;
+                pc += 1;
+            }
+            Opcode::Lload3 => {
+                frame.operands.push_long(frame.locals.get_long(3)?)?;
+                pc += 1;
+            }
+            Opcode::Lstore => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                let v = frame.operands.pop_long()?;
+                frame.locals.set_long(idx, v)?;
+                pc += 2;
+            }
+            Opcode::Lstore0 => {
+                let v = frame.operands.pop_long()?;
+                frame.locals.set_long(0, v)?;
+                pc += 1;
+            }
+            Opcode::Lstore1 => {
+                let v = frame.operands.pop_long()?;
+                frame.locals.set_long(1, v)?;
+                pc += 1;
+            }
+            Opcode::Lstore2 => {
+                let v = frame.operands.pop_long()?;
+                frame.locals.set_long(2, v)?;
+                pc += 1;
+            }
+            Opcode::Lstore3 => {
+                let v = frame.operands.pop_long()?;
+                frame.locals.set_long(3, v)?;
+                pc += 1;
+            }
+            // ---- long:算术 ----
+            Opcode::Ladd => {
+                let r = frame.operands.pop_long()?;
+                let l = frame.operands.pop_long()?;
+                frame.operands.push_long(l.wrapping_add(r))?;
+                pc += 1;
+            }
+            Opcode::Lsub => {
+                let r = frame.operands.pop_long()?;
+                let l = frame.operands.pop_long()?;
+                frame.operands.push_long(l.wrapping_sub(r))?;
+                pc += 1;
+            }
+            Opcode::Lmul => {
+                let r = frame.operands.pop_long()?;
+                let l = frame.operands.pop_long()?;
+                frame.operands.push_long(l.wrapping_mul(r))?;
+                pc += 1;
+            }
+            Opcode::Ldiv => {
+                let r = frame.operands.pop_long()?;
+                let l = frame.operands.pop_long()?;
+                if r == 0 {
+                    return Err(throw_exception(vm, "java/lang/ArithmeticException"));
+                }
+                frame.operands.push_long(l.wrapping_div(r))?;
+                pc += 1;
+            }
+            Opcode::Lrem => {
+                let r = frame.operands.pop_long()?;
+                let l = frame.operands.pop_long()?;
+                if r == 0 {
+                    return Err(throw_exception(vm, "java/lang/ArithmeticException"));
+                }
+                frame.operands.push_long(l.wrapping_rem(r))?;
+                pc += 1;
+            }
+            Opcode::Lneg => {
+                let v = frame.operands.pop_long()?;
+                frame.operands.push_long(v.wrapping_neg())?;
+                pc += 1;
+            }
+            // ---- long:位运算与移位 ----
+            Opcode::Land => {
+                let r = frame.operands.pop_long()?;
+                let l = frame.operands.pop_long()?;
+                frame.operands.push_long(l & r)?;
+                pc += 1;
+            }
+            Opcode::Lor => {
+                let r = frame.operands.pop_long()?;
+                let l = frame.operands.pop_long()?;
+                frame.operands.push_long(l | r)?;
+                pc += 1;
+            }
+            Opcode::Lxor => {
+                let r = frame.operands.pop_long()?;
+                let l = frame.operands.pop_long()?;
+                frame.operands.push_long(l ^ r)?;
+                pc += 1;
+            }
+            Opcode::Lshl => {
+                let s = frame.operands.pop_int()?;
+                let l = frame.operands.pop_long()?;
+                frame.operands.push_long(l.wrapping_shl(s as u32))?;
+                pc += 1;
+            }
+            Opcode::Lshr => {
+                let s = frame.operands.pop_int()?;
+                let l = frame.operands.pop_long()?;
+                frame.operands.push_long(l.wrapping_shr(s as u32))?;
+                pc += 1;
+            }
+            Opcode::Lushr => {
+                let s = frame.operands.pop_int()?;
+                let l = frame.operands.pop_long()?;
+                frame.operands.push_long(((l as u64).wrapping_shr(s as u32)) as i64)?;
+                pc += 1;
+            }
+            Opcode::Lcmp => {
+                let b = frame.operands.pop_long()?;
+                let a = frame.operands.pop_long()?;
+                let r = if a < b { -1 } else if a > b { 1 } else { 0 };
+                frame.operands.push_int(r)?;
+                pc += 1;
+            }
+            Opcode::I2l => {
+                let v = frame.operands.pop_int()?;
+                frame.operands.push_long(v as i64)?;
+                pc += 1;
+            }
+            Opcode::L2i => {
+                let v = frame.operands.pop_long()?;
+                frame.operands.push_int(v as i32)?;
+                pc += 1;
+            }
+            // ---- float:常量与加载 ----
+            Opcode::Fconst0 => {
+                frame.operands.push_float(0.0)?;
+                pc += 1;
+            }
+            Opcode::Fconst1 => {
+                frame.operands.push_float(1.0)?;
+                pc += 1;
+            }
+            Opcode::Fconst2 => {
+                frame.operands.push_float(2.0)?;
+                pc += 1;
+            }
+            Opcode::Fload => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                frame.operands.push_float(frame.locals.get_float(idx)?)?;
+                pc += 2;
+            }
+            Opcode::Fload0 => {
+                frame.operands.push_float(frame.locals.get_float(0)?)?;
+                pc += 1;
+            }
+            Opcode::Fload1 => {
+                frame.operands.push_float(frame.locals.get_float(1)?)?;
+                pc += 1;
+            }
+            Opcode::Fload2 => {
+                frame.operands.push_float(frame.locals.get_float(2)?)?;
+                pc += 1;
+            }
+            Opcode::Fload3 => {
+                frame.operands.push_float(frame.locals.get_float(3)?)?;
+                pc += 1;
+            }
+            Opcode::Fstore => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                let v = frame.operands.pop_float()?;
+                frame.locals.set_float(idx, v)?;
+                pc += 2;
+            }
+            Opcode::Fstore0 => {
+                let v = frame.operands.pop_float()?;
+                frame.locals.set_float(0, v)?;
+                pc += 1;
+            }
+            Opcode::Fstore1 => {
+                let v = frame.operands.pop_float()?;
+                frame.locals.set_float(1, v)?;
+                pc += 1;
+            }
+            Opcode::Fstore2 => {
+                let v = frame.operands.pop_float()?;
+                frame.locals.set_float(2, v)?;
+                pc += 1;
+            }
+            Opcode::Fstore3 => {
+                let v = frame.operands.pop_float()?;
+                frame.locals.set_float(3, v)?;
+                pc += 1;
+            }
+            // ---- float:算术 ----
+            Opcode::Fadd => {
+                let r = frame.operands.pop_float()?;
+                let l = frame.operands.pop_float()?;
+                frame.operands.push_float(l + r)?;
+                pc += 1;
+            }
+            Opcode::Fsub => {
+                let r = frame.operands.pop_float()?;
+                let l = frame.operands.pop_float()?;
+                frame.operands.push_float(l - r)?;
+                pc += 1;
+            }
+            Opcode::Fmul => {
+                let r = frame.operands.pop_float()?;
+                let l = frame.operands.pop_float()?;
+                frame.operands.push_float(l * r)?;
+                pc += 1;
+            }
+            Opcode::Fdiv => {
+                let r = frame.operands.pop_float()?;
+                let l = frame.operands.pop_float()?;
+                frame.operands.push_float(l / r)?;
+                pc += 1;
+            }
+            Opcode::Frem => {
+                let r = frame.operands.pop_float()?;
+                let l = frame.operands.pop_float()?;
+                frame.operands.push_float(l % r)?;
+                pc += 1;
+            }
+            Opcode::Fneg => {
+                let v = frame.operands.pop_float()?;
+                frame.operands.push_float(-v)?;
+                pc += 1;
+            }
+            Opcode::Fcmpl => {
+                let r = cmp_float(frame, false)?;
+                frame.operands.push_int(r)?;
+                pc += 1;
+            }
+            Opcode::Fcmpg => {
+                let r = cmp_float(frame, true)?;
+                frame.operands.push_int(r)?;
+                pc += 1;
+            }
+            Opcode::I2f => {
+                let v = frame.operands.pop_int()?;
+                frame.operands.push_float(v as f32)?;
+                pc += 1;
+            }
+            Opcode::F2i => {
+                let v = frame.operands.pop_float()?;
+                frame.operands.push_int(v as i32)?;
+                pc += 1;
+            }
+            // ---- double:常量与加载 ----
+            Opcode::Dconst0 => {
+                frame.operands.push_double(0.0)?;
+                pc += 1;
+            }
+            Opcode::Dconst1 => {
+                frame.operands.push_double(1.0)?;
+                pc += 1;
+            }
+            Opcode::Dload => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                frame.operands.push_double(frame.locals.get_double(idx)?)?;
+                pc += 2;
+            }
+            Opcode::Dload0 => {
+                frame.operands.push_double(frame.locals.get_double(0)?)?;
+                pc += 1;
+            }
+            Opcode::Dload1 => {
+                frame.operands.push_double(frame.locals.get_double(1)?)?;
+                pc += 1;
+            }
+            Opcode::Dload2 => {
+                frame.operands.push_double(frame.locals.get_double(2)?)?;
+                pc += 1;
+            }
+            Opcode::Dload3 => {
+                frame.operands.push_double(frame.locals.get_double(3)?)?;
+                pc += 1;
+            }
+            Opcode::Dstore => {
+                let idx = self.read_u1(pc + 1)? as u16;
+                let v = frame.operands.pop_double()?;
+                frame.locals.set_double(idx, v)?;
+                pc += 2;
+            }
+            Opcode::Dstore0 => {
+                let v = frame.operands.pop_double()?;
+                frame.locals.set_double(0, v)?;
+                pc += 1;
+            }
+            Opcode::Dstore1 => {
+                let v = frame.operands.pop_double()?;
+                frame.locals.set_double(1, v)?;
+                pc += 1;
+            }
+            Opcode::Dstore2 => {
+                let v = frame.operands.pop_double()?;
+                frame.locals.set_double(2, v)?;
+                pc += 1;
+            }
+            Opcode::Dstore3 => {
+                let v = frame.operands.pop_double()?;
+                frame.locals.set_double(3, v)?;
+                pc += 1;
+            }
+            // ---- double:算术 ----
+            Opcode::Dadd => {
+                let r = frame.operands.pop_double()?;
+                let l = frame.operands.pop_double()?;
+                frame.operands.push_double(l + r)?;
+                pc += 1;
+            }
+            Opcode::Dsub => {
+                let r = frame.operands.pop_double()?;
+                let l = frame.operands.pop_double()?;
+                frame.operands.push_double(l - r)?;
+                pc += 1;
+            }
+            Opcode::Dmul => {
+                let r = frame.operands.pop_double()?;
+                let l = frame.operands.pop_double()?;
+                frame.operands.push_double(l * r)?;
+                pc += 1;
+            }
+            Opcode::Ddiv => {
+                let r = frame.operands.pop_double()?;
+                let l = frame.operands.pop_double()?;
+                frame.operands.push_double(l / r)?;
+                pc += 1;
+            }
+            Opcode::Drem => {
+                let r = frame.operands.pop_double()?;
+                let l = frame.operands.pop_double()?;
+                frame.operands.push_double(l % r)?;
+                pc += 1;
+            }
+            Opcode::Dneg => {
+                let v = frame.operands.pop_double()?;
+                frame.operands.push_double(-v)?;
+                pc += 1;
+            }
+            Opcode::Dcmpl => {
+                let r = cmp_double(frame, false)?;
+                frame.operands.push_int(r)?;
+                pc += 1;
+            }
+            Opcode::Dcmpg => {
+                let r = cmp_double(frame, true)?;
+                frame.operands.push_int(r)?;
+                pc += 1;
+            }
+            Opcode::I2d => {
+                let v = frame.operands.pop_int()?;
+                frame.operands.push_double(v as f64)?;
+                pc += 1;
+            }
+            Opcode::D2i => {
+                let v = frame.operands.pop_double()?;
+                frame.operands.push_int(v as i32)?;
+                pc += 1;
+            }
+            // ---- 跨数值类型转换 ----
+            Opcode::L2f => {
+                let v = frame.operands.pop_long()?;
+                frame.operands.push_float(v as f32)?;
+                pc += 1;
+            }
+            Opcode::L2d => {
+                let v = frame.operands.pop_long()?;
+                frame.operands.push_double(v as f64)?;
+                pc += 1;
+            }
+            Opcode::F2l => {
+                let v = frame.operands.pop_float()?;
+                frame.operands.push_long(v as i64)?;
+                pc += 1;
+            }
+            Opcode::F2d => {
+                let v = frame.operands.pop_float()?;
+                frame.operands.push_double(v as f64)?;
+                pc += 1;
+            }
+            Opcode::D2l => {
+                let v = frame.operands.pop_double()?;
+                frame.operands.push_long(v as i64)?;
+                pc += 1;
+            }
+            Opcode::D2f => {
+                let v = frame.operands.pop_double()?;
+                frame.operands.push_float(v as f32)?;
+                pc += 1;
+            }
+            Opcode::I2b => {
+                let v = frame.operands.pop_int()?;
+                frame.operands.push_int((v as i8) as i32)?;
+                pc += 1;
+            }
+            Opcode::I2c => {
+                let v = frame.operands.pop_int()?;
+                frame.operands.push_int((v as u16) as i32)?;
+                pc += 1;
+            }
+            Opcode::I2s => {
+                let v = frame.operands.pop_int()?;
+                frame.operands.push_int((v as i16) as i32)?;
+                pc += 1;
+            }
+            // ---- 栈操作 ----
+            Opcode::Nop => {
+                pc += 1;
+            }
+            Opcode::Dup => {
+                let v = frame.operands.pop_slot()?;
+                frame.operands.push_slot(v)?;
+                frame.operands.push_slot(v)?;
+                pc += 1;
+            }
+            Opcode::Pop => {
+                frame.operands.pop_slot()?;
+                pc += 1;
+            }
+            // ---- 对象与字段(4.1)----
+            Opcode::AconstNull => {
+                frame.operands.push_reference(Reference::null())?;
+                pc += 1;
+            }
+            Opcode::New => {
+                let index = self.read_u2(pc + 1)?;
+                field::new_instance(self, frame, vm, index)?;
+                pc += 3;
+            }
+            Opcode::Getfield => {
+                let index = self.read_u2(pc + 1)?;
+                field::get_field(self, frame, vm, index)?;
+                pc += 3;
+            }
+            Opcode::Putfield => {
+                let index = self.read_u2(pc + 1)?;
+                field::put_field(self, frame, vm, index)?;
+                pc += 3;
+            }
+            Opcode::Getstatic => {
+                let index = self.read_u2(pc + 1)?;
+                field::get_static(self, frame, vm, index)?;
+                pc += 3;
+            }
+            Opcode::Putstatic => {
+                let index = self.read_u2(pc + 1)?;
+                field::put_static(self, frame, vm, index)?;
+                pc += 3;
+            }
+            // ---- 单操作数条件分支 ----
+            Opcode::Ifeq => pc = self.cond1(pc, |v| v == 0, frame)?,
+            Opcode::Ifne => pc = self.cond1(pc, |v| v != 0, frame)?,
+            Opcode::Iflt => pc = self.cond1(pc, |v| v < 0, frame)?,
+            Opcode::Ifge => pc = self.cond1(pc, |v| v >= 0, frame)?,
+            Opcode::Ifgt => pc = self.cond1(pc, |v| v > 0, frame)?,
+            Opcode::Ifle => pc = self.cond1(pc, |v| v <= 0, frame)?,
+            // ---- 双操作数条件分支 ----
+            Opcode::IfIcmpeq => pc = self.cond2(pc, |a, b| a == b, frame)?,
+            Opcode::IfIcmpne => pc = self.cond2(pc, |a, b| a != b, frame)?,
+            Opcode::IfIcmplt => pc = self.cond2(pc, |a, b| a < b, frame)?,
+            Opcode::IfIcmpge => pc = self.cond2(pc, |a, b| a >= b, frame)?,
+            Opcode::IfIcmpgt => pc = self.cond2(pc, |a, b| a > b, frame)?,
+            Opcode::IfIcmple => pc = self.cond2(pc, |a, b| a <= b, frame)?,
+            // ---- 无条件跳转 ----
+            Opcode::Goto => {
+                let off = self.read_s2(pc + 1)?;
+                pc = Self::branch_target(pc, off)?;
+            }
+            Opcode::GotoW => {
+                let off = self.read_s4(pc + 1)?;
+                pc = Self::branch_target_w(pc, off)?;
+            }
+            // ---- 引用比较分支(4.4)----
+            Opcode::IfAcmpeq => pc = self.cond_ref2(pc, |a, b| a == b, frame)?,
+            Opcode::IfAcmpne => pc = self.cond_ref2(pc, |a, b| a != b, frame)?,
+            Opcode::Ifnull => pc = self.cond_ref1(pc, |v| v.is_null(), frame)?,
+            Opcode::Ifnonnull => pc = self.cond_ref1(pc, |v| !v.is_null(), frame)?,
+            // ---- switch(4.4)----
+            Opcode::Tableswitch => pc = self.table_switch(pc, frame)?,
+            Opcode::Lookupswitch => pc = self.lookup_switch(pc, frame)?,
+            // ---- 方法调用(invokestatic:同类内,含递归与互调)----
+            Opcode::Invokestatic => {
+                let index = self.read_u2(pc + 1)?;
+                match invoke::invoke_static(self, frame, vm, index, pc)? {
+                    invoke::InvokeFlow::Fallthrough => pc += 3,
+                    invoke::InvokeFlow::Jump(h) => pc = h,
+                }
+            }
+            Opcode::Invokespecial => {
+                let index = self.read_u2(pc + 1)?;
+                match invoke::invoke_special(self, frame, vm, index, pc)? {
+                    invoke::InvokeFlow::Fallthrough => pc += 3,
+                    invoke::InvokeFlow::Jump(h) => pc = h,
+                }
+            }
+            Opcode::Invokevirtual => {
+                let index = self.read_u2(pc + 1)?;
+                match invoke::invoke_virtual(self, frame, vm, index, pc)? {
+                    invoke::InvokeFlow::Fallthrough => pc += 3,
+                    invoke::InvokeFlow::Jump(h) => pc = h,
+                }
+            }
+            Opcode::Invokeinterface => {
+                let index = self.read_u2(pc + 1)?;
+                // count(pc+3) 与尾 0(pc+4)对运行时冗余,随 pc += 5 丢弃。
+                match invoke::invoke_interface(self, frame, vm, index, pc)? {
+                    invoke::InvokeFlow::Fallthrough => pc += 5,
+                    invoke::InvokeFlow::Jump(h) => pc = h,
+                }
+            }
+            // ---- 数组(4.3a)----
+            Opcode::Newarray => {
+                let atype = self.read_u1(pc + 1)?;
+                array::new_array(frame, vm, atype)?;
+                pc += 2;
+            }
+            Opcode::Anewarray => {
+                let index = self.read_u2(pc + 1)?;
+                array::a_new_array(self, frame, vm, index)?;
+                pc += 3;
+            }
+            Opcode::Multianewarray => {
+                let index = self.read_u2(pc + 1)?;
+                let dims = self.read_u1(pc + 3)?;
+                array::multi_new_array(self, frame, vm, index, dims)?;
+                pc += 4;
+            }
+            Opcode::Checkcast => {
+                let index = self.read_u2(pc + 1)?;
+                type_check::check_cast(self, frame, vm, index)?;
+                pc += 3;
+            }
+            Opcode::Instanceof => {
+                let index = self.read_u2(pc + 1)?;
+                type_check::instance_of(self, frame, vm, index)?;
+                pc += 3;
+            }
+            Opcode::Arraylength => {
+                array::array_length(frame, vm)?;
+                pc += 1;
+            }
+            Opcode::Iaload => {
+                array::array_load(frame, vm, array::ArrayKind::Int)?;
+                pc += 1;
+            }
+            Opcode::Laload => {
+                array::array_load(frame, vm, array::ArrayKind::Long)?;
+                pc += 1;
+            }
+            Opcode::Faload => {
+                array::array_load(frame, vm, array::ArrayKind::Float)?;
+                pc += 1;
+            }
+            Opcode::Daload => {
+                array::array_load(frame, vm, array::ArrayKind::Double)?;
+                pc += 1;
+            }
+            Opcode::Aaload => {
+                array::array_load(frame, vm, array::ArrayKind::Ref)?;
+                pc += 1;
+            }
+            Opcode::Baload => {
+                array::array_load(frame, vm, array::ArrayKind::Byte)?;
+                pc += 1;
+            }
+            Opcode::Caload => {
+                array::array_load(frame, vm, array::ArrayKind::Char)?;
+                pc += 1;
+            }
+            Opcode::Saload => {
+                array::array_load(frame, vm, array::ArrayKind::Short)?;
+                pc += 1;
+            }
+            Opcode::Iastore => {
+                array::array_store(frame, vm, array::ArrayKind::Int)?;
+                pc += 1;
+            }
+            Opcode::Lastore => {
+                array::array_store(frame, vm, array::ArrayKind::Long)?;
+                pc += 1;
+            }
+            Opcode::Fastore => {
+                array::array_store(frame, vm, array::ArrayKind::Float)?;
+                pc += 1;
+            }
+            Opcode::Dastore => {
+                array::array_store(frame, vm, array::ArrayKind::Double)?;
+                pc += 1;
+            }
+            Opcode::Aastore => {
+                array::array_store(frame, vm, array::ArrayKind::Ref)?;
+                pc += 1;
+            }
+            Opcode::Bastore => {
+                array::array_store(frame, vm, array::ArrayKind::Byte)?;
+                pc += 1;
+            }
+            Opcode::Castore => {
+                array::array_store(frame, vm, array::ArrayKind::Char)?;
+                pc += 1;
+            }
+            Opcode::Sastore => {
+                array::array_store(frame, vm, array::ArrayKind::Short)?;
+                pc += 1;
+            }
+            Opcode::Return => return Ok(Step::Return(Value::Void)),
+            Opcode::Ireturn => {
+                let v = frame.operands.pop_int()?;
+                return Ok(Step::Return(Value::Int(v)));
+            }
+            Opcode::Lreturn => {
+                let v = frame.operands.pop_long()?;
+                return Ok(Step::Return(Value::Long(v)));
+            }
+            Opcode::Freturn => {
+                let v = frame.operands.pop_float()?;
+                return Ok(Step::Return(Value::Float(v)));
+            }
+            Opcode::Dreturn => {
+                let v = frame.operands.pop_double()?;
+                return Ok(Step::Return(Value::Double(v)));
+            }
+            Opcode::Areturn => {
+                let v = frame.operands.pop_reference()?;
+                return Ok(Step::Return(Value::Reference(v)));
+            }
+            Opcode::Athrow => {
+                let exc = frame.operands.pop_reference()?;
+                // throw null → NPE(JVM 语义);否则上传 exc。表查找统一由
+                // interpret_with 的循环处理(与指令抛出的异常同源)。
+                let err = if exc.is_null() {
+                    throw_exception(vm, "java/lang/NullPointerException")
+                } else {
+                    VmError::ThrownException(exc)
+                };
+                return Err(err);
+            }
+            other => return Err(VmError::UnsupportedOpcode(other)),
+        }
+        *pc_slot = pc;
+        Ok(Step::Continue)
     }
 
     // ---- 操作数读取(带越界检查,大端)----
@@ -1258,6 +1310,20 @@ mod tests {
         }
     }
 
+    /// Stage B 闸门:断言解释结果抛出指定类的运行时异常。
+    ///
+    /// 运行时异常(NPE/CCE/ArithmeticException/AIOOBE 等)统一为 `ThrownException(Reference)`,
+    /// 异常对象由引导桩分配在堆上。`vm` 须带注册表(装好引导桩)以备查类名。
+    fn assert_throws(result: Result<Value, VmError>, vm: &Vm<'_>, expected_class: &str) {
+        let Err(VmError::ThrownException(exc)) = result else {
+            panic!("应抛 ThrownException({expected_class}), 实得 {result:?}");
+        };
+        let Some(crate::oops::Oop::Instance(i)) = vm.heap().get(exc) else {
+            panic!("抛出的异常应为引导桩分配的实例, 引用 {exc:?}");
+        };
+        assert_eq!(i.class_name(), expected_class, "异常类名不符");
+    }
+
     #[test]
     fn iconst_variants_load_constants() {
         assert_eq!(run_int(&[Opcode::IconstM1 as u8, Opcode::Ireturn as u8], 1), -1);
@@ -1444,21 +1510,33 @@ mod tests {
     }
 
     #[test]
-    fn idiv_by_zero_is_dividebyzero_error() {
+    fn idiv_by_zero_throws_arithmetic_exception() {
         let code = [Opcode::Iconst5 as u8, Opcode::Iconst0 as u8, Opcode::Idiv as u8, Opcode::Ireturn as u8];
         let cp = empty_cp();
         let interp = Interpreter::new(&code, &cp);
         let mut frame = Frame::new(0, 2);
-        assert_eq!(interp.interpret(&mut frame).unwrap_err(), VmError::DivideByZero);
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        assert_throws(
+            interp.interpret_with(&mut frame, &mut vm),
+            &vm,
+            "java/lang/ArithmeticException",
+        );
     }
 
     #[test]
-    fn irem_by_zero_is_dividebyzero_error() {
+    fn irem_by_zero_throws_arithmetic_exception() {
         let code = [Opcode::Iconst5 as u8, Opcode::Iconst0 as u8, Opcode::Irem as u8, Opcode::Ireturn as u8];
         let cp = empty_cp();
         let interp = Interpreter::new(&code, &cp);
         let mut frame = Frame::new(0, 2);
-        assert_eq!(interp.interpret(&mut frame).unwrap_err(), VmError::DivideByZero);
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        assert_throws(
+            interp.interpret_with(&mut frame, &mut vm),
+            &vm,
+            "java/lang/ArithmeticException",
+        );
     }
 
     /// 以 [1]=Integer(value) 构造常量池。
@@ -1563,9 +1641,12 @@ mod tests {
         ];
         let interp = Interpreter::new(&code, &cp);
         let mut frame = Frame::new(0, 4);
-        assert_eq!(
-            interp.interpret(&mut frame),
-            Err(crate::runtime::VmError::NegativeArraySize)
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        assert_throws(
+            interp.interpret_with(&mut frame, &mut vm),
+            &vm,
+            "java/lang/NegativeArraySizeException",
         );
     }
 
@@ -1719,9 +1800,62 @@ mod tests {
         let code = [Opcode::AconstNull as u8, Opcode::Athrow as u8];
         let mut frame = Frame::new(0, 2);
         let interp = Interpreter::new(&code, &cp).with_exception_table(&[]);
+        assert_throws(
+            interp.interpret_with(&mut frame, &mut vm),
+            &vm,
+            "java/lang/NullPointerException",
+        );
+    }
+
+    /// 同帧捕获(Stage B 核心闸门):idiv 除零抛 `ArithmeticException`,被**本帧**异常表
+    /// 以 `catch(java/lang/Exception)` 捕获 → clear 栈 + 压异常 + 跳 `handler_pc` → 返回哨兵。
+    ///
+    /// 证明三点:(1) 运行时异常统一为 `ThrownException`、可捕获(旧 `DivideByZero` 是内部
+    /// 故障、不可捕获,本测试在那条路上会原样 `Err` 而非走到 handler);(2) 同帧异常表经
+    /// `find_handler` 在 dispatch 循环内捕获;(3) `catch` 超类型(`Exception`)经引导桩层次
+    /// `is_instance` 命中子类(`ArithmeticException`)——层次与 catch 联动贯通。
+    #[test]
+    fn same_frame_catch_via_supertype() {
+        use crate::classfile::attributes::ExceptionTableEntry;
+        use crate::classfile::Reader;
+        use crate::constant_pool::ConstantPool;
+        // CP:[1]=Utf8"java/lang/Exception" [2]=Class{1}
+        let mut cp_bytes = vec![0x00, 0x03]; // count=3
+        cp_bytes.push(0x01); // Utf8
+        let name = "java/lang/Exception";
+        cp_bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        cp_bytes.extend_from_slice(name.as_bytes());
+        cp_bytes.push(0x07); // Class
+        cp_bytes.extend_from_slice(&1u16.to_be_bytes());
+        let cp = ConstantPool::parse(&mut Reader::new(&cp_bytes)).unwrap();
+
+        //   0 iconst_5
+        //   1 iconst_0
+        //   2 idiv        ← 抛 ArithmeticException(pc=2 ∈ [0,3))
+        //   3 ireturn     ← 未达
+        //   4 iconst_1    ← handler:压哨兵 1
+        //   5 ireturn
+        let code = [
+            Opcode::Iconst5 as u8,
+            Opcode::Iconst0 as u8,
+            Opcode::Idiv as u8,
+            Opcode::Ireturn as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        let table = [ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 3,
+            handler_pc: 4,
+            catch_type: 2, // catch Exception(超类型,经 is_instance 命中 ArithmeticException)
+        }];
+        let interp = Interpreter::new(&code, &cp).with_exception_table(&table);
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut frame = Frame::new(0, 2);
         assert_eq!(
-            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
-            VmError::NullPointer
+            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            Value::Int(1)
         );
     }
 
@@ -2322,11 +2456,13 @@ mod tests {
         let code = [Opcode::IconstM1 as u8, Opcode::Newarray as u8, 10];
         let cp = empty_cp();
         let mut frame = Frame::new(0, 1);
-        let mut vm = Vm::default();
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
         let interp = Interpreter::new(&code, &cp);
-        assert_eq!(
-            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
-            VmError::NegativeArraySize
+        assert_throws(
+            interp.interpret_with(&mut frame, &mut vm),
+            &vm,
+            "java/lang/NegativeArraySizeException",
         );
     }
 
@@ -2339,11 +2475,13 @@ mod tests {
         ];
         let cp = empty_cp();
         let mut frame = Frame::new(0, 1);
-        let mut vm = Vm::default();
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
         let interp = Interpreter::new(&code, &cp);
-        assert_eq!(
-            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
-            VmError::NullPointer
+        assert_throws(
+            interp.interpret_with(&mut frame, &mut vm),
+            &vm,
+            "java/lang/NullPointerException",
         );
     }
 
@@ -2404,7 +2542,8 @@ mod tests {
     fn array_load_out_of_bounds_is_aioobe() {
         use crate::oops::{ArrayOop, Oop};
         use crate::runtime::Slot;
-        let mut vm = Vm::default();
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
         let arr = vm
             .heap_mut()
             .alloc(Oop::Array(ArrayOop::new(vec![Slot::Int(0)]))); // len 1
@@ -2419,9 +2558,10 @@ mod tests {
         let mut frame = Frame::new(1, 2);
         frame.locals.set_reference(0, arr).unwrap();
         let interp = Interpreter::new(&code, &cp);
-        assert_eq!(
-            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
-            VmError::ArrayIndexOutOfBounds
+        assert_throws(
+            interp.interpret_with(&mut frame, &mut vm),
+            &vm,
+            "java/lang/ArrayIndexOutOfBoundsException",
         );
     }
 
@@ -2499,11 +2639,13 @@ mod tests {
         ];
         let cp = empty_cp();
         let mut frame = Frame::new(1, 3);
-        let mut vm = Vm::default();
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
         let interp = Interpreter::new(&code, &cp);
-        assert_eq!(
-            interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
-            VmError::ArrayIndexOutOfBounds
+        assert_throws(
+            interp.interpret_with(&mut frame, &mut vm),
+            &vm,
+            "java/lang/ArrayIndexOutOfBoundsException",
         );
     }
 

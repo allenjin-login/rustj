@@ -14,7 +14,7 @@ use crate::metadata::descriptor::{parse_field_descriptor, FieldType};
 use crate::oops::{LoadedClass, Oop};
 use crate::runtime::{Frame, Slot, Vm};
 
-use super::{Interpreter, VmError};
+use super::{throw_exception, Interpreter, VmError};
 
 /// 解析 `Fieldref` 常量池条目 → `(类内部名, 字段名, 描述符)`。owned 字符串。
 pub(super) fn resolve_fieldref(
@@ -179,7 +179,7 @@ pub(super) fn get_field(
 
     let objref = frame.operands.pop_reference()?;
     if objref.is_null() {
-        return Err(VmError::NullPointer);
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
     let slot = match vm
         .heap()
@@ -217,7 +217,7 @@ pub(super) fn put_field(
     let value = pop_field_value(frame, &ft)?;
     let objref = frame.operands.pop_reference()?;
     if objref.is_null() {
-        return Err(VmError::NullPointer);
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
     match vm
         .heap_mut()

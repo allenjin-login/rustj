@@ -1,10 +1,11 @@
 //! 集成闸门(Layer 4.7):javac 编 try/catch/finally 的真实 Java,由 rustj 执行,
 //! 验证 `athrow` + 异常表分派 + 跨帧(invoke)异常传播与 JVM 一致。需 `javac`(无则跳过)。
 //!
-//! 范围:用户 `athrow` 抛出的异常,经本帧或调用者帧异常表捕获。
-//! 仅用**已加载**异常类型(BaseExc/SubExc/OtherExc)——`catch(Throwable)` 需
-//! 加载 `java/lang/Throwable`(4.7b 顺延),故本闸门不涉;catch-all 语义由
-//! `finally`(catch_type 0)验证。
+//! 范围:(1) 用户 `athrow` 抛出的异常,经本帧或调用者帧异常表捕获;
+//! (2) **JVM 抛出**的运行时异常(NPE/ArithmeticException/AIOOBE/CCE)被 javac 编的
+//! try/catch 捕获——验证 Stage B 将其统一为 `ThrownException` 后与 javac 的 catch 表一致;
+//! (3) `catch` 超类型(`Exception`/`Throwable`)经引导桩层次 `is_instance` 命中子类。
+//! 异常根类(`Throwable`/`Exception`/`NullPointerException` 等)由引导桩(Stage A)装好。
 
 use std::process::Command;
 
@@ -177,6 +178,72 @@ public class ThrowGate {
     public static int uncaught() throws SubExc {
         throw new SubExc();
     }
+
+    // ---- JVM 抛出的运行时异常(Stage B 统一为 ThrownException)被 javac try/catch 捕获 ----
+    // 触发 rustj 解释器内部抛出的标准异常,验证其类名与 catch 子句一致(不匹配则传播 → run 失败)。
+    static class A {}
+    static class B {}
+
+    // 7. arraylength on null → NullPointerException
+    public static int catchNpe() {
+        int[] a = null;
+        try {
+            return a.length;
+        } catch (NullPointerException e) {
+            return 1;
+        }
+    }
+
+    // 8. 整数除零 → ArithmeticException(数组取值避免 javac 常量折叠)
+    public static int catchArithmetic() {
+        int[] z = new int[1];
+        try {
+            return 100 / z[0];
+        } catch (ArithmeticException e) {
+            return 1;
+        }
+    }
+
+    // 9. 数组越界 → ArrayIndexOutOfBoundsException
+    public static int catchAioobe() {
+        int[] a = new int[2];
+        try {
+            return a[5];
+        } catch (ArrayIndexOutOfBoundsException e) {
+            return 1;
+        }
+    }
+
+    // 10. checkcast 失败 → ClassCastException(A 实例强转 B)
+    public static int catchCce() {
+        Object o = new A();
+        try {
+            B b = (B) o;
+            return 0;
+        } catch (ClassCastException e) {
+            return 1;
+        }
+    }
+
+    // 11. catch 超类型:NPE 被 catch(Exception) 捕获(经引导桩层次 is_instance)
+    public static int catchNpeAsException() {
+        int[] a = null;
+        try {
+            return a.length;
+        } catch (Exception e) {
+            return 1;
+        }
+    }
+
+    // 12. catch 根类型:NPE 被 catch(Throwable) 捕获
+    public static int catchNpeAsThrowable() {
+        int[] a = null;
+        try {
+            return a.length;
+        } catch (Throwable e) {
+            return 1;
+        }
+    }
 }
 "#;
 
@@ -249,4 +316,66 @@ fn uncaught_propagates_as_thrown_exception() {
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
     assert!(is_thrown(run_err(&reg, "ThrowGate", "uncaught", "()I")));
+}
+
+// ---- JVM 抛出的运行时异常(Stage B 统一)被 javac try/catch 捕获 ----
+
+#[test]
+fn jvm_thrown_npe_is_caught() {
+    if !javac_available() {
+        eprintln!("跳过:未找到 javac");
+        return;
+    }
+    let reg = compile_and_load(SOURCE, "ThrowGate");
+    assert_eq!(as_int(run(&reg, "ThrowGate", "catchNpe", "()I")), 1);
+}
+
+#[test]
+fn jvm_thrown_arithmetic_is_caught() {
+    if !javac_available() {
+        eprintln!("跳过:未找到 javac");
+        return;
+    }
+    let reg = compile_and_load(SOURCE, "ThrowGate");
+    assert_eq!(as_int(run(&reg, "ThrowGate", "catchArithmetic", "()I")), 1);
+}
+
+#[test]
+fn jvm_thrown_aioobe_is_caught() {
+    if !javac_available() {
+        eprintln!("跳过:未找到 javac");
+        return;
+    }
+    let reg = compile_and_load(SOURCE, "ThrowGate");
+    assert_eq!(as_int(run(&reg, "ThrowGate", "catchAioobe", "()I")), 1);
+}
+
+#[test]
+fn jvm_thrown_cce_is_caught() {
+    if !javac_available() {
+        eprintln!("跳过:未找到 javac");
+        return;
+    }
+    let reg = compile_and_load(SOURCE, "ThrowGate");
+    assert_eq!(as_int(run(&reg, "ThrowGate", "catchCce", "()I")), 1);
+}
+
+#[test]
+fn jvm_thrown_npe_caught_by_supertype_exception() {
+    if !javac_available() {
+        eprintln!("跳过:未找到 javac");
+        return;
+    }
+    let reg = compile_and_load(SOURCE, "ThrowGate");
+    assert_eq!(as_int(run(&reg, "ThrowGate", "catchNpeAsException", "()I")), 1);
+}
+
+#[test]
+fn jvm_thrown_npe_caught_by_throwable() {
+    if !javac_available() {
+        eprintln!("跳过:未找到 javac");
+        return;
+    }
+    let reg = compile_and_load(SOURCE, "ThrowGate");
+    assert_eq!(as_int(run(&reg, "ThrowGate", "catchNpeAsThrowable", "()I")), 1);
 }

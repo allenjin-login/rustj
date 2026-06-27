@@ -87,7 +87,7 @@ fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     // 入口解释器必须带上本方法异常表:同帧 athrow 靠它找处理者;跨帧时它作为
     // 调用者表供 invoke 的 finish_invoke 扫描。
-    let interp = Interpreter::new_with_exception_table(&code.code, &lc.cf.constant_pool, &code.exception_table);
+    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
     let mut vm = Vm::new(reg);
     interp
         .interpret_with(&mut frame, &mut vm)
@@ -105,7 +105,7 @@ fn run_err(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> VmE
         .as_ref()
         .unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new_with_exception_table(&code.code, &lc.cf.constant_pool, &code.exception_table);
+    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
     let mut vm = Vm::new(reg);
     interp
         .interpret_with(&mut frame, &mut vm)

@@ -116,17 +116,11 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// 带 `Code` 属性的异常表构造(4 处 invoke 被调用者解释器、集成闸门入口用之)。
-    pub fn new_with_exception_table(
-        code: &'a [u8],
-        cp: &'a ConstantPool,
-        exception_table: &'a [ExceptionTableEntry],
-    ) -> Self {
-        Self {
-            code,
-            cp,
-            exception_table,
-        }
+    /// 附上方法的异常表(`Code` 属性)。被调用者解释器(4 处 invoke)与集成闸门入口
+    /// 用之;`new(code, cp)` 默认空表。流式:`Interpreter::new(..).with_exception_table(..)`。
+    pub fn with_exception_table(mut self, exception_table: &'a [ExceptionTableEntry]) -> Self {
+        self.exception_table = exception_table;
+        self
     }
 
     /// 当前字节码所属的常量池(供 invoke 子模块解析 Methodref)。
@@ -1693,7 +1687,7 @@ mod tests {
         }];
         let mut frame = Frame::new(1, 2);
         frame.locals.set_reference(0, inst).unwrap();
-        let interp = Interpreter::new_with_exception_table(&code, &cp, &table);
+        let interp = Interpreter::new(&code, &cp).with_exception_table(&table);
         assert_eq!(
             interp.interpret_with(&mut frame, &mut vm).unwrap(),
             Value::Int(1)
@@ -1711,7 +1705,7 @@ mod tests {
         let code = [Opcode::Aload0 as u8, Opcode::Athrow as u8];
         let mut frame = Frame::new(1, 2);
         frame.locals.set_reference(0, inst).unwrap();
-        let interp = Interpreter::new_with_exception_table(&code, &cp, &[]);
+        let interp = Interpreter::new(&code, &cp).with_exception_table(&[]);
         match interp.interpret_with(&mut frame, &mut vm).unwrap_err() {
             VmError::ThrownException(r) => assert_eq!(r, inst),
             other => panic!("期望 ThrownException,得 {other:?}"),
@@ -1724,7 +1718,7 @@ mod tests {
         let mut vm = crate::runtime::Vm::new(&reg);
         let code = [Opcode::AconstNull as u8, Opcode::Athrow as u8];
         let mut frame = Frame::new(0, 2);
-        let interp = Interpreter::new_with_exception_table(&code, &cp, &[]);
+        let interp = Interpreter::new(&code, &cp).with_exception_table(&[]);
         assert_eq!(
             interp.interpret_with(&mut frame, &mut vm).unwrap_err(),
             VmError::NullPointer

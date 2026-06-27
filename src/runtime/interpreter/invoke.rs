@@ -278,7 +278,7 @@ pub(super) fn invoke_static(
 
     // 递归:用目标方法的字节码与常量池 + 异常表构造新解释器,沿用同一 Vm(堆 + 注册表)。
     let callee_interp =
-        Interpreter::new_with_exception_table(&code.code, &target_lc.cf.constant_pool, &code.exception_table);
+        Interpreter::new(&code.code, &target_lc.cf.constant_pool).with_exception_table(&code.exception_table);
     let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
     // 回填返回值 / 捕获被调用者抛出的异常(单点)。
@@ -348,7 +348,7 @@ pub(super) fn invoke_special(
     }
 
     let callee_interp =
-        Interpreter::new_with_exception_table(&code.code, &target_lc.cf.constant_pool, &code.exception_table);
+        Interpreter::new(&code.code, &target_lc.cf.constant_pool).with_exception_table(&code.exception_table);
     let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
     finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
@@ -413,7 +413,7 @@ pub(super) fn invoke_virtual(
     }
 
     let callee_interp =
-        Interpreter::new_with_exception_table(&code.code, &target_lc.cf.constant_pool, &code.exception_table);
+        Interpreter::new(&code.code, &target_lc.cf.constant_pool).with_exception_table(&code.exception_table);
     let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
     finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
@@ -476,7 +476,7 @@ pub(super) fn invoke_interface(
     }
 
     let callee_interp =
-        Interpreter::new_with_exception_table(&code.code, &target_lc.cf.constant_pool, &code.exception_table);
+        Interpreter::new(&code.code, &target_lc.cf.constant_pool).with_exception_table(&code.exception_table);
     let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
     finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)

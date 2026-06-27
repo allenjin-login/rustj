@@ -134,6 +134,11 @@ impl<'a> Interpreter<'a> {
         self.cp
     }
 
+    /// 当前方法的异常表(供 `athrow` / invoke 跨帧异常分派扫描处理者)。
+    pub(crate) fn exception_table(&self) -> &'a [ExceptionTableEntry] {
+        self.exception_table
+    }
+
     /// 便捷入口:无对象/类上下文,用默认空 [`Vm`] 执行(纯数值路径)。
     ///
     /// 既有单帧测试与此路径兼容;需要对象/字段/`invokestatic` 时用 [`Self::interpret_with`]。
@@ -894,24 +899,32 @@ impl<'a> Interpreter<'a> {
                 // ---- 方法调用(invokestatic:同类内,含递归与互调)----
                 Opcode::Invokestatic => {
                     let index = self.read_u2(pc + 1)?;
-                    invoke::invoke_static(self, frame, vm, index)?;
-                    pc += 3;
+                    match invoke::invoke_static(self, frame, vm, index, pc)? {
+                        invoke::InvokeFlow::Fallthrough => pc += 3,
+                        invoke::InvokeFlow::Jump(h) => pc = h,
+                    }
                 }
                 Opcode::Invokespecial => {
                     let index = self.read_u2(pc + 1)?;
-                    invoke::invoke_special(self, frame, vm, index)?;
-                    pc += 3;
+                    match invoke::invoke_special(self, frame, vm, index, pc)? {
+                        invoke::InvokeFlow::Fallthrough => pc += 3,
+                        invoke::InvokeFlow::Jump(h) => pc = h,
+                    }
                 }
                 Opcode::Invokevirtual => {
                     let index = self.read_u2(pc + 1)?;
-                    invoke::invoke_virtual(self, frame, vm, index)?;
-                    pc += 3;
+                    match invoke::invoke_virtual(self, frame, vm, index, pc)? {
+                        invoke::InvokeFlow::Fallthrough => pc += 3,
+                        invoke::InvokeFlow::Jump(h) => pc = h,
+                    }
                 }
                 Opcode::Invokeinterface => {
                     let index = self.read_u2(pc + 1)?;
                     // count(pc+3) 与尾 0(pc+4)对运行时冗余,随 pc += 5 丢弃。
-                    invoke::invoke_interface(self, frame, vm, index)?;
-                    pc += 5;
+                    match invoke::invoke_interface(self, frame, vm, index, pc)? {
+                        invoke::InvokeFlow::Fallthrough => pc += 5,
+                        invoke::InvokeFlow::Jump(h) => pc = h,
+                    }
                 }
                 // ---- 数组(4.3a)----
                 Opcode::Newarray => {

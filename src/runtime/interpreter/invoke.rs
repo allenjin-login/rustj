@@ -20,7 +20,62 @@ use crate::metadata::{ClassFile, MethodInfo};
 use crate::oops::Oop;
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
-use super::{Interpreter, Value, VmError};
+use super::{exception, Interpreter, Value, VmError};
+
+/// invoke 后调用者分派循环的流向。
+pub(super) enum InvokeFlow {
+    /// 正常返回(含 void);调用方推进 pc(`invokestatic`/`special`/`virtual` +3,
+    /// `invokeinterface` +5)。
+    Fallthrough,
+    /// 捕获被调用者抛出的异常并已设好处理帧(清栈压异常);调用方跳 `handler_pc`(不推进)。
+    Jump(usize),
+}
+
+/// 统一被调用者结果:正常则按返回类型回填(`Fallthrough`);抛异常则经**调用者帧**
+/// 异常表(`interp.exception_table()` @ `caller_pc`)找处理者——命中清栈压异常(`Jump(h)`),
+/// 未命中原样 `Err(ThrownException)` 上传(本层仅用户 `athrow` 异常可捕获)。
+///
+/// 取代各 invoke 末尾原 `match (return_type, result) { ... }` 块(消除 4 处重复),
+/// 并把异常捕获单点化。
+fn finish_invoke(
+    interp: &Interpreter<'_>,
+    frame: &mut Frame,
+    vm: &mut Vm<'_>,
+    caller_pc: usize,
+    result: Result<Value, VmError>,
+    return_type: ReturnDescriptor,
+) -> Result<InvokeFlow, VmError> {
+    match result {
+        Ok(v) => {
+            match (return_type, v) {
+                (ReturnDescriptor::Void, Value::Void) => {}
+                (ReturnDescriptor::FieldType(_), Value::Void) => {
+                    return Err(VmError::BadConstant("invoke 期望返回值,被调用者返回 void"));
+                }
+                (ReturnDescriptor::FieldType(_), val) => push_return(frame, val)?,
+                (ReturnDescriptor::Void, _) => {
+                    return Err(VmError::BadConstant("invoke void 方法返回了值"));
+                }
+            }
+            Ok(InvokeFlow::Fallthrough)
+        }
+        Err(VmError::ThrownException(exc)) => match exception::find_handler(
+            interp,
+            vm,
+            interp.exception_table(),
+            caller_pc,
+            exc,
+        )? {
+            Some(h) => {
+                frame.operands.clear();
+                frame.operands.push_reference(exc)?;
+                Ok(InvokeFlow::Jump(h))
+            }
+            None => Err(VmError::ThrownException(exc)),
+        },
+        Err(e) => Err(e),
+    }
+}
 
 /// 进入一帧:`frame_depth +1`,执行 `f`,返回前 `−1`(Ok/Err 两路对称)。
 /// `frame_depth >= stack_limit` 时直接 [`VmError::StackOverflow`],不进入 `f`。
@@ -187,7 +242,8 @@ pub(super) fn invoke_static(
     frame: &mut Frame,
     vm: &mut Vm<'_>,
     methodref_index: u16,
-) -> Result<(), VmError> {
+    caller_pc: usize,
+) -> Result<InvokeFlow, VmError> {
     let registry = vm
         .registry()
         .ok_or(VmError::BadConstant("invokestatic 需要类注册表"))?;
@@ -220,22 +276,13 @@ pub(super) fn invoke_static(
             .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
     }
 
-    // 递归:用目标方法的字节码与常量池构造新解释器,沿用同一 Vm(堆 + 注册表)。
-    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
-    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm))?;
+    // 递归:用目标方法的字节码与常量池 + 异常表构造新解释器,沿用同一 Vm(堆 + 注册表)。
+    let callee_interp =
+        Interpreter::new_with_exception_table(&code.code, &target_lc.cf.constant_pool, &code.exception_table);
+    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
-    // 按描述符返回类型回填:void 不压栈;非 void 压返回值;类型不符报错。
-    match (md.return_type, result) {
-        (ReturnDescriptor::Void, Value::Void) => {}
-        (ReturnDescriptor::FieldType(_), Value::Void) => {
-            return Err(VmError::BadConstant("invokestatic 期望返回值,被调用者返回 void"));
-        }
-        (ReturnDescriptor::FieldType(_), v) => push_return(frame, v)?,
-        (ReturnDescriptor::Void, _) => {
-            return Err(VmError::BadConstant("invokestatic void 方法返回了值"));
-        }
-    }
-    Ok(())
+    // 回填返回值 / 捕获被调用者抛出的异常(单点)。
+    finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
 }
 
 /// 执行 `invokespecial`:4.1 仅 `<init>`(构造器)。
@@ -248,7 +295,8 @@ pub(super) fn invoke_special(
     frame: &mut Frame,
     vm: &mut Vm<'_>,
     methodref_index: u16,
-) -> Result<(), VmError> {
+    caller_pc: usize,
+) -> Result<InvokeFlow, VmError> {
     let (class_name, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
     let md = parse_method_descriptor(&desc)?;
 
@@ -270,7 +318,7 @@ pub(super) fn invoke_special(
             None => {
                 // 未加载类(根类 java/lang/Object 等):仅放行 <init>()V 空构造器。
                 if matches!(md.return_type, ReturnDescriptor::Void) {
-                    return Ok(());
+                    return Ok(InvokeFlow::Fallthrough);
                 }
                 return Err(VmError::BadConstant("invokespecial 目标类未加载"));
             }
@@ -299,20 +347,11 @@ pub(super) fn invoke_special(
             .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
     }
 
-    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
-    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm))?;
+    let callee_interp =
+        Interpreter::new_with_exception_table(&code.code, &target_lc.cf.constant_pool, &code.exception_table);
+    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
-    match (md.return_type, result) {
-        (ReturnDescriptor::Void, Value::Void) => {}
-        (ReturnDescriptor::FieldType(_), Value::Void) => {
-            return Err(VmError::BadConstant("invokespecial 期望返回值,被调用者返回 void"));
-        }
-        (ReturnDescriptor::FieldType(_), v) => push_return(frame, v)?,
-        (ReturnDescriptor::Void, _) => {
-            return Err(VmError::BadConstant("invokespecial void 方法返回了值"));
-        }
-    }
-    Ok(())
+    finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
 }
 
 /// 执行 `invokevirtual`:按对象**运行时实际类**沿超类链虚分派。
@@ -325,7 +364,8 @@ pub(super) fn invoke_virtual(
     frame: &mut Frame,
     vm: &mut Vm<'_>,
     methodref_index: u16,
-) -> Result<(), VmError> {
+    caller_pc: usize,
+) -> Result<InvokeFlow, VmError> {
     let (_declared_class, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
     let md = parse_method_descriptor(&desc)?;
 
@@ -372,20 +412,11 @@ pub(super) fn invoke_virtual(
             .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
     }
 
-    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
-    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm))?;
+    let callee_interp =
+        Interpreter::new_with_exception_table(&code.code, &target_lc.cf.constant_pool, &code.exception_table);
+    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
-    match (md.return_type, result) {
-        (ReturnDescriptor::Void, Value::Void) => {}
-        (ReturnDescriptor::FieldType(_), Value::Void) => {
-            return Err(VmError::BadConstant("invokevirtual 期望返回值,被调用者返回 void"));
-        }
-        (ReturnDescriptor::FieldType(_), v) => push_return(frame, v)?,
-        (ReturnDescriptor::Void, _) => {
-            return Err(VmError::BadConstant("invokevirtual void 方法返回了值"));
-        }
-    }
-    Ok(())
+    finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
 }
 
 /// 执行 `invokeinterface`:按对象运行时实际类分派。语义与 `invokevirtual` 一致
@@ -397,7 +428,8 @@ pub(super) fn invoke_interface(
     frame: &mut Frame,
     vm: &mut Vm<'_>,
     methodref_index: u16,
-) -> Result<(), VmError> {
+    caller_pc: usize,
+) -> Result<InvokeFlow, VmError> {
     let (_declared_iface, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
     let md = parse_method_descriptor(&desc)?;
 
@@ -443,20 +475,11 @@ pub(super) fn invoke_interface(
             .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
     }
 
-    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool);
-    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm))?;
+    let callee_interp =
+        Interpreter::new_with_exception_table(&code.code, &target_lc.cf.constant_pool, &code.exception_table);
+    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
-    match (md.return_type, result) {
-        (ReturnDescriptor::Void, Value::Void) => {}
-        (ReturnDescriptor::FieldType(_), Value::Void) => {
-            return Err(VmError::BadConstant("invokeinterface 期望返回值,被调用者返回 void"));
-        }
-        (ReturnDescriptor::FieldType(_), v) => push_return(frame, v)?,
-        (ReturnDescriptor::Void, _) => {
-            return Err(VmError::BadConstant("invokeinterface void 方法返回了值"));
-        }
-    }
-    Ok(())
+    finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
 }
 
 #[cfg(test)]

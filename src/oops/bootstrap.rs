@@ -29,6 +29,7 @@ const BOOTSTRAP_HIERARCHY: &[(&str, Option<&str>)] = &[
     ("java/lang/LinkageError", Some("java/lang/Error")),
     ("java/lang/ExceptionInInitializerError", Some("java/lang/LinkageError")),
     ("java/lang/NoClassDefFoundError", Some("java/lang/LinkageError")),
+    ("java/lang/UnsatisfiedLinkError", Some("java/lang/LinkageError")),
     ("java/lang/AbstractMethodError", Some("java/lang/Error")),
     ("java/lang/StackOverflowError", Some("java/lang/Error")),
     ("java/lang/Exception", Some("java/lang/Throwable")),
@@ -183,6 +184,7 @@ mod tests {
             "java/lang/LinkageError",
             "java/lang/ExceptionInInitializerError",
             "java/lang/NoClassDefFoundError",
+            "java/lang/UnsatisfiedLinkError",
         ] {
             assert!(reg.get(name).is_some(), "{name} 应已加载");
         }

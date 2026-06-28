@@ -20,7 +20,7 @@ use crate::metadata::{ClassFile, MethodInfo};
 use crate::oops::Oop;
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
-use super::{clinit, exception, throw_exception, Interpreter, Value, VmError};
+use super::{clinit, exception, native, throw_exception, Interpreter, Value, VmError};
 
 /// invoke 后调用者分派循环的流向。
 pub(super) enum InvokeFlow {
@@ -177,6 +177,19 @@ enum Arg {
     Reference(Reference),
 }
 
+/// 实参 → 解释器值(native 分派用:native 方法不走被调用者帧,直接消费 `Value`)。
+impl From<Arg> for Value {
+    fn from(a: Arg) -> Self {
+        match a {
+            Arg::Int(x) => Value::Int(x),
+            Arg::Long(x) => Value::Long(x),
+            Arg::Float(x) => Value::Float(x),
+            Arg::Double(x) => Value::Double(x),
+            Arg::Reference(r) => Value::Reference(r),
+        }
+    }
+}
+
 /// 从调用者操作数栈弹出单个实参(按字段类型决定弹出类型)。
 ///
 /// JVM 栈上 `byte/char/short/boolean` 一律以 int 承载,故按 int 弹出。
@@ -255,12 +268,22 @@ pub(super) fn invoke_static(
         .get(&class_name)
         .ok_or(VmError::BadConstant("invokestatic 目标类未加载"))?;
     let target_method = find_method(&target_lc.cf, &method_name, &desc)?;
+    let md = parse_method_descriptor(&desc)?;
+    // ACC_NATIVE(无 Code)→ 内置 native 分派表(移植 prims/jvm.cpp 的 JVM_* 桥;
+    // 详见 `native::invoke`)。静态 native 无 `this`,实参自调用者栈逆序弹出转正序。
+    if target_method.access_flags.is_native() {
+        let mut nargs: Vec<Value> = Vec::with_capacity(md.parameters.len());
+        for ft in md.parameters.iter().rev() {
+            nargs.push(pop_arg(frame, ft)?.into());
+        }
+        nargs.reverse();
+        let result = native::invoke(vm, &class_name, &method_name, &desc, None, &nargs);
+        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+    }
     let code = target_method
         .code
         .as_ref()
-        .ok_or(VmError::BadConstant("invokestatic 目标方法无 Code(抽象/原生)"))?;
-
-    let md = parse_method_descriptor(&desc)?;
+        .ok_or(VmError::BadConstant("invokestatic 目标方法无 Code(抽象)"))?;
 
     // 实参在调用者栈上为正序(arg0 在底,argN 在顶);逆序弹出后翻转为正序,
     // 再按 JVM 调用约定写入被调用者局部变量 0..(long/double 占两槽)。
@@ -335,10 +358,17 @@ pub(super) fn invoke_special(
                 .ok_or(VmError::BadConstant("invokespecial 未找到目标方法"))?,
         }
     };
+    // ACC_NATIVE → 内置 native 分派表(声明类 = 解析到的目标类)。
+    if target_method.access_flags.is_native() {
+        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
+        let native_class = target_lc.name().to_string();
+        let result = native::invoke(vm, &native_class, &method_name, &desc, Some(objref), &nargs);
+        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+    }
     let code = target_method
         .code
         .as_ref()
-        .ok_or(VmError::BadConstant("invokespecial 目标方法无 Code(抽象/原生)"))?;
+        .ok_or(VmError::BadConstant("invokespecial 目标方法无 Code(抽象)"))?;
 
     let mut callee = Frame::new(code.max_locals, code.max_stack);
     callee.locals.set_reference(0, objref)?;
@@ -407,6 +437,13 @@ pub(super) fn invoke_virtual(
         Some(x) => x,
         None => return Err(throw_exception(vm, "java/lang/AbstractMethodError")),
     };
+    // ACC_NATIVE → 内置 native 分派表(Object.hashCode 等虚方法 native 经此)。
+    if target_method.access_flags.is_native() {
+        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
+        let native_class = target_lc.name().to_string();
+        let result = native::invoke(vm, &native_class, &method_name, &desc, Some(objref), &nargs);
+        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+    }
     let Some(code) = target_method.code.as_ref() else {
         return Err(throw_exception(vm, "java/lang/AbstractMethodError"));
     };
@@ -476,6 +513,13 @@ pub(super) fn invoke_interface(
         Some(x) => x,
         None => return Err(throw_exception(vm, "java/lang/AbstractMethodError")),
     };
+    // ACC_NATIVE → 内置 native 分派表。
+    if target_method.access_flags.is_native() {
+        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
+        let native_class = target_lc.name().to_string();
+        let result = native::invoke(vm, &native_class, &method_name, &desc, Some(objref), &nargs);
+        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+    }
     let Some(code) = target_method.code.as_ref() else {
         return Err(throw_exception(vm, "java/lang/AbstractMethodError"));
     };

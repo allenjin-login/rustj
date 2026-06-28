@@ -10,6 +10,7 @@ mod clinit;
 mod exception;
 mod field;
 mod invoke;
+mod native;
 mod type_check;
 
 use crate::bytecode::opcode::{BytecodeError, Opcode};

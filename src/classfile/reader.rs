@@ -83,6 +83,12 @@ impl<'a> Reader<'a> {
 /// 2. 辅助平面字符(U+10000 以上)以 UTF-16 代理对形式,各按 3 字节序列编码。
 ///
 /// 实现:先把每段序列解码为 BMP 码元(`Vec<u16>`),再把代理对合并为 `char`。
+///
+/// **孤立代理(lone surrogate)的处理**:JVMS 允许 `Utf8` 含孤立代理单元(如 `GB18030` 把映射
+/// 表存为含原始 UTF-16 单元的 Java 串,javac 逐单元按 3 字节编码,jvm 容忍读取)。但 Rust
+/// `String`/`char` **不能表示代理**,故本解码器把孤立代理**损余替换**为 `U+FFFD`——仅影响含
+/// 孤立代理的串常量之**值**(名字/描述符/方法名绝不含代理,不受影响)。忠实往返(保留原始字节)
+/// 见后续「原始字节 Utf8 存储」层。
 fn decode_modified_utf8(bytes: &[u8]) -> Result<String, ClassFileError> {
     let mut units: Vec<u16> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -128,24 +134,27 @@ fn decode_modified_utf8(bytes: &[u8]) -> Result<String, ClassFileError> {
         }
     }
 
-    // 合并 UTF-16 代理对,得到 `String`。
+    // 合并 UTF-16 代理对,得到 `String`。孤立代理(无配对)→ U+FFFD(Rust char 不可表示代理)。
     let mut out = String::with_capacity(units.len());
     let mut j = 0;
     while j < units.len() {
         let u = units[j];
         if (0xD800..=0xDBFF).contains(&u) {
-            // 高代理,应跟一个低代理
-            if j + 1 >= units.len() || !(0xDC00..=0xDFFF).contains(&units[j + 1]) {
-                return Err(ClassFileError::InvalidUtf8);
+            // 高代理:紧随低代理则合并为辅助平面字符;否则孤立 → U+FFFD。
+            if j + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[j + 1]) {
+                let hi = u32::from(u);
+                let lo = u32::from(units[j + 1]);
+                let cp = 0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                out.push(char::from_u32(cp).ok_or(ClassFileError::InvalidUtf8)?);
+                j += 2;
+            } else {
+                out.push('\u{FFFD}');
+                j += 1;
             }
-            let hi = u32::from(u);
-            let lo = u32::from(units[j + 1]);
-            let cp = 0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
-            out.push(char::from_u32(cp).ok_or(ClassFileError::InvalidUtf8)?);
-            j += 2;
         } else if (0xDC00..=0xDFFF).contains(&u) {
-            // 裸低代理,非法
-            return Err(ClassFileError::InvalidUtf8);
+            // 孤立低代理(无前导高代理)→ U+FFFD。
+            out.push('\u{FFFD}');
+            j += 1;
         } else {
             out.push(char::from_u32(u32::from(u)).ok_or(ClassFileError::InvalidUtf8)?);
             j += 1;
@@ -249,5 +258,17 @@ mod tests {
         let mut r = Reader::new(&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]);
         let s = r.modified_utf8(6).unwrap();
         assert_eq!(s, "😀");
+    }
+
+    #[test]
+    fn modified_utf8_lone_surrogates_become_replacement() {
+        // GB18030 等把映射表存为含孤立代理单元的 Java 串;javac 逐单元按 3 字节编码。
+        // Rust String 不可表示代理 → 损余为 U+FFFD(配对代理仍正确合并,见上)。
+        // 孤立低代理 U+DE9A = 0xED 0xBA 0x9A(无前导高代理):
+        let mut r = Reader::new(&[0xED, 0xBA, 0x9A]);
+        assert_eq!(r.modified_utf8(3).unwrap(), "\u{FFFD}");
+        // 孤立高代理 U+D83D = 0xED 0xA0 0xBD(无后随低代理;配对时 D83D DE00 合为 😀):
+        let mut r = Reader::new(&[0xED, 0xA0, 0xBD]);
+        assert_eq!(r.modified_utf8(3).unwrap(), "\u{FFFD}");
     }
 }

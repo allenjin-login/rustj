@@ -26,6 +26,9 @@ const BOOTSTRAP_HIERARCHY: &[(&str, Option<&str>)] = &[
     ("java/lang/Object", None),
     ("java/lang/Throwable", Some("java/lang/Object")),
     ("java/lang/Error", Some("java/lang/Throwable")),
+    ("java/lang/LinkageError", Some("java/lang/Error")),
+    ("java/lang/ExceptionInInitializerError", Some("java/lang/LinkageError")),
+    ("java/lang/NoClassDefFoundError", Some("java/lang/LinkageError")),
     ("java/lang/AbstractMethodError", Some("java/lang/Error")),
     ("java/lang/StackOverflowError", Some("java/lang/Error")),
     ("java/lang/Exception", Some("java/lang/Throwable")),
@@ -177,6 +180,9 @@ mod tests {
             "java/lang/IndexOutOfBoundsException",
             "java/lang/AbstractMethodError",
             "java/lang/StackOverflowError",
+            "java/lang/LinkageError",
+            "java/lang/ExceptionInInitializerError",
+            "java/lang/NoClassDefFoundError",
         ] {
             assert!(reg.get(name).is_some(), "{name} 应已加载");
         }

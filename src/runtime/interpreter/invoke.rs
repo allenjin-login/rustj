@@ -20,7 +20,7 @@ use crate::metadata::{ClassFile, MethodInfo};
 use crate::oops::Oop;
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
-use super::{exception, throw_exception, Interpreter, Value, VmError};
+use super::{clinit, exception, throw_exception, Interpreter, Value, VmError};
 
 /// invoke 后调用者分派循环的流向。
 pub(super) enum InvokeFlow {
@@ -249,6 +249,8 @@ pub(super) fn invoke_static(
         .registry()
         .ok_or(VmError::BadConstant("invokestatic 需要类注册表"))?;
     let (class_name, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
+    // 首次静态调用 → 触发声明类初始化(<clinit> 先行)。
+    clinit::ensure_class_initialized(vm, &class_name)?;
     let target_lc = registry
         .get(&class_name)
         .ok_or(VmError::BadConstant("invokestatic 目标类未加载"))?;

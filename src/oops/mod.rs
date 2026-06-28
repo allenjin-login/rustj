@@ -12,6 +12,6 @@ pub mod string;
 
 pub use array::ArrayOop;
 pub use instance::InstanceOop;
-pub use klass::{ClassRegistry, LoadedClass, ResolvedField};
+pub use klass::{ClassRegistry, InitState, LoadedClass, ResolvedField};
 pub use oop::Oop;
 pub use string::StringOop;

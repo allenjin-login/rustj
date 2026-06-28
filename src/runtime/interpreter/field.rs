@@ -11,10 +11,10 @@
 
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_field_descriptor, FieldType};
-use crate::oops::{LoadedClass, Oop};
+use crate::oops::Oop;
 use crate::runtime::{Frame, Slot, Vm};
 
-use super::{throw_exception, Interpreter, VmError};
+use super::{clinit, throw_exception, Interpreter, VmError};
 
 /// 解析 `Fieldref` 常量池条目 → `(类内部名, 字段名, 描述符)`。owned 字符串。
 pub(super) fn resolve_fieldref(
@@ -69,17 +69,6 @@ fn utf8(cp: &ConstantPool, index: u16) -> Result<String, VmError> {
         ConstantPoolEntry::Utf8(s) => Ok(s.clone()),
         _ => Err(VmError::BadConstant("期望 Utf8 条目")),
     }
-}
-
-/// 在注册表中定位已加载类;未加载或无注册表报错。
-///
-/// 返回的 `&'reg LoadedClass` 与注册表同寿命(由 [`Vm::registry`] 的 `'a` 暴露),
-/// 不依赖本次对 `vm` 的借用——故取出后仍可再借 `&mut vm`(堆访问)。
-fn require_class<'reg>(vm: &Vm<'reg>, class_name: &str) -> Result<&'reg LoadedClass, VmError> {
-    vm.registry()
-        .ok_or(VmError::BadConstant("字段/new 指令需要类注册表"))?
-        .get(class_name)
-        .ok_or(VmError::BadConstant("目标类未加载"))
 }
 
 /// 按字段类型从操作数栈弹出一个值 → 槽(byte/char/short/boolean 以 int 承载)。
@@ -146,6 +135,8 @@ pub(super) fn new_instance(
     class_index: u16,
 ) -> Result<(), VmError> {
     let class_name = resolve_class_name(interp.cp(), class_index)?;
+    // 首次实例化 → 触发类初始化(<clinit>),先于分配。
+    clinit::ensure_class_initialized(vm, &class_name)?;
     let registry = vm
         .registry()
         .ok_or(VmError::BadConstant("new 需要类注册表"))?;
@@ -239,9 +230,14 @@ pub(super) fn get_static(
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
     let ft = parse_field_descriptor(&desc)?;
-    let lc = require_class(vm, &class_name)?;
-    let ordinal = lc
-        .static_field(&field_name, &ft)
+    // 首次读静态字段 → 触发声明类初始化(<clinit> 先行写入;ensure 会先初始化超类)。
+    clinit::ensure_class_initialized(vm, &class_name)?;
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("字段指令需要类注册表"))?;
+    // 沿超类链找声明类(Fieldref 类可能为继承字段的子类)+ 其静态槽。
+    let (lc, ordinal) = registry
+        .resolve_static_field(&class_name, &field_name, &ft)
         .ok_or(VmError::BadConstant("getstatic 未找到静态字段"))?;
     let slot = *lc
         .static_storage
@@ -261,9 +257,13 @@ pub(super) fn put_static(
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
     let ft = parse_field_descriptor(&desc)?;
-    let lc = require_class(vm, &class_name)?;
-    let ordinal = lc
-        .static_field(&field_name, &ft)
+    // 首次写静态字段 → 触发声明类初始化。
+    clinit::ensure_class_initialized(vm, &class_name)?;
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("字段指令需要类注册表"))?;
+    let (lc, ordinal) = registry
+        .resolve_static_field(&class_name, &field_name, &ft)
         .ok_or(VmError::BadConstant("putstatic 未找到静态字段"))?;
     let value = pop_field_value(frame, &ft)?;
     lc.static_storage.borrow_mut()[ordinal] = value;

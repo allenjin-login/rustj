@@ -23,6 +23,20 @@ pub struct ResolvedField {
     pub descriptor: FieldType,
 }
 
+/// 类初始化状态(JVMS §5.5 子集)。`RefCell` 承载:类初始化是类级可变状态(类比
+/// `static_storage`),而 `Vm` 以不可变借用持注册表,只能经内部可变性改之。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitState {
+    /// 尚未初始化(默认)。
+    NotStarted,
+    /// 正在初始化中(重入跳过,防无限递归)。
+    InProgress,
+    /// 已初始化完成。
+    Done,
+    /// 初始化曾抛异常 → 后续 active use 抛 `NoClassDefFoundError`。
+    Failed,
+}
+
 /// 已加载的类:`ClassFile` + 本类实例/静态字段布局 + 静态字段存储 + 超类关系。
 ///
 /// `instance_fields` 为**本类声明**的实例字段;**继承字段**经
@@ -38,6 +52,8 @@ pub struct LoadedClass {
     pub static_storage: RefCell<Vec<Slot>>,
     super_class_name: Option<String>,
     flat_cache: RefCell<Option<Vec<ResolvedField>>>,
+    /// 类初始化状态(4.9 `<clinit>`):首次 active use 时由解释器推进。
+    init_state: RefCell<InitState>,
 }
 
 impl LoadedClass {
@@ -56,8 +72,8 @@ impl LoadedClass {
         &self.static_fields
     }
 
-    /// 按名 + 类型定位**静态**字段 → 序号(`static_storage` 索引)。静态字段不扁平化
-    /// (归属声明类;getstatic/putstatic 的 Fieldref 已指向声明类)。
+    /// 按名 + 类型定位**本类静态**字段 → 序号(`static_storage` 索引)。仅本类声明,
+    /// **不**沿超类链查找;继承静态字段经 [`ClassRegistry::resolve_static_field`] 解析。
     pub fn static_field(&self, name: &str, ft: &FieldType) -> Option<usize> {
         self.static_fields
             .iter()
@@ -67,6 +83,16 @@ impl LoadedClass {
     /// 超类内部名;`None` 表示 `java/lang/Object` 或无超类。
     pub fn super_class_name(&self) -> Option<&str> {
         self.super_class_name.as_deref()
+    }
+
+    /// 类初始化状态(4.9)。
+    pub fn init_state(&self) -> InitState {
+        *self.init_state.borrow()
+    }
+
+    /// 设置类初始化状态(4.9)。经 `RefCell` 内部可变性。
+    pub fn set_init_state(&self, state: InitState) {
+        *self.init_state.borrow_mut() = state;
     }
 
     /// 直接实现的接口内部名(解析 `cf.interfaces` 的 `Class` 条目)。
@@ -96,6 +122,7 @@ impl LoadedClass {
             static_storage: RefCell::new(layout.static_storage),
             super_class_name,
             flat_cache: RefCell::new(None),
+            init_state: RefCell::new(InitState::NotStarted),
         })
     }
 }
@@ -173,6 +200,25 @@ impl ClassRegistry {
     pub fn new_instance(&self, lc: &LoadedClass) -> InstanceOop {
         let fields = default_fields(&self.flattened_instance_fields(lc));
         InstanceOop::new(lc.name().to_string(), fields)
+    }
+
+    /// 沿超类链找静态字段的**(声明类, 序号)**。getstatic/putstatic 解析:Fieldref 的类
+    /// 可能指向继承该字段的子类(javac 对继承静态字段如此编码),故须上行找到真正声明、
+    /// 持有 `static_storage` 的类。接口静态字段不沿此路径(顺延)。
+    pub fn resolve_static_field<'a>(
+        &'a self,
+        class_name: &str,
+        name: &str,
+        ft: &FieldType,
+    ) -> Option<(&'a LoadedClass, usize)> {
+        let mut cur = self.get(class_name);
+        while let Some(lc) = cur {
+            if let Some(ord) = lc.static_field(name, ft) {
+                return Some((lc, ord));
+            }
+            cur = lc.super_class_name().and_then(|s| self.get(s));
+        }
+        None
     }
 
     /// 虚分派:从 `class_name` 沿超类链找首个 (name, desc) 方法 → (声明类, 方法)。
@@ -465,6 +511,19 @@ mod tests {
         assert_eq!(stat[0].name, "count");
         assert_eq!(stat[0].descriptor, FieldType::Int);
         assert_eq!(storage, vec![Slot::Int(0)]); // 静态默认值
+    }
+
+    #[test]
+    fn init_state_defaults_not_started() {
+        // utf8: [1]="C",[2]="java/lang/Object"; classes[1,2] → [3]=Class"C",[4]=Class Object
+        let pool = mk_cp(&["C", "java/lang/Object"], &[1, 2]);
+        let cf = mk_cf(pool, 3, 4, vec![], vec![]);
+        let lc = LoadedClass::from_cf(cf).unwrap();
+        assert_eq!(lc.init_state(), InitState::NotStarted);
+        lc.set_init_state(InitState::InProgress);
+        assert_eq!(lc.init_state(), InitState::InProgress);
+        lc.set_init_state(InitState::Done);
+        assert_eq!(lc.init_state(), InitState::Done);
     }
 
     /// 构建常量池:先放 utf8s(索引从 1 起),再放 classes(每个 = 指向某 utf8 索引的 Class 条目)。

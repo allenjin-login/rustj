@@ -2,6 +2,7 @@
 //!
 //! 本层定义数据与存取语义;字节码分派循环(执行)见 [`interpreter`]。
 
+pub mod class_loader;
 pub mod frame;
 pub mod heap;
 pub mod interpreter;

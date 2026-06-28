@@ -9,7 +9,8 @@
 //!   解 zip 内 DEFLATE 条目;rustj 不引依赖,手移植 RFC 1951 解压器(纯 safe Rust,零 unsafe),
 //!   算法依 RFC 1951,zlib 的 `contrib/puff/puff.c` 为参考实现。
 //! - [`zip`] — zip 中心目录 + 条目读取(STORED/DEFLATED;含 jmod 前缀 base 偏移修正)。
-//! - 加载器与 ClassPath(4.10d)。
+//! - [`class_path`] — 类路径(容器列表)+ 按需 `load_class`(真 ClassLoader 雏形)。
 
+pub mod class_path;
 pub mod inflate;
 pub mod zip;

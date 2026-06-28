@@ -43,9 +43,13 @@ struct Entry {
 }
 
 /// zip 容器只读视图。构造时一次性解析中心目录;`read` 按需取条目(惰性解压)。
+///
+/// 持有容器字节的**拥有副本**(`Vec<u8>`)——`ClassPath` 需把打开的容器长期存活(随注册表/
+/// Vm 同寿),拥有副本免去"数据与其 `&` 借用同处一结构"的自引用难题(安全 Rust 无法表达)。
+/// `new(&[u8])` 仍按借用构造,内部拷贝;对外为零寿命依赖。
 #[derive(Debug)]
-pub struct ZipReader<'a> {
-    data: &'a [u8],
+pub struct ZipReader {
+    data: Vec<u8>,
     entries: Vec<Entry>,
 }
 
@@ -76,9 +80,9 @@ fn find_eocd(d: &[u8]) -> Result<usize, ZipError> {
     Err(ZipError::NoEocd)
 }
 
-impl<'a> ZipReader<'a> {
+impl ZipReader {
     /// 解析 zip 字节流:定位 EOCD → 读中心目录 → 建条目索引(含 base 偏移修正)。
-    pub fn new(data: &'a [u8]) -> Result<Self, ZipError> {
+    pub fn new(data: &[u8]) -> Result<Self, ZipError> {
         let eocd = find_eocd(data)?;
         let num = u16le(data, eocd + 10)? as usize;
         let cd_size = u32le(data, eocd + 12)? as u64;
@@ -119,7 +123,7 @@ impl<'a> ZipReader<'a> {
             entries.push(Entry { name, method, comp_size, data_offset });
             p += 46 + name_len + extra_len + comment_len;
         }
-        Ok(Self { data, entries })
+        Ok(Self { data: data.to_vec(), entries })
     }
 
     /// 条目数。

@@ -17,6 +17,7 @@ fn object_type(vm: &Vm<'_>, objref: Reference) -> Result<(bool, Option<String>),
     Ok(match obj {
         Oop::Instance(i) => (false, Some(i.class_name().to_string())),
         Oop::Array(_) => (true, None),
+        Oop::String(_) => (false, Some("java/lang/String".to_string())),
     })
 }
 

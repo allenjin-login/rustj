@@ -4,6 +4,7 @@
 
 use super::array::ArrayOop;
 use super::instance::InstanceOop;
+use super::string::StringOop;
 
 /// 堆中的对象。
 #[derive(Debug, Clone, PartialEq)]
@@ -12,4 +13,6 @@ pub enum Oop {
     Instance(InstanceOop),
     /// 一维数组(基本类型或引用类型,统一表示)。
     Array(ArrayOop),
+    /// 字符串对象(4.8:字符串字面量的堆表示,见 [`StringOop`])。
+    String(StringOop),
 }

@@ -19,7 +19,7 @@ fn runtime_class_name(vm: &Vm<'_>, exc: Reference) -> Result<String, VmError> {
         .ok_or(VmError::BadConstant("athrow/异常分派 引用悬空"))?;
     match obj {
         Oop::Instance(i) => Ok(i.class_name().to_string()),
-        Oop::Array(_) => Err(VmError::BadConstant("athrow 对象为数组(非法)")),
+        Oop::Array(_) | Oop::String(_) => Err(VmError::BadConstant("athrow 对象须为异常实例(数组/String 非法)")),
     }
 }
 

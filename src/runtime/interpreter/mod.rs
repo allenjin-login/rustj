@@ -245,12 +245,13 @@ impl<'a> Interpreter<'a> {
             }
             Opcode::Ldc => {
                 let index = self.read_u1(pc + 1)? as u16;
-                match self.cp.get(index)? {
-                    ConstantPoolEntry::Integer(v) => frame.operands.push_int(*v)?,
-                    ConstantPoolEntry::Float(v) => frame.operands.push_float(*v)?,
-                    _ => return Err(VmError::BadConstant("ldc 期望 int/float(3.2 仅支持数值)")),
-                }
+                self.load_constant(frame, vm, index)?;
                 pc += 2;
+            }
+            Opcode::LdcW => {
+                let index = self.read_u2(pc + 1)?;
+                self.load_constant(frame, vm, index)?;
+                pc += 3;
             }
             // ---- 加载局部变量 ----
             Opcode::Iload => {
@@ -1107,6 +1108,34 @@ impl<'a> Interpreter<'a> {
         Ok(Step::Continue)
     }
 
+    /// `ldc`/`ldc_w` 取常量压栈:`Integer`/`Float` 数值,或 `String`(经 Vm intern 池 → 引用)。
+    /// `Class`/`MethodType`/`MethodHandle` 等顺延。
+    fn load_constant(
+        &self,
+        frame: &mut Frame,
+        vm: &mut Vm<'_>,
+        index: u16,
+    ) -> Result<(), VmError> {
+        match self.cp.get(index)? {
+            ConstantPoolEntry::Integer(v) => frame.operands.push_int(*v)?,
+            ConstantPoolEntry::Float(v) => frame.operands.push_float(*v)?,
+            ConstantPoolEntry::String { string_index } => {
+                let text = match self.cp.get(*string_index)? {
+                    ConstantPoolEntry::Utf8(s) => s.clone(),
+                    _ => return Err(VmError::BadConstant("ldc String 须指向 Utf8")),
+                };
+                let r = vm.intern_string(&text);
+                frame.operands.push_reference(r)?;
+            }
+            _ => {
+                return Err(VmError::BadConstant(
+                    "ldc/ldc_w 期望 int/float/string(Class/MethodType 顺延)",
+                ))
+            }
+        }
+        Ok(())
+    }
+
     // ---- 操作数读取(带越界检查,大端)----
 
     fn read_u1(&self, at: usize) -> Result<u8, VmError> {
@@ -1368,6 +1397,66 @@ mod tests {
         let interp = Interpreter::new(&code, &cp);
         let mut frame = Frame::new(0, 1);
         assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(42));
+    }
+
+    /// 常量池:[1]=Utf8(s) [2]=String{string_index=1}。
+    fn cp_with_string(s: &str) -> ConstantPool {
+        use crate::classfile::Reader;
+        let mut b = vec![0x00, 0x03]; // count=3 → 索引 1..2
+        b.push(0x01); // [1] Utf8
+        b.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        b.extend_from_slice(s.as_bytes());
+        b.push(0x08); // [2] String
+        b.extend_from_slice(&1u16.to_be_bytes()); // string_index=1
+        ConstantPool::parse(&mut Reader::new(&b)).unwrap()
+    }
+
+    #[test]
+    fn ldc_string_pushes_interned_reference() {
+        let cp = cp_with_string("hi");
+        let code = [Opcode::Ldc as u8, 0x02, Opcode::Areturn as u8];
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(0, 1);
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        let v = interp.interpret_with(&mut frame, &mut vm).unwrap();
+        let Value::Reference(r) = v else {
+            panic!("期望 Value::Reference, 得 {v:?}");
+        };
+        assert!(!r.is_null());
+        match vm.heap().get(r).unwrap() {
+            crate::oops::Oop::String(s) => assert_eq!(s.text(), "hi"),
+            other => panic!("期望 Oop::String, 得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ldc_w_string_pushes_interned_reference() {
+        let cp = cp_with_string("hi");
+        let code = [Opcode::LdcW as u8, 0x00, 0x02, Opcode::Areturn as u8];
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(0, 1);
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        let v = interp.interpret_with(&mut frame, &mut vm).unwrap();
+        let Value::Reference(r) = v else {
+            panic!("期望 Value::Reference, 得 {v:?}");
+        };
+        match vm.heap().get(r).unwrap() {
+            crate::oops::Oop::String(s) => assert_eq!(s.text(), "hi"),
+            other => panic!("期望 Oop::String, 得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ldc_w_integer_loads_value() {
+        // count=2,[1]=Integer(7)(补缺:ldc_w 此前从未分派)
+        let cp_bytes = [0x00, 0x02, 0x03, 0x00, 0x00, 0x00, 0x07];
+        let cp = ConstantPool::parse(&mut crate::classfile::Reader::new(&cp_bytes)).unwrap();
+        let code = [Opcode::LdcW as u8, 0x00, 0x01, Opcode::Ireturn as u8];
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(0, 1);
+        assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(7));
     }
 
     /// 在预置局部变量后运行,返回 Int 值。

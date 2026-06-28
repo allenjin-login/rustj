@@ -8,8 +8,10 @@ pub mod bootstrap;
 pub mod instance;
 pub mod klass;
 pub mod oop;
+pub mod string;
 
 pub use array::ArrayOop;
 pub use instance::InstanceOop;
 pub use klass::{ClassRegistry, LoadedClass, ResolvedField};
 pub use oop::Oop;
+pub use string::StringOop;

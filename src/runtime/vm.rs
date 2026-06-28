@@ -9,6 +9,8 @@
 
 use crate::oops::ClassRegistry;
 use crate::runtime::heap::Heap;
+use crate::runtime::string_pool::StringPool;
+use crate::runtime::Reference;
 
 /// 默认帧深度上限。高于 ackermann(3,3) 的递归深度(~120),正常小测试不会误触;
 /// 可经 [`Vm::with_stack_limit`] 调整(SOE 测试用小值快速触发)。
@@ -18,6 +20,8 @@ pub const DEFAULT_STACK_LIMIT: u32 = 512;
 pub struct Vm<'a> {
     heap: Heap,
     registry: Option<&'a ClassRegistry>,
+    /// 字符串 intern 池(4.8):文本 → 堆引用,以本 Vm 的堆为后盾。
+    string_pool: StringPool,
     /// 当前嵌套帧数(进入一帧 +1,退出 −1)。
     pub(crate) frame_depth: u32,
     /// 帧深度上限;`frame_depth >= stack_limit` 时再调用 → 抛 `StackOverflowError`。
@@ -30,6 +34,7 @@ impl<'a> Vm<'a> {
         Self {
             heap: Heap::new(),
             registry: Some(registry),
+            string_pool: StringPool::new(),
             frame_depth: 0,
             stack_limit: DEFAULT_STACK_LIMIT,
         }
@@ -51,6 +56,11 @@ impl<'a> Vm<'a> {
         &mut self.heap
     }
 
+    /// 返回 `text` 的 intern 字符串引用(同文本恒同引用)。4.8:`ldc`/`ldc_w` 字符串字面量经此。
+    pub fn intern_string(&mut self, text: &str) -> Reference {
+        self.string_pool.intern(&mut self.heap, text)
+    }
+
     /// 类注册表(若启用)。
     ///
     /// 返回的引用与注册表本身同寿命(`'a`),不依赖本次对 `self` 的借用——
@@ -65,6 +75,7 @@ impl Default for Vm<'_> {
         Self {
             heap: Heap::new(),
             registry: None,
+            string_pool: StringPool::new(),
             frame_depth: 0,
             stack_limit: DEFAULT_STACK_LIMIT,
         }

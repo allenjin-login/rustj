@@ -70,7 +70,7 @@ mod tests {
                 assert_eq!(i.class_name(), "P");
                 assert_eq!(i.field(0), Slot::Int(7));
             }
-            Oop::Array(_) => panic!("期望实例"),
+            Oop::Array(_) | Oop::String(_) => panic!("期望实例"),
         }
     }
 
@@ -80,11 +80,11 @@ mod tests {
         let r = heap.alloc(inst("P", vec![Slot::Int(0)]));
         match heap.get_mut(r).unwrap() {
             Oop::Instance(i) => i.set_field(0, Slot::Int(5)),
-            Oop::Array(_) => panic!("期望实例"),
+            Oop::Array(_) | Oop::String(_) => panic!("期望实例"),
         }
         match heap.get(r).unwrap() {
             Oop::Instance(i) => assert_eq!(i.field(0), Slot::Int(5)),
-            Oop::Array(_) => panic!("期望实例"),
+            Oop::Array(_) | Oop::String(_) => panic!("期望实例"),
         }
     }
 

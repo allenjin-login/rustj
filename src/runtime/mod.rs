@@ -8,6 +8,7 @@ pub mod interpreter;
 pub mod local_vars;
 pub mod operand_stack;
 pub mod slot;
+pub mod string_pool;
 pub mod vm;
 
 pub use frame::{Frame, FrameError};
@@ -16,4 +17,5 @@ pub use interpreter::{Interpreter, Value, VmError};
 pub use local_vars::LocalVars;
 pub use operand_stack::OperandStack;
 pub use slot::{Reference, Slot};
+pub use string_pool::StringPool;
 pub use vm::{DEFAULT_STACK_LIMIT, Vm};

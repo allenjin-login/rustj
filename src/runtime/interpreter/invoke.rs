@@ -389,6 +389,9 @@ pub(super) fn invoke_virtual(
         Oop::Array(_) => {
             return Err(VmError::BadConstant("invoke 目标为数组(数组方法 clone 等顺延)"))
         }
+        Oop::String(_) => {
+            return Err(VmError::BadConstant("invoke 目标为 String(String 方法顺延)"))
+        }
     };
 
     let registry = vm
@@ -455,6 +458,9 @@ pub(super) fn invoke_interface(
         Oop::Instance(i) => i.class_name().to_string(),
         Oop::Array(_) => {
             return Err(VmError::BadConstant("invoke 目标为数组(数组方法 clone 等顺延)"))
+        }
+        Oop::String(_) => {
+            return Err(VmError::BadConstant("invoke 目标为 String(String 方法顺延)"))
         }
     };
 

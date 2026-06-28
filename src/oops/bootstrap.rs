@@ -168,6 +168,23 @@ mod tests {
     }
 
     #[test]
+    fn load_or_replace_swaps_class() {
+        let mut reg = ClassRegistry::new();
+        // 先合成 Foo(超类 Object)。
+        reg.load(synth_classfile("Foo", Some("java/lang/Object")))
+            .unwrap();
+        assert_eq!(reg.get("Foo").unwrap().super_class_name(), Some("java/lang/Object"));
+        // load_or_replace 同名 Foo(超类改 Throwable)— 末胜:覆盖后超类应变。
+        reg.load_or_replace(synth_classfile("Foo", Some("java/lang/Throwable")))
+            .unwrap();
+        assert_eq!(
+            reg.get("Foo").unwrap().super_class_name(),
+            Some("java/lang/Throwable"),
+            "load_or_replace 须覆盖同名已注册类"
+        );
+    }
+
+    #[test]
     fn install_bootstrap_loads_standard_hierarchy() {
         let reg = ClassRegistry::new();
         for name in [

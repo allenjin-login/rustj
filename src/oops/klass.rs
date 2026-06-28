@@ -160,6 +160,18 @@ impl ClassRegistry {
         Ok(self.classes.entry(name).or_insert(lc))
     }
 
+    /// 加载并**覆盖**同名已注册类(`load` 首胜;此末胜)。用于以真类(从容器加载)退役
+    /// 合成引导桩:同名的合成桩被真 `ClassFile` 取而代之。对应北极星"退役 Stage A 桩"。
+    pub fn load_or_replace(&mut self, cf: ClassFile) -> Result<&LoadedClass, ClassFileError> {
+        let name = cf
+            .this_class_name()
+            .ok_or(ClassFileError::Unsupported("类缺少 this_class 名"))?
+            .to_string();
+        let lc = LoadedClass::from_cf(cf)?;
+        self.classes.insert(name.clone(), lc);
+        Ok(self.classes.get(&name).expect("刚插入"))
+    }
+
     /// 按内部名取已加载类。
     pub fn get(&self, name: &str) -> Option<&LoadedClass> {
         self.classes.get(name)

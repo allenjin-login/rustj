@@ -54,6 +54,10 @@ pub struct LoadedClass {
     flat_cache: RefCell<Option<Vec<ResolvedField>>>,
     /// 类初始化状态(4.9 `<clinit>`):首次 active use 时由解释器推进。
     init_state: RefCell<InitState>,
+    /// 是否为**合成引导桩**(非从真实 `.class` 解析)。由 [`ClassRegistry::load_stub`] 置位;
+    /// 真类(经 `load`/`load_or_replace` 从容器解析)恒为 `false`。闭包加载器据此识别「待真类
+    /// 覆盖」的桩并跳过已是真类者(幂等)。
+    is_synthetic_stub: bool,
 }
 
 impl LoadedClass {
@@ -95,6 +99,11 @@ impl LoadedClass {
         *self.init_state.borrow_mut() = state;
     }
 
+    /// 是否为合成引导桩(非真实 `.class`)。真类恒为 `false`。
+    pub fn is_synthetic_stub(&self) -> bool {
+        self.is_synthetic_stub
+    }
+
     /// 直接实现的接口内部名(解析 `cf.interfaces` 的 `Class` 条目)。
     pub fn interface_names(&self) -> Vec<String> {
         let cp = &self.cf.constant_pool;
@@ -123,6 +132,7 @@ impl LoadedClass {
             super_class_name,
             flat_cache: RefCell::new(None),
             init_state: RefCell::new(InitState::NotStarted),
+            is_synthetic_stub: false,
         })
     }
 }
@@ -170,6 +180,20 @@ impl ClassRegistry {
         let lc = LoadedClass::from_cf(cf)?;
         self.classes.insert(name.clone(), lc);
         Ok(self.classes.get(&name).expect("刚插入"))
+    }
+
+    /// 加载并标记为**合成引导桩**([`super::bootstrap::install_bootstrap`] 用)。语义同 [`load`]
+    /// (首胜),但置 `is_synthetic_stub = true`。供闭包加载器
+    /// [`load_closure`](crate::runtime::class_loader::loader::load_closure) 识别「待真类覆盖」的桩
+    /// 并跳过已是真类者(使二次调用幂等)。
+    pub fn load_stub(&mut self, cf: ClassFile) -> Result<&LoadedClass, ClassFileError> {
+        let name = cf
+            .this_class_name()
+            .ok_or(ClassFileError::Unsupported("类缺少 this_class 名"))?
+            .to_string();
+        let mut lc = LoadedClass::from_cf(cf)?;
+        lc.is_synthetic_stub = true;
+        Ok(self.classes.entry(name).or_insert(lc))
     }
 
     /// 按内部名取已加载类。

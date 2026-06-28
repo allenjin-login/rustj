@@ -10,7 +10,10 @@
 //!   算法依 RFC 1951,zlib 的 `contrib/puff/puff.c` 为参考实现。
 //! - [`zip`] — zip 中心目录 + 条目读取(STORED/DEFLATED;含 jmod 前缀 base 偏移修正)。
 //! - [`class_path`] — 类路径(容器列表)+ 按需 `load_class`(真 ClassLoader 雏形)。
+//! - [`loader`] — 传递闭包加载器:从 ClassPath 按引用闭包 BFS 预载入 ClassRegistry
+//!   (注册表为不可变借用,「惰性」= 构造 Vm 前急切预载)。
 
 pub mod class_path;
 pub mod inflate;
+pub mod loader;
 pub mod zip;

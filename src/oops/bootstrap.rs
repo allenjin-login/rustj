@@ -124,7 +124,8 @@ fn synth_classfile(name: &str, super_name: Option<&str>) -> ClassFile {
 pub(super) fn install_bootstrap(reg: &mut ClassRegistry) {
     for &(name, super_name) in BOOTSTRAP_HIERARCHY {
         let cf = synth_classfile(name, super_name);
-        reg.load(cf)
+        // load_stub(而非 load):置 is_synthetic_stub,使闭包加载器能用真类覆盖这些桩。
+        reg.load_stub(cf)
             .expect("引导类加载失败(内部不变量)");
     }
 }

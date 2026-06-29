@@ -419,6 +419,13 @@ pub(super) fn invoke_virtual(
         return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
     }
 
+    // String 特殊变体(Oop::String)的临时方法分派(equals/hashCode 等,真字节码待 Oop::String 退役)。
+    if matches!(vm.heap().get(objref), Some(Oop::String(_))) {
+        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
+        let result = native::invoke(vm, "java/lang/String", &method_name, &desc, Some(objref), &nargs);
+        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+    }
+
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
     let runtime_class = vm
         .heap()
@@ -429,9 +436,7 @@ pub(super) fn invoke_virtual(
         Oop::Array(_) => {
             return Err(VmError::BadConstant("invoke 目标为数组(数组方法 clone 等顺延)"))
         }
-        Oop::String(_) => {
-            return Err(VmError::BadConstant("invoke 目标为 String(String 方法顺延)"))
-        }
+        Oop::String(_) => unreachable!("Oop::String 已先行 native 分派"),
         Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
     };
 
@@ -504,6 +509,13 @@ pub(super) fn invoke_interface(
         return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
     }
 
+    // String 特殊变体的临时方法分派(同 invoke_virtual)。
+    if matches!(vm.heap().get(objref), Some(Oop::String(_))) {
+        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
+        let result = native::invoke(vm, "java/lang/String", &method_name, &desc, Some(objref), &nargs);
+        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+    }
+
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
     let runtime_class = vm
         .heap()
@@ -514,9 +526,7 @@ pub(super) fn invoke_interface(
         Oop::Array(_) => {
             return Err(VmError::BadConstant("invoke 目标为数组(数组方法 clone 等顺延)"))
         }
-        Oop::String(_) => {
-            return Err(VmError::BadConstant("invoke 目标为 String(String 方法顺延)"))
-        }
+        Oop::String(_) => unreachable!("Oop::String 已先行 native 分派"),
         Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
     };
 

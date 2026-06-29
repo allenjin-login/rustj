@@ -59,6 +59,19 @@ pub(super) fn invoke(
         // 此处恒空操作(等价"VM 已初始化,无保存属性"——后续 getSavedProperty 读空表得 null)。
         ("jdk/internal/misc/VM", "initialize", "()V") => Ok(Value::Void),
 
+        // jdk.internal.misc.CDS.initializeFromArchive(Ljava/lang/Class;)V —— CDS.java:130
+        // public static native。HotSpot `JVM_InitializeFromArchive`:从 CDS/AOT 归档恢复类的
+        // 归档静态状态;无归档(rustj 无 CDS)→ 空操作(归档字段留默认 null)。包装类(Integer/
+        // Long/…)$<clinit> 经 `runtimeSetup()` 调之以尝试恢复 archivedCache;空操作后走"新建缓存"
+        // 分支,即非 CDS 运行的规范行为。
+        ("jdk/internal/misc/CDS", "initializeFromArchive", "(Ljava/lang/Class;)V") => Ok(Value::Void),
+
+        // jdk.internal.misc.CDS.getCDSConfigStatus()I —— CDS.java:95 私有 native,<clinit> 经
+        // `configStatus = getCDSConfigStatus()` 调之。HotSpot 返回 CDS 配置位掩码(cdsConfig.hpp:
+        // IS_DUMPING_ARCHIVE / IS_USING_ARCHIVE / …);rustj 无 CDS → 恒 0(所有标志关闭),
+        // 即 isUsingArchive()/isDumpingArchive()/… 均假——规范的非 CDS 运行。
+        ("jdk/internal/misc/CDS", "getCDSConfigStatus", "()I") => Ok(Value::Int(0)),
+
         // Object.hashCode()I —— synchronizer.cpp get_next_hash mode 4(对象标识/地址)。
         // 句柄 id 即堆上唯一标识;null 收者(理论不可达,实例方法)兜底 0。
         ("java/lang/Object", "hashCode", "()I") => {
@@ -109,6 +122,57 @@ pub(super) fn invoke(
         // rustj 无断言支持 → 恒 false(断言禁用,即 `$assertionsDisabled = true`)。Oop::Class 镜像
         // 由 invoke 路径按 "java/lang/Class" 经本表分派(见 invoke_virtual/interface)。
         ("java/lang/Class", "desiredAssertionStatus", "()Z") => Ok(Value::Int(0)),
+
+        // Runtime.maxMemory()J —— jvm.cpp JVM_MaxMemory:堆上限。rustj 堆为无界 Vec → 取 i64::MAX
+        // (VM.saveProperties 存进 directMemory,本场景不用;真值无意义)。
+        ("java/lang/Runtime", "maxMemory", "()J") => Ok(Value::Long(i64::MAX)),
+
+        // String.equals(Ljava/lang/Object;)Z —— 临时脚手架(Oop::String 特殊变体上的方法,见
+        // invoke_virtual/interface 的 String 分派)。真 String.equals 退役 Oop::String 后由真字节码运行;
+        // 本臂仅 `equals(Object)`:`null`/非 String → false;同引用 → true;否则文本比较。
+        ("java/lang/String", "equals", "(Ljava/lang/Object;)Z") => {
+            let Some(this_ref) = this else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let Some(Value::Reference(other_ref)) = args.first().copied() else {
+                return Ok(Value::Int(0)); // null 实参 → false
+            };
+            let this_text = match vm.heap().get(this_ref) {
+                Some(Oop::String(s)) => s.text().to_string(),
+                _ => {
+                    return Err(VmError::BadConstant(
+                        "String.equals 收者非 String(暂仅 Oop::String 支持)",
+                    ))
+                }
+            };
+            if other_ref == this_ref {
+                return Ok(Value::Int(1));
+            }
+            let eq = matches!(vm.heap().get(other_ref),
+                Some(Oop::String(s)) if s.text() == this_text);
+            Ok(Value::Int(if eq { 1 } else { 0 }))
+        }
+
+        // String.hashCode()I —— 临时脚手架:Java String.hashCode = h = 31*h + char(UTF-16 单元,
+        // 补码回绕)。按 encode_utf16 迭代以对齐 Java 的按代码单元求值(辅助平面字符=代理对两单元)。
+        ("java/lang/String", "hashCode", "()I") => {
+            let Some(this_ref) = this else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let text = match vm.heap().get(this_ref) {
+                Some(Oop::String(s)) => s.text().to_string(),
+                _ => {
+                    return Err(VmError::BadConstant(
+                        "String.hashCode 收者非 String(暂仅 Oop::String 支持)",
+                    ))
+                }
+            };
+            let mut h: i32 = 0;
+            for u in text.encode_utf16() {
+                h = h.wrapping_mul(31).wrapping_add(u as i32);
+            }
+            Ok(Value::Int(h))
+        }
 
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),

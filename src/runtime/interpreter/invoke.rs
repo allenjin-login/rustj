@@ -411,6 +411,14 @@ pub(super) fn invoke_virtual(
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
 
+    // Class 镜像(Oop::Class)非注册表类,经 "java/lang/Class" 的 native 表分派
+    // (desiredAssertionStatus 等)。先于 runtime_class 解析(其按类链查表,镜像无类链)。
+    if matches!(vm.heap().get(objref), Some(Oop::Class(_))) {
+        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
+        let result = native::invoke(vm, "java/lang/Class", &method_name, &desc, Some(objref), &nargs);
+        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+    }
+
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
     let runtime_class = vm
         .heap()
@@ -424,6 +432,7 @@ pub(super) fn invoke_virtual(
         Oop::String(_) => {
             return Err(VmError::BadConstant("invoke 目标为 String(String 方法顺延)"))
         }
+        Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
     };
 
     let registry = vm
@@ -488,6 +497,13 @@ pub(super) fn invoke_interface(
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
 
+    // Class 镜像经 "java/lang/Class" 的 native 表分派(同 invoke_virtual)。
+    if matches!(vm.heap().get(objref), Some(Oop::Class(_))) {
+        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
+        let result = native::invoke(vm, "java/lang/Class", &method_name, &desc, Some(objref), &nargs);
+        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+    }
+
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
     let runtime_class = vm
         .heap()
@@ -501,6 +517,7 @@ pub(super) fn invoke_interface(
         Oop::String(_) => {
             return Err(VmError::BadConstant("invoke 目标为 String(String 方法顺延)"))
         }
+        Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
     };
 
     let registry = vm

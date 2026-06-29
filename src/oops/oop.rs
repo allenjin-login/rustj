@@ -3,6 +3,7 @@
 //! 4.1 实例对象;4.3 增一维数组(统一 [`ArrayOop`])。多维数组顺延。
 
 use super::array::ArrayOop;
+use super::class_oop::ClassOop;
 use super::instance::InstanceOop;
 use super::string::StringOop;
 
@@ -15,4 +16,6 @@ pub enum Oop {
     Array(ArrayOop),
     /// 字符串对象(4.8:字符串字面量的堆表示,见 [`StringOop`])。
     String(StringOop),
+    /// Class 镜像对象(4.10g:`Class.getPrimitiveClass` 等的返回值载体,见 [`ClassOop`])。
+    Class(ClassOop),
 }

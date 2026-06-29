@@ -17,6 +17,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::oops::{ClassOop, Oop};
 use crate::runtime::{Reference, Vm};
 
 use super::{throw_exception, Value, VmError};
@@ -36,12 +37,27 @@ pub(super) fn invoke(
     name: &str,
     desc: &str,
     this: Option<Reference>,
-    _args: &[Value],
+    args: &[Value],
 ) -> Result<Value, VmError> {
     match (class, name, desc) {
+        // Throwable.fillInStackTrace(I)Ljava/lang/Throwable; —— 每个 Throwable 构造器首调
+        // (捕获栈回溯)。rustj 暂无栈回溯捕获机制 → 空操作,返回 this(对应"无栈帧记录")。
+        // 保留 `this` 不变;HotSpot 此法返回 this 以便链式。
+        ("java/lang/Throwable", "fillInStackTrace", "(I)Ljava/lang/Throwable;") => {
+            match this {
+                Some(r) => Ok(Value::Reference(r)),
+                None => Err(throw_exception(vm, "java/lang/NullPointerException")),
+            }
+        }
+
         // JDK 各类私有 registerNatives()V:rustj 编译期表,native 恒已"注册" → 空操作。
         // 最高杠杆:解锁 System/Object 等真实 <clinit>(否则其 <clinit> 调它即 UnsatisfiedLinkError)。
         (_, "registerNatives", "()V") => Ok(Value::Void),
+
+        // jdk.internal.misc.VM.initialize()V —— VM.java:451 私有 native,VM.<clinit> 首调,
+        // 做 JDK 启动期一次性引导(保存属性 / 直接内存上限 / …)。rustj 无 launcher 传递的启动态,
+        // 此处恒空操作(等价"VM 已初始化,无保存属性"——后续 getSavedProperty 读空表得 null)。
+        ("jdk/internal/misc/VM", "initialize", "()V") => Ok(Value::Void),
 
         // Object.hashCode()I —— synchronizer.cpp get_next_hash mode 4(对象标识/地址)。
         // 句柄 id 即堆上唯一标识;null 收者(理论不可达,实例方法)兜底 0。
@@ -69,9 +85,43 @@ pub(super) fn invoke(
             Ok(Value::Long(nanos))
         }
 
+        // Class.getPrimitiveClass(Ljava/lang/String;)Ljava/lang/Class;
+        // —— jvm.cpp:770 JVM_FindPrimitiveClass:name2type → Universe::java_mirror。
+        // 原语名 → Class 镜像;非原语名 → ClassNotFoundException。
+        ("java/lang/Class", "getPrimitiveClass", "(Ljava/lang/String;)Ljava/lang/Class;") => {
+            let Value::Reference(r) = args.first().copied().unwrap_or(Value::Void) else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let text = match vm.heap().get(r) {
+                Some(Oop::String(s)) => s.text().to_string(),
+                _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+            };
+            if !is_primitive_name(&text) {
+                // 对应 jvm.cpp 的 THROW_MSG_NULL(ClassNotFoundException, utf)。
+                return Err(throw_exception(vm, "java/lang/ClassNotFoundException"));
+            }
+            let cls = Oop::Class(ClassOop::new(text));
+            Ok(Value::Reference(vm.heap_mut().alloc(cls)))
+        }
+
+        // Class.desiredAssertionStatus()Z —— javac 断言初始化(`!Foo.class.desiredAssertionStatus()`)
+        // 广见于 java.base 各 <clinit>。真 Class 类此法走 ClassLoader + desiredAssertionStatus0;
+        // rustj 无断言支持 → 恒 false(断言禁用,即 `$assertionsDisabled = true`)。Oop::Class 镜像
+        // 由 invoke 路径按 "java/lang/Class" 经本表分派(见 invoke_virtual/interface)。
+        ("java/lang/Class", "desiredAssertionStatus", "()Z") => Ok(Value::Int(0)),
+
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }
+}
+
+/// 原语关键字名(`"int"`/…/`"void"`)判定——`name2type` 的等价物
+/// (jvm.cpp:770 `JVM_FindPrimitiveClass` 的 `t != T_ILLEGAL && !is_reference_type(t)`)。
+fn is_primitive_name(name: &str) -> bool {
+    matches!(
+        name,
+        "int" | "long" | "byte" | "char" | "short" | "boolean" | "double" | "float" | "void"
+    )
 }
 
 #[cfg(test)]
@@ -125,6 +175,79 @@ mod tests {
             invoke(&mut vm, "java/lang/System", "nanoTime", "()J", None, &[]).unwrap(),
             Value::Long(_)
         ));
+    }
+
+    #[test]
+    fn get_primitive_class_returns_class_oop() {
+        // jvm.cpp:770 JVM_FindPrimitiveClass:"int" → Class 镜像。
+        let mut vm = crate::runtime::Vm::default();
+        let s = vm.heap_mut().alloc(crate::oops::Oop::String(
+            crate::oops::StringOop::new("int".into()),
+        ));
+        let r = invoke(
+            &mut vm,
+            "java/lang/Class",
+            "getPrimitiveClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            None,
+            &[Value::Reference(s)],
+        )
+        .unwrap();
+        let Value::Reference(cls) = r else {
+            panic!("期望 Class 引用,得 {r:?}");
+        };
+        let crate::oops::Oop::Class(c) = vm.heap().get(cls).unwrap() else {
+            panic!("期望 Oop::Class");
+        };
+        assert_eq!(c.name(), "int");
+    }
+
+    #[test]
+    fn get_primitive_class_non_primitive_throws_class_not_found() {
+        // 非原语名 → ClassNotFoundException(jvm.cpp 的 THROW_MSG_NULL)。
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        let s = vm.heap_mut().alloc(crate::oops::Oop::String(
+            crate::oops::StringOop::new("java/lang/Object".into()),
+        ));
+        let err = invoke(
+            &mut vm,
+            "java/lang/Class",
+            "getPrimitiveClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            None,
+            &[Value::Reference(s)],
+        )
+        .unwrap_err();
+        let crate::runtime::VmError::ThrownException(exc) = err else {
+            panic!("应抛 ThrownException,得 {err:?}");
+        };
+        let crate::oops::Oop::Instance(i) = vm.heap().get(exc).unwrap() else {
+            panic!("须为异常实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/ClassNotFoundException");
+    }
+
+    #[test]
+    fn get_primitive_class_missing_arg_throws_npe() {
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        let err = invoke(
+            &mut vm,
+            "java/lang/Class",
+            "getPrimitiveClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            None,
+            &[],
+        )
+        .unwrap_err();
+        let crate::runtime::VmError::ThrownException(exc) = err else {
+            panic!("应抛 ThrownException,得 {err:?}");
+        };
+        let crate::oops::Oop::Instance(i) = vm.heap().get(exc).unwrap() else {
+            panic!("须为异常实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/NullPointerException");
     }
 
     #[test]

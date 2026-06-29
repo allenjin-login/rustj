@@ -1129,9 +1129,21 @@ impl<'a> Interpreter<'a> {
                 let r = vm.intern_string(&text);
                 frame.operands.push_reference(r)?;
             }
+            ConstantPoolEntry::Class { name_index } => {
+                // 类字面量(`Foo.class`):ldc 取 CONSTANT_Class → 推 Class 镜像。
+                // 对应 HotSpot `ldc` 解析 Class 常量 → `java_lang_Class::as_Klass` 的镜像。
+                let name = match self.cp.get(*name_index)? {
+                    ConstantPoolEntry::Utf8(s) => s.clone(),
+                    _ => return Err(VmError::BadConstant("ldc Class 须指向 Utf8 名")),
+                };
+                let r = vm
+                    .heap_mut()
+                    .alloc(crate::oops::Oop::Class(crate::oops::ClassOop::new(name)));
+                frame.operands.push_reference(r)?;
+            }
             _ => {
                 return Err(VmError::BadConstant(
-                    "ldc/ldc_w 期望 int/float/string(Class/MethodType 顺延)",
+                    "ldc/ldc_w 期望 int/float/string/Class(MethodType 顺延)",
                 ))
             }
         }

@@ -178,7 +178,9 @@ pub(super) fn get_field(
         .ok_or(VmError::BadConstant("getfield 引用悬空"))?
     {
         Oop::Instance(i) => i.field(ordinal),
-        Oop::Array(_) | Oop::String(_) => return Err(VmError::BadConstant("getfield 目标为数组/String")),
+        Oop::Array(_) | Oop::String(_) | Oop::Class(_) => {
+            return Err(VmError::BadConstant("getfield 目标为数组/String/Class"))
+        }
     };
     push_field_value(frame, &ft, slot)?;
     Ok(())
@@ -216,7 +218,9 @@ pub(super) fn put_field(
         .ok_or(VmError::BadConstant("putfield 引用悬空"))?
     {
         Oop::Instance(i) => i.set_field(ordinal, value),
-        Oop::Array(_) | Oop::String(_) => return Err(VmError::BadConstant("putfield 目标为数组/String")),
+        Oop::Array(_) | Oop::String(_) | Oop::Class(_) => {
+            return Err(VmError::BadConstant("putfield 目标为数组/String/Class"))
+        }
     }
     Ok(())
 }

@@ -34,6 +34,8 @@ const BOOTSTRAP_HIERARCHY: &[(&str, Option<&str>)] = &[
     ("java/lang/StackOverflowError", Some("java/lang/Error")),
     ("java/lang/Exception", Some("java/lang/Throwable")),
     ("java/lang/RuntimeException", Some("java/lang/Exception")),
+    ("java/lang/ReflectiveOperationException", Some("java/lang/Exception")),
+    ("java/lang/ClassNotFoundException", Some("java/lang/ReflectiveOperationException")),
     ("java/lang/IndexOutOfBoundsException", Some("java/lang/RuntimeException")),
     ("java/lang/ArrayIndexOutOfBoundsException", Some("java/lang/IndexOutOfBoundsException")),
     ("java/lang/StringIndexOutOfBoundsException", Some("java/lang/IndexOutOfBoundsException")),

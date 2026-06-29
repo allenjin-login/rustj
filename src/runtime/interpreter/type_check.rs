@@ -18,6 +18,7 @@ fn object_type(vm: &Vm<'_>, objref: Reference) -> Result<(bool, Option<String>),
         Oop::Instance(i) => (false, Some(i.class_name().to_string())),
         Oop::Array(_) => (true, None),
         Oop::String(_) => (false, Some("java/lang/String".to_string())),
+        Oop::Class(_) => (false, Some("java/lang/Class".to_string())),
     })
 }
 

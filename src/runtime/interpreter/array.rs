@@ -146,7 +146,9 @@ pub(super) fn array_length(frame: &mut Frame, vm: &mut Vm<'_>) -> Result<(), VmE
         .ok_or(VmError::BadConstant("arraylength 引用悬空"))?
     {
         Oop::Array(a) => a.length(),
-        Oop::Instance(_) | Oop::String(_) => return Err(VmError::BadConstant("arraylength 目标非数组")),
+        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+            return Err(VmError::BadConstant("arraylength 目标非数组"))
+        }
     };
     frame.operands.push_int(len as i32)?;
     Ok(())
@@ -171,7 +173,9 @@ pub(super) fn array_load(
         .ok_or(VmError::BadConstant("aload 引用悬空"))?
     {
         Oop::Array(a) => a.length(),
-        Oop::Instance(_) | Oop::String(_) => return Err(VmError::BadConstant("aload 目标非数组")),
+        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+            return Err(VmError::BadConstant("aload 目标非数组"))
+        }
     };
     if index < 0 || (index as usize) >= length {
         return Err(throw_exception(
@@ -185,7 +189,9 @@ pub(super) fn array_load(
         .ok_or(VmError::BadConstant("aload 引用悬空"))?
     {
         Oop::Array(a) => a.element(index as usize),
-        Oop::Instance(_) | Oop::String(_) => return Err(VmError::BadConstant("aload 目标非数组")),
+        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+            return Err(VmError::BadConstant("aload 目标非数组"))
+        }
     };
     push_array_value(frame, kind, slot)
 }
@@ -273,7 +279,9 @@ pub(super) fn array_store(
         .ok_or(VmError::BadConstant("astore 引用悬空"))?
     {
         Oop::Array(a) => a.length(),
-        Oop::Instance(_) | Oop::String(_) => return Err(VmError::BadConstant("astore 目标非数组")),
+        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+            return Err(VmError::BadConstant("astore 目标非数组"))
+        }
     };
     if idx >= length {
         return Err(throw_exception(
@@ -287,7 +295,9 @@ pub(super) fn array_store(
         .ok_or(VmError::BadConstant("astore 引用悬空"))?
     {
         Oop::Array(a) => a.set_element(idx, value),
-        Oop::Instance(_) | Oop::String(_) => return Err(VmError::BadConstant("astore 目标非数组")),
+        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+            return Err(VmError::BadConstant("astore 目标非数组"))
+        }
     }
     Ok(())
 }

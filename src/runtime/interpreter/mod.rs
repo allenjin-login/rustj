@@ -66,6 +66,23 @@ pub(super) fn throw_exception(vm: &mut Vm<'_>, class_name: &str) -> VmError {
     VmError::ThrownException(reference)
 }
 
+/// 同 [`throw_exception`],但带上 detailMessage(对应 `new X(String)` 设 `detailMessage`,
+/// 如 `ArithmeticException("/ by zero")`)。HotSpot 各抛出点经 `THROW_MSG(vm Symbols::…, msg)`
+/// 构造消息异常;rustj 在 `record_message` 镜像之。
+pub(super) fn throw_exception_with_message(
+    vm: &mut Vm<'_>,
+    class_name: &str,
+    message: &str,
+) -> VmError {
+    let err = throw_exception(vm, class_name);
+    if let VmError::ThrownException(r) = err {
+        vm.record_message(r, message);
+        VmError::ThrownException(r)
+    } else {
+        err
+    }
+}
+
 /// 运行时错误——二分:**Java 异常**(可捕获)vs **内部故障**(不可捕获)。
 ///
 /// - [`VmError::ThrownException`]:唯一的 Java 异常通道——用户 `athrow` 与 JVM 自动抛出
@@ -427,7 +444,11 @@ impl<'a> Interpreter<'a> {
                 let r = frame.operands.pop_int()?;
                 let l = frame.operands.pop_int()?;
                 if r == 0 {
-                    return Err(throw_exception(vm, "java/lang/ArithmeticException"));
+                    return Err(throw_exception_with_message(
+                        vm,
+                        "java/lang/ArithmeticException",
+                        "/ by zero",
+                    ));
                 }
                 frame.operands.push_int(l.wrapping_div(r))?;
                 pc += 1;
@@ -436,7 +457,11 @@ impl<'a> Interpreter<'a> {
                 let r = frame.operands.pop_int()?;
                 let l = frame.operands.pop_int()?;
                 if r == 0 {
-                    return Err(throw_exception(vm, "java/lang/ArithmeticException"));
+                    return Err(throw_exception_with_message(
+                        vm,
+                        "java/lang/ArithmeticException",
+                        "/ by zero",
+                    ));
                 }
                 frame.operands.push_int(l.wrapping_rem(r))?;
                 pc += 1;
@@ -577,7 +602,11 @@ impl<'a> Interpreter<'a> {
                 let r = frame.operands.pop_long()?;
                 let l = frame.operands.pop_long()?;
                 if r == 0 {
-                    return Err(throw_exception(vm, "java/lang/ArithmeticException"));
+                    return Err(throw_exception_with_message(
+                        vm,
+                        "java/lang/ArithmeticException",
+                        "/ by zero",
+                    ));
                 }
                 frame.operands.push_long(l.wrapping_div(r))?;
                 pc += 1;
@@ -586,7 +615,11 @@ impl<'a> Interpreter<'a> {
                 let r = frame.operands.pop_long()?;
                 let l = frame.operands.pop_long()?;
                 if r == 0 {
-                    return Err(throw_exception(vm, "java/lang/ArithmeticException"));
+                    return Err(throw_exception_with_message(
+                        vm,
+                        "java/lang/ArithmeticException",
+                        "/ by zero",
+                    ));
                 }
                 frame.operands.push_long(l.wrapping_rem(r))?;
                 pc += 1;
@@ -1643,6 +1676,27 @@ mod tests {
             interp.interpret_with(&mut frame, &mut vm),
             &vm,
             "java/lang/ArithmeticException",
+        );
+    }
+
+    #[test]
+    fn arithmetic_exception_carries_by_zero_message() {
+        // idiv 除零 → ArithmeticException("/ by zero"):format_trace 头须渲染 ": / by zero"。
+        // 对照 HotSpot `THROW_MSG(vm, …, "/ by zero")`(bytecodeInterpreter idiv/irem/ldiv/lrem)。
+        let code = [Opcode::Iconst5 as u8, Opcode::Iconst0 as u8, Opcode::Idiv as u8, Opcode::Ireturn as u8];
+        let cp = empty_cp();
+        let interp = Interpreter::new(&code, &cp);
+        let mut frame = Frame::new(0, 2);
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        let err = interp.interpret_with(&mut frame, &mut vm).unwrap_err();
+        let VmError::ThrownException(r) = err else {
+            panic!("须 ThrownException,得 {err:?}");
+        };
+        let trace = vm.format_trace(r);
+        assert!(
+            trace.contains("java/lang/ArithmeticException: / by zero"),
+            "detailMessage 须渲染,得:\n{trace}"
         );
     }
 

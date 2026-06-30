@@ -29,6 +29,21 @@ pub struct CallFrame {
     pub method: String,
 }
 
+/// 异常的元数据(`Throwable` 三要素的 rustj 侧镜像):捕获帧 / cause / detailMessage。
+///
+/// 键 = 异常对象句柄(`Reference` 单调不复用)。`format_trace` 据此渲染
+/// `Class: message\n\tat …\nCaused by: …`。真 `Throwable.getMessage/getCause/getStackTrace`
+/// 字段回填是更大的独立层;当前先以此并行结构服务诊断输出。
+#[derive(Default, Clone)]
+struct ExceptionMeta {
+    /// 抛出点快照的调用链(`Throwable.fillInStackTrace`)。空 = 未捕获。
+    frames: Vec<CallFrame>,
+    /// 包裹 cause(`Throwable.cause` / `new X(cause)`)。
+    cause: Option<Reference>,
+    /// detailMessage(`Throwable.detailMessage`,如 "/ by zero")。
+    message: Option<String>,
+}
+
 /// 执行上下文:拥有对象堆,借用类注册表,跟踪帧嵌套深度。
 pub struct Vm<'a> {
     heap: Heap,
@@ -41,12 +56,8 @@ pub struct Vm<'a> {
     pub(crate) stack_limit: u32,
     /// 当前活动 Java 调用栈(逐帧 push/pop),供栈轨迹捕获。
     call_stack: Vec<CallFrame>,
-    /// 抛出时快照的调用链,键 = 异常对象句柄(`Reference` 单调不复用)。
-    traces: HashMap<Reference, Vec<CallFrame>>,
-    /// 异常的包裹 cause 链:wrapper → 被包 cause。对应 `Throwable.cause` /
-    /// `new ExceptionInInitializerError(cause)`;与 `traces` 并行,`format_trace` 追链渲染
-    /// "Caused by:"(EIIE 头 + cause 自身轨迹含 clinit 内部位置)。
-    causes: HashMap<Reference, Reference>,
+    /// 异常 → 元数据(帧 / cause / detailMessage),键 = 异常对象句柄。
+    exception_meta: HashMap<Reference, ExceptionMeta>,
 }
 
 impl<'a> Vm<'a> {
@@ -59,8 +70,7 @@ impl<'a> Vm<'a> {
             frame_depth: 0,
             stack_limit: DEFAULT_STACK_LIMIT,
             call_stack: Vec::new(),
-            traces: HashMap::new(),
-            causes: HashMap::new(),
+            exception_meta: HashMap::new(),
         }
     }
 
@@ -119,24 +129,39 @@ impl<'a> Vm<'a> {
     /// 等价 HotSpot `Throwable.fillInStackTrace` 捕获语义——stub 异常不经真 `<init>`,
     /// 故 `throw_exception` 直接调之;`fillInStackTrace` native 亦调之(为真 Throwable 预留)。
     pub(crate) fn record_trace(&mut self, exc: Reference) {
-        self.traces.insert(exc, self.call_stack.clone());
+        self.exception_meta
+            .entry(exc)
+            .or_default()
+            .frames = self.call_stack.clone();
     }
 
     /// 登记包裹异常的 cause(对应 `new ExceptionInInitializerError(cause)` 设 `Throwable.cause`)。
     /// `format_trace` 据此追链渲染 "Caused by:"——被包异常**自身**的轨迹携带真正抛出点
     /// (如 clinit 内部位置),从而顶层不再丢失根因。
     pub(crate) fn record_cause(&mut self, wrapper: Reference, cause: Reference) {
-        self.causes.insert(wrapper, cause);
+        self.exception_meta.entry(wrapper).or_default().cause = Some(cause);
     }
 
-    /// 格式化异常的栈轨迹文本:`ExcClass\n\t at Class.method\n …`,**最内(抛出)帧在前**
-    /// (Java 惯例)。随后沿 [`causes`](Self::record_cause) 追链,每跳输出
-    /// `\nCaused by: <cause 类>` + cause 自身帧。深度上限 64(防环/失控链)。无快照且无
-    /// cause → 空串(保持旧契约)。供测试/诊断;顶层未捕获时由 `interpret_with` 自动打印。
+    /// 登记异常的 detailMessage(对应 `Throwable.detailMessage`,如 "/ by zero")。
+    /// `format_trace` 据此在头类后渲染 ": <message>"。供 JVM 自动抛出点带上诊断消息。
+    pub(crate) fn record_message(&mut self, exc: Reference, message: impl Into<String>) {
+        self.exception_meta
+            .entry(exc)
+            .or_default()
+            .message = Some(message.into());
+    }
+
+    /// 格式化异常的栈轨迹文本:`ExcClass[: message]\n\t at Class.method\n …`,
+    /// **最内(抛出)帧在前**(Java 惯例)。随后沿 cause 链每跳输出
+    /// `\nCaused by: <cause 类>[: message]` + cause 自身帧。深度上限 64(防环/失控链)。
+    /// 无快照且无 cause/message → 空串(旧契约)。供测试/诊断;顶层未捕获时自动打印。
     pub fn format_trace(&self, exc: Reference) -> String {
         use crate::oops::Oop;
-        // 头异常既无帧又无 cause → 无信息,返空串(旧契约)。
-        if !self.traces.contains_key(&exc) && !self.causes.contains_key(&exc) {
+        let Some(meta) = self.exception_meta.get(&exc) else {
+            return String::new();
+        };
+        // 头异常无帧、无 cause、无 message → 无信息,返空串(旧契约)。
+        if meta.frames.is_empty() && meta.cause.is_none() && meta.message.is_none() {
             return String::new();
         }
         let mut out = String::new();
@@ -159,16 +184,25 @@ impl<'a> Vm<'a> {
                 out.push_str("\nCaused by: ");
                 out.push_str(&class);
             }
+            if let Some(m) = self.exception_meta.get(&e)
+                && let Some(msg) = &m.message
+            {
+                out.push_str(": ");
+                out.push_str(msg);
+            }
             // call_stack 入栈序 = 外层→内层(抛出帧在最末);Java 惯例最内帧首 → 逆序打印。
-            if let Some(frames) = self.traces.get(&e) {
-                for f in frames.iter().rev() {
+            if let Some(m) = self.exception_meta.get(&e) {
+                for f in m.frames.iter().rev() {
                     out.push_str("\n\tat ");
                     out.push_str(&f.class);
                     out.push('.');
                     out.push_str(&f.method);
                 }
             }
-            cur = self.causes.get(&e).copied();
+            cur = self
+                .exception_meta
+                .get(&e)
+                .and_then(|m| m.cause);
         }
         out
     }
@@ -183,8 +217,7 @@ impl Default for Vm<'_> {
             frame_depth: 0,
             stack_limit: DEFAULT_STACK_LIMIT,
             call_stack: Vec::new(),
-            traces: HashMap::new(),
-            causes: HashMap::new(),
+            exception_meta: HashMap::new(),
         }
     }
 }

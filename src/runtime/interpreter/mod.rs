@@ -6,6 +6,7 @@
 //! 3.1:仅 int 核心子集;清单外指令返回 [`VmError::UnsupportedOpcode`]。
 
 mod array;
+mod arraycopy;
 mod clinit;
 mod exception;
 mod field;

@@ -85,6 +85,25 @@ pub(super) fn invoke(
             Ok(Value::Int(id))
         }
 
+        // System.arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V —— jvm.cpp:293-305
+        // JVM_ArrayCopy → typeArrayKlass/objArrayKlass::copy_array。检查序(null→NPE、
+        // 非数组/类型不符→ASE、负值/越界→AIOOBE)、引用 checkcast、重叠 memmove 见
+        // `arraycopy::system_arraycopy`。高价值 native:解锁 StringBuilder/String 字节拷贝。
+        ("java/lang/System", "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V") => {
+            let (src, src_pos, dst, dst_pos, length) =
+                match (args.first(), args.get(1), args.get(2), args.get(3), args.get(4)) {
+                    (
+                        Some(Value::Reference(s)),
+                        Some(Value::Int(sp)),
+                        Some(Value::Reference(d)),
+                        Some(Value::Int(dp)),
+                        Some(Value::Int(l)),
+                    ) => (*s, *sp, *d, *dp, *l),
+                    _ => return Err(VmError::BadConstant("arraycopy 实参缺失/类型不符")),
+                };
+            super::arraycopy::system_arraycopy(vm, src, src_pos, dst, dst_pos, length)
+        }
+
         // System.currentTimeMillis()J —— jvm.cpp JVM_CurrentTimeMillis:墙钟毫秒(自 Unix 纪元)。
         ("java/lang/System", "currentTimeMillis", "()J") => {
             let millis = SystemTime::now()

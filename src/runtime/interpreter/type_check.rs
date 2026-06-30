@@ -40,7 +40,10 @@ fn class_of_obj_desc(component: &str) -> Option<&str> {
 /// - 同描述符 → 真;
 /// - `[Ljava/lang/Object;` 左值的组件为引用/数组时为真(基本类型数组非 `Object[]`);
 /// - 同维数组递归剥维;引用组件 `[Lsub;` vs `[Lsup;` 走类层 `is_instance`。
-fn array_instanceof(sub: &str, target: &str, reg: &crate::oops::ClassRegistry) -> bool {
+///
+/// `pub(super)` 供 `arraycopy` 复用:「组件 A 可赋给组件 B」⟺「`[A` instanceof `[B`」
+/// (见 `arraycopy::component_assignable`)。
+pub(super) fn array_instanceof(sub: &str, target: &str, reg: &crate::oops::ClassRegistry) -> bool {
     match target {
         "java/lang/Object" | "java/lang/Cloneable" | "java/io/Serializable" => return true,
         _ => {}

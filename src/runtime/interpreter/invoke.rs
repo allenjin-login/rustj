@@ -147,6 +147,14 @@ fn utf8(cp: &ConstantPool, index: u16) -> Result<String, VmError> {
     }
 }
 
+/// 取 `Utf8` 条目的 `&str`(零分配,借自常量池)——供栈轨迹 `with_identity`。
+fn cp_utf8(cp: &ConstantPool, index: u16) -> Result<&str, VmError> {
+    match cp.get(index)? {
+        ConstantPoolEntry::Utf8(s) => Ok(s.as_str()),
+        _ => Err(VmError::BadConstant("期望 Utf8 条目")),
+    }
+}
+
 /// 在类中按名 + 描述符查找方法;未命中返回错误。
 fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> Result<&'a MethodInfo, VmError> {
     cf.methods
@@ -303,8 +311,12 @@ pub(super) fn invoke_static(
     }
 
     // 递归:用目标方法的字节码与常量池 + 异常表构造新解释器,沿用同一 Vm(堆 + 注册表)。
-    let callee_interp =
-        Interpreter::new(&code.code, &target_lc.cf.constant_pool).with_exception_table(&code.exception_table);
+    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table)
+        .with_identity(
+            target_lc.name(),
+            cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
+        );
     let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
     // 回填返回值 / 捕获被调用者抛出的异常(单点)。
@@ -383,8 +395,12 @@ pub(super) fn invoke_special(
             .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
     }
 
-    let callee_interp =
-        Interpreter::new(&code.code, &target_lc.cf.constant_pool).with_exception_table(&code.exception_table);
+    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table)
+        .with_identity(
+            target_lc.name(),
+            cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
+        );
     let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
     finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
@@ -470,8 +486,12 @@ pub(super) fn invoke_virtual(
             .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
     }
 
-    let callee_interp =
-        Interpreter::new(&code.code, &target_lc.cf.constant_pool).with_exception_table(&code.exception_table);
+    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table)
+        .with_identity(
+            target_lc.name(),
+            cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
+        );
     let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
     finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
@@ -554,8 +574,12 @@ pub(super) fn invoke_interface(
             .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
     }
 
-    let callee_interp =
-        Interpreter::new(&code.code, &target_lc.cf.constant_pool).with_exception_table(&code.exception_table);
+    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table)
+        .with_identity(
+            target_lc.name(),
+            cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
+        );
     let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
 
     finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)

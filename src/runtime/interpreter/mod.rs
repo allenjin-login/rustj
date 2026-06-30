@@ -60,6 +60,8 @@ pub(super) fn throw_exception(vm: &mut Vm<'_>, class_name: &str) -> VmError {
         .unwrap_or_else(|| panic!("{class_name} 应作为引导桩已加载(内部不变量)"));
     let oop = Oop::Instance(reg.new_instance(lc));
     let reference = vm.heap_mut().alloc(oop);
+    // 捕获抛出点调用链(此刻 call_stack 满),供 format_trace / 顶层自动打印。
+    vm.record_trace(reference);
     VmError::ThrownException(reference)
 }
 
@@ -123,6 +125,15 @@ pub struct Interpreter<'a> {
     code: &'a [u8],
     cp: &'a ConstantPool,
     exception_table: &'a [ExceptionTableEntry],
+    /// 当前方法的身份(声明类内部名 + 方法名),供栈轨迹 `push_frame`。`None` = 匿名
+    /// (纯算术单测不经 invoke,无身份亦无妨)。零分配:借自注册表/常量池(`'a`)。
+    identity: Option<MethodIdentity<'a>>,
+}
+
+/// 方法身份切片(栈轨迹用):内部类名 + 方法名,均借自注册表寿命 `'a`。
+struct MethodIdentity<'a> {
+    class: &'a str,
+    name: &'a str,
 }
 
 impl<'a> Interpreter<'a> {
@@ -131,6 +142,7 @@ impl<'a> Interpreter<'a> {
             code,
             cp,
             exception_table: &[],
+            identity: None,
         }
     }
 
@@ -138,6 +150,13 @@ impl<'a> Interpreter<'a> {
     /// 用之;`new(code, cp)` 默认空表。流式:`Interpreter::new(..).with_exception_table(..)`。
     pub fn with_exception_table(mut self, exception_table: &'a [ExceptionTableEntry]) -> Self {
         self.exception_table = exception_table;
+        self
+    }
+
+    /// 附上方法身份(声明类内部名 + 方法名),供栈轨迹记录。流式。
+    /// `class` 借自 `LoadedClass::name()`、`name` 借自常量池 Utf8(`'a`),零分配。
+    pub fn with_identity(mut self, class: &'a str, name: &'a str) -> Self {
+        self.identity = Some(MethodIdentity { class, name });
         self
     }
 
@@ -164,7 +183,38 @@ impl<'a> Interpreter<'a> {
     }
 
     /// 带 [`Vm`](对象堆 + 类注册表)执行至 `*return`;对象/字段/`invokestatic` 经此路径。
+    ///
+    /// 包裹 [`Self::run`]:入/出口 push/pop 一个 Java 栈帧(若有身份),供栈轨迹捕获;
+    /// 顶层(`frame_depth == 0`)未捕获的 Java 异常自动 `eprintln` 栈轨迹,方便调试。
     pub fn interpret_with(&self, frame: &mut Frame, vm: &mut Vm<'_>) -> Result<Value, VmError> {
+        let pushed = match &self.identity {
+            Some(id) => {
+                vm.push_frame(id.class, id.name);
+                true
+            }
+            None => false,
+        };
+        let result = self.run(frame, vm);
+        if pushed {
+            vm.pop_frame();
+        }
+        // 顶层未捕获(frame_depth==0;被调用者帧经 run_with_depth 故 depth≥1)的 Java 异常
+        // → 自动打印栈轨迹,方便调试。仅 eprintln,不改返回值/不抛(同帧异常表已捕获的不会到此)。
+        // 栈轨迹于抛出点捕获(深层被调用者有身份),与顶层帧是否有身份无关。
+        // cargo 捕获测试输出、仅失败时回放 → 通过的测试零噪音。
+        if vm.frame_depth == 0
+            && let Err(VmError::ThrownException(r)) = &result
+        {
+            let trace = vm.format_trace(*r);
+            if !trace.is_empty() {
+                eprintln!("{trace}");
+            }
+        }
+        result
+    }
+
+    /// 字节码主循环(由 [`Self::interpret_with`] 包裹,勿直接调——绕过栈帧 push/pop)。
+    fn run(&self, frame: &mut Frame, vm: &mut Vm<'_>) -> Result<Value, VmError> {
         let mut pc: usize = 0;
         loop {
             if pc >= self.code.len() {

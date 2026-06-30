@@ -39,13 +39,19 @@ pub(super) fn invoke(
     this: Option<Reference>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    match (class, name, desc) {
+    // 推一个 native 栈帧:未登记 native 抛 UnsatisfiedLinkError 时,栈轨迹含此帧
+    // (直接答"缺哪个 native")。出口配对 pop(覆盖所有 Ok/Err 臂)。
+    vm.push_frame(class, name);
+    let result = match (class, name, desc) {
         // Throwable.fillInStackTrace(I)Ljava/lang/Throwable; —— 每个 Throwable 构造器首调
-        // (捕获栈回溯)。rustj 暂无栈回溯捕获机制 → 空操作,返回 this(对应"无栈帧记录")。
-        // 保留 `this` 不变;HotSpot 此法返回 this 以便链式。
+        // (捕获栈回溯)。rustj 在此快照当前调用链(record_trace),对应 HotSpot 的栈回溯捕获;
+        // 返回 this 以便链式。stub 异常不经真 <init>,其轨迹由 throw_exception 直接捕获。
         ("java/lang/Throwable", "fillInStackTrace", "(I)Ljava/lang/Throwable;") => {
             match this {
-                Some(r) => Ok(Value::Reference(r)),
+                Some(r) => {
+                    vm.record_trace(r);
+                    Ok(Value::Reference(r))
+                }
                 None => Err(throw_exception(vm, "java/lang/NullPointerException")),
             }
         }
@@ -165,7 +171,9 @@ pub(super) fn invoke(
 
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
-    }
+    };
+    vm.pop_frame();
+    result
 }
 
 /// 原语关键字名(`"int"`/…/`"void"`)判定——`name2type` 的等价物

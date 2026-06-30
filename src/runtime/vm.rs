@@ -7,13 +7,27 @@
 //! 供确不抛异常的纯数值测试。4.2b:帧深度计数 + 可配置上限([`Vm::with_stack_limit`]);
 //! 超限时解释器抛 `java/lang/StackOverflowError`(统一为 `ThrownException`)。
 
+use std::collections::HashMap;
+
 use crate::oops::ClassRegistry;
 use crate::runtime::heap::Heap;
 use crate::runtime::string_pool::StringPool;
+use crate::runtime::Reference;
 
 /// 默认帧深度上限。高于 ackermann(3,3) 的递归深度(~120),正常小测试不会误触;
 /// 可经 [`Vm::with_stack_limit`] 调整(SOE 测试用小值快速触发)。
 pub const DEFAULT_STACK_LIMIT: u32 = 512;
+
+/// 一个 Java 栈帧的身份切片(供栈轨迹):声明类内部名 + 方法名。
+///
+/// 不含描述符/行号(行号需 `LineNumberTable` 解码 + 抛出点 pc,顺延)。
+/// 拥有 `String`:`push_frame` 来源生命周期不一(字节码帧借自常量池 / native 帧借自
+/// 调用方局部串),统一 owned 入栈最简。
+#[derive(Debug, Clone)]
+pub struct CallFrame {
+    pub class: String,
+    pub method: String,
+}
 
 /// 执行上下文:拥有对象堆,借用类注册表,跟踪帧嵌套深度。
 pub struct Vm<'a> {
@@ -25,6 +39,10 @@ pub struct Vm<'a> {
     pub(crate) frame_depth: u32,
     /// 帧深度上限;`frame_depth >= stack_limit` 时再调用 → 抛 `StackOverflowError`。
     pub(crate) stack_limit: u32,
+    /// 当前活动 Java 调用栈(逐帧 push/pop),供栈轨迹捕获。
+    call_stack: Vec<CallFrame>,
+    /// 抛出时快照的调用链,键 = 异常对象句柄(`Reference` 单调不复用)。
+    traces: HashMap<Reference, Vec<CallFrame>>,
 }
 
 impl<'a> Vm<'a> {
@@ -36,6 +54,8 @@ impl<'a> Vm<'a> {
             string_pool: StringPool::new(),
             frame_depth: 0,
             stack_limit: DEFAULT_STACK_LIMIT,
+            call_stack: Vec::new(),
+            traces: HashMap::new(),
         }
     }
 
@@ -73,6 +93,51 @@ impl<'a> Vm<'a> {
     pub fn registry(&self) -> Option<&'a ClassRegistry> {
         self.registry
     }
+
+    // ---- 栈轨迹捕获(4.10j+) ----
+
+    /// 入一个 Java 栈帧(类内部名 + 方法名)。`interpret_with` 入口与 `native::invoke`
+    /// 入口各推一帧。克隆入 owned [`CallFrame`](各来源生命周期不一)。
+    pub(crate) fn push_frame(&mut self, class: &str, method: &str) {
+        self.call_stack.push(CallFrame {
+            class: class.to_string(),
+            method: method.to_string(),
+        });
+    }
+
+    /// 退一个 Java 栈帧(与 `push_frame` 配对;`interpret_with`/`native::invoke` 出口调)。
+    pub(crate) fn pop_frame(&mut self) {
+        self.call_stack.pop();
+    }
+
+    /// 在抛出点快照当前调用链,绑定到异常句柄(此刻 `call_stack` 满)。
+    /// 等价 HotSpot `Throwable.fillInStackTrace` 捕获语义——stub 异常不经真 `<init>`,
+    /// 故 `throw_exception` 直接调之;`fillInStackTrace` native 亦调之(为真 Throwable 预留)。
+    pub(crate) fn record_trace(&mut self, exc: Reference) {
+        self.traces.insert(exc, self.call_stack.clone());
+    }
+
+    /// 格式化异常的栈轨迹文本:`ExcClass\n\t at Class.method\n …`,**最内(抛出)帧在前**
+    /// (Java 惯例)。无快照 → 空串。供测试/诊断;顶层未捕获时由 `interpret_with` 自动打印。
+    pub fn format_trace(&self, exc: Reference) -> String {
+        use crate::oops::Oop;
+        let Some(frames) = self.traces.get(&exc) else {
+            return String::new();
+        };
+        let class = match self.heap.get(exc) {
+            Some(Oop::Instance(i)) => i.class_name().to_string(),
+            _ => "<unknown>".to_string(),
+        };
+        let mut out = String::from(&class);
+        // call_stack 入栈序 = 外层→内层(抛出帧在最末);Java 惯例最内帧首 → 逆序打印。
+        for f in frames.iter().rev() {
+            out.push_str("\n\tat ");
+            out.push_str(&f.class);
+            out.push('.');
+            out.push_str(&f.method);
+        }
+        out
+    }
 }
 
 impl Default for Vm<'_> {
@@ -83,6 +148,8 @@ impl Default for Vm<'_> {
             string_pool: StringPool::new(),
             frame_depth: 0,
             stack_limit: DEFAULT_STACK_LIMIT,
+            call_stack: Vec::new(),
+            traces: HashMap::new(),
         }
     }
 }

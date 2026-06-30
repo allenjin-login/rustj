@@ -330,6 +330,9 @@ pub(super) fn invoke_special(
     for ft in md.parameters.iter().rev() {
         args.push(pop_arg(frame, ft)?);
     }
+    // 逆序弹出得 argN..arg0,翻回正序 arg0..argN 后再写局部变量(与 `invoke_static` 一致);
+    // 下游 native 分派的 `nargs` 亦取此正序声明序。
+    args.reverse();
     let objref = frame.operands.pop_reference()?;
 
     let registry = vm
@@ -406,6 +409,9 @@ pub(super) fn invoke_virtual(
     for ft in md.parameters.iter().rev() {
         args.push(pop_arg(frame, ft)?);
     }
+    // 逆序弹出得 argN..arg0,翻回正序 arg0..argN 后再写局部变量(与 `invoke_static` 一致);
+    // 下游 native 分派的 `nargs` 亦取此正序声明序。
+    args.reverse();
     let objref = frame.operands.pop_reference()?;
     if objref.is_null() {
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
@@ -489,6 +495,9 @@ pub(super) fn invoke_interface(
     for ft in md.parameters.iter().rev() {
         args.push(pop_arg(frame, ft)?);
     }
+    // 逆序弹出得 argN..arg0,翻回正序 arg0..argN 后再写局部变量(与 `invoke_static` 一致);
+    // 下游 native 分派的 `nargs` 亦取此正序声明序。
+    args.reverse();
     let objref = frame.operands.pop_reference()?;
     if objref.is_null() {
         return Err(throw_exception(vm, "java/lang/NullPointerException"));

@@ -8,9 +8,18 @@
 //! `docs/superpowers/specs/2026-06-30-system-arraycopy-design.md`。
 
 use super::type_check::array_instanceof;
-use super::{throw_exception, Value, VmError};
+use super::{throw_exception, throw_exception_with_message, Value, VmError};
 use crate::oops::Oop;
 use crate::runtime::{Reference, Slot, Vm};
+
+/// 引用异数组拷贝的逐元素 checkcast 上下文:目标组件 + 失败时的 ASE 消息。
+/// 消息镜像 HotSpot `throw_array_store_exception`(objArrayKlass.cpp:187-203):
+/// bound(dst 组件)非 stype(src 组件)子类型 → "type mismatch: can not copy …[] into …[]";
+/// 否则(逐元素个别不可赋)→ "element type mismatch: can not cast one of the elements of …[]"。
+struct Checkcast<'a> {
+    dst_comp: &'a str,
+    msg: String,
+}
 
 /// `java/lang/System.arraycopy(Object,I,Object,I,I)V`。
 ///
@@ -28,12 +37,33 @@ pub(super) fn system_arraycopy(
     if src.is_null() || dst.is_null() {
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
-    // 2. 非数组 → ASE(array_meta 仅克隆描述符,不持借用 → 释放后再 throw_exception 取 &mut vm)。
-    let Some((src_desc, src_len)) = array_meta(vm, src) else {
-        return Err(throw_exception(vm, "java/lang/ArrayStoreException"));
+    // 2. 非数组 → ASE(typeArrayKlass/objArrayKlass:255 "destination type … is not an array")。
+    //    array_meta 仅克隆描述符,不持借用 → 释放后再 throw 取 &mut vm。
+    let (src_desc, src_len) = match array_meta(vm, src) {
+        Some(m) => m,
+        None => {
+            return Err(throw_exception_with_message(
+                vm,
+                "java/lang/ArrayStoreException",
+                &format!(
+                    "arraycopy: source type {} is not an array",
+                    oop_external_name(vm, src)
+                ),
+            ));
+        }
     };
-    let Some((dst_desc, dst_len)) = array_meta(vm, dst) else {
-        return Err(throw_exception(vm, "java/lang/ArrayStoreException"));
+    let (dst_desc, dst_len) = match array_meta(vm, dst) {
+        Some(m) => m,
+        None => {
+            return Err(throw_exception_with_message(
+                vm,
+                "java/lang/ArrayStoreException",
+                &format!(
+                    "arraycopy: destination type {} is not an array",
+                    oop_external_name(vm, dst)
+                ),
+            ));
+        }
     };
     let src_comp = component_of(&src_desc);
     let dst_comp = component_of(&dst_desc);
@@ -41,29 +71,84 @@ pub(super) fn system_arraycopy(
     let dst_prim = is_primitive_component(dst_comp);
     // 3. 类型相容(typeArrayKlass:112/123、objArrayKlass:248):先于越界。
     if src_prim {
-        // 基本 src:dst 须同为该基本类型(非数组已在 2 拦;此处 dst 是基本但不同型 → ASE)。
-        if !dst_prim || dst_comp != src_comp {
-            return Err(throw_exception(vm, "java/lang/ArrayStoreException"));
+        if !dst_prim {
+            // 基本 src → 引用数组 dst(typeArrayKlass:116 "into object array[]")。
+            return Err(throw_exception_with_message(
+                vm,
+                "java/lang/ArrayStoreException",
+                &format!(
+                    "arraycopy: type mismatch: can not copy {}[] into object array[]",
+                    element_external(src_comp)
+                ),
+            ));
+        } else if dst_comp != src_comp {
+            // 基本 src → 基本 dst 异型(typeArrayKlass:126)。
+            return Err(throw_exception_with_message(
+                vm,
+                "java/lang/ArrayStoreException",
+                &format!(
+                    "arraycopy: type mismatch: can not copy {}[] into {}[]",
+                    element_external(src_comp),
+                    element_external(dst_comp)
+                ),
+            ));
         }
     } else if dst_prim {
-        // 引用 src、基本 dst → ASE。
-        return Err(throw_exception(vm, "java/lang/ArrayStoreException"));
+        // 引用 src → 基本 dst(objArrayKlass:252 "object array[] into {T}[]")。
+        return Err(throw_exception_with_message(
+            vm,
+            "java/lang/ArrayStoreException",
+            &format!(
+                "arraycopy: type mismatch: can not copy object array[] into {}[]",
+                element_external(dst_comp)
+            ),
+        ));
     }
-    // 4. 负值 → AIOOBE(typeArrayKlass:133 / objArrayKlass:261)。
+    // 4. 负值 → AIOOBE(typeArrayKlass:133 / objArrayKlass:261)。HotSpot 按 src_pos/dst_pos/length
+    //    优先序给消息。
     if src_pos < 0 || dst_pos < 0 || length < 0 {
-        return Err(throw_exception(
+        let msg = if src_pos < 0 {
+            format!(
+                "arraycopy: source index {src_pos} out of bounds for {}[{src_len}]",
+                kind_label(src_prim, src_comp)
+            )
+        } else if dst_pos < 0 {
+            format!(
+                "arraycopy: destination index {dst_pos} out of bounds for {}[{dst_len}]",
+                kind_label(dst_prim, dst_comp)
+            )
+        } else {
+            format!("arraycopy: length {length} is negative")
+        };
+        return Err(throw_exception_with_message(
             vm,
             "java/lang/ArrayIndexOutOfBoundsException",
+            &msg,
         ));
     }
     // 5. 越界 → AIOOBE(无符号算术 `(u32)len+(u32)pos > len` → i64 等价且溢出安全;
-    //    typeArrayKlass:149 / objArrayKlass:277)。
+    //    typeArrayKlass:149 / objArrayKlass:277)。HotSpot 按 src/dst 优先序给消息;
+    //    "last source/destination index {n}"(n = pos+length,已过负值检查故非负)。
     if src_pos as i64 + length as i64 > src_len as i64
         || dst_pos as i64 + length as i64 > dst_len as i64
     {
-        return Err(throw_exception(
+        let msg = if src_pos as i64 + length as i64 > src_len as i64 {
+            format!(
+                "arraycopy: last source index {} out of bounds for {}[{src_len}]",
+                src_pos as i64 + length as i64,
+                kind_label(src_prim, src_comp)
+            )
+        } else {
+            format!(
+                "arraycopy: last destination index {} out of bounds for {}[{dst_len}]",
+                dst_pos as i64 + length as i64,
+                kind_label(dst_prim, dst_comp)
+            )
+        };
+        return Err(throw_exception_with_message(
             vm,
             "java/lang/ArrayIndexOutOfBoundsException",
+            &msg,
         ));
     }
     // 6. length==0 → 空(typeArrayKlass:166 / objArrayKlass:296)。
@@ -73,8 +158,7 @@ pub(super) fn system_arraycopy(
     // 7. 拷贝。是否须逐元素 checkcast:
     //    - 基本:否;引用同数组:否(do_copy:208 "source==destination, no conversion checks");
     //    - 引用异数组:src 组件非 dst 组件子类型 → 是(checkcast,首个不可赋处拷前缀后 ASE)。
-    //    `Some(comp)` 即对该组件逐元素 checkcast;`None` 即量体。
-    let checkcast_comp = if src_prim || src == dst {
+    let checkcast = if src_prim || src == dst {
         None
     } else {
         let Some(reg) = vm.registry() else {
@@ -83,18 +167,35 @@ pub(super) fn system_arraycopy(
         if component_assignable(src_comp, dst_comp, reg) {
             None
         } else {
-            Some(dst_comp)
+            // 消息镜像 throw_array_store_exception(objArrayKlass:192-200)。
+            let msg = if !component_assignable(dst_comp, src_comp, reg) {
+                format!(
+                    "arraycopy: type mismatch: can not copy {}[] into {}[]",
+                    element_external(src_comp),
+                    element_external(dst_comp)
+                )
+            } else {
+                format!(
+                    "arraycopy: element type mismatch: can not cast one of the elements of {}[] to the type of the destination array, {}",
+                    element_external(src_comp),
+                    element_external(dst_comp)
+                )
+            };
+            Some(Checkcast {
+                dst_comp,
+                msg,
+            })
         }
     };
-    copy_elements(vm, src, src_pos, dst, dst_pos, length, checkcast_comp)?;
+    copy_elements(vm, src, src_pos, dst, dst_pos, length, checkcast)?;
     Ok(Value::Void)
 }
 
 /// 逐元素拷贝(memmove 择向 + 可选 checkcast)。
 ///
-/// 每轮:不可变借读一个 `Slot`(Copy,即释放)→(checkcast 时查可赋性,不可赋即 ASE,
-/// 前缀已写)→ 可变借写。读/写分属不同借用时刻,故**同一数组**(src==dst)亦可安全自拷。
-/// `checkcast_comp` 为 `Some(comp)` 时对每个非 null 引用元素查可赋性。
+/// 每轮:不可变借读一个 `Slot`(Copy,即释放)→(checkcast 时查可赋性,不可赋即 ASE 带
+/// `throw_array_store_exception` 消息,前缀已写)→ 可变借写。读/写分属不同借用时刻,故
+/// **同一数组**(src==dst)亦可安全自拷。`checkcast` 为 `Some` 时对每个非 null 引用元素查可赋性。
 fn copy_elements(
     vm: &mut Vm<'_>,
     src: Reference,
@@ -102,7 +203,7 @@ fn copy_elements(
     dst: Reference,
     dst_pos: i32,
     length: i32,
-    checkcast_comp: Option<&str>,
+    checkcast: Option<Checkcast<'_>>,
 ) -> Result<(), VmError> {
     // 重叠择向:同数组且 dst_pos>src_pos → 后向(防前向读时已写位被覆盖);否则前向
     // (copy.hpp conjoint_* = memmove 语义)。异数组无重叠,前向即可。
@@ -111,7 +212,7 @@ fn copy_elements(
     for k in 0..n {
         let idx = if backward { n - 1 - k } else { k };
         let slot = read_element(vm, src, src_pos as usize + idx)?;
-        if let Some(dst_comp) = checkcast_comp
+        if let Some(cc) = &checkcast
             && let Slot::Reference(r) = slot
             && !r.is_null()
         {
@@ -119,8 +220,12 @@ fn copy_elements(
                 return Err(VmError::BadConstant("arraycopy checkcast 需类注册表"));
             };
             let elem_comp = element_component(vm, r)?;
-            if !component_assignable(&elem_comp, dst_comp, reg) {
-                return Err(throw_exception(vm, "java/lang/ArrayStoreException"));
+            if !component_assignable(&elem_comp, cc.dst_comp, reg) {
+                return Err(throw_exception_with_message(
+                    vm,
+                    "java/lang/ArrayStoreException",
+                    &cc.msg,
+                ));
             }
         }
         write_element(vm, dst, dst_pos as usize + idx, slot)?;
@@ -133,6 +238,15 @@ fn array_meta(vm: &Vm<'_>, r: Reference) -> Option<(String, usize)> {
     match vm.heap().get(r) {
         Some(Oop::Array(a)) => Some((a.class_name().to_string(), a.length())),
         _ => None,
+    }
+}
+
+/// 非数组 oop 的外部名(供 "source/destination type … is not an array" 消息):内部名 → 点分。
+fn oop_external_name(vm: &Vm<'_>, r: Reference) -> String {
+    match vm.heap().get(r) {
+        Some(Oop::Instance(i)) => i.class_name().replace('/', "."),
+        Some(Oop::Array(a)) => a.class_name().replace('/', "."),
+        _ => "<unknown>".into(),
     }
 }
 
@@ -175,6 +289,39 @@ fn component_of(desc: &str) -> &str {
 /// 组件段是否基本类型(单字符 BCDFIJSZ)。
 fn is_primitive_component(comp: &str) -> bool {
     matches!(comp, "B" | "C" | "D" | "F" | "I" | "J" | "S" | "Z")
+}
+
+/// 组件 → HotSpot `type2name_tab` 外部名(`I`→`int`、`B`→`byte` …);引用 `L…;` → 点分类名
+/// (`Ljava/lang/String;`→`java.lang.String`);数组描述符按点分兜底。供 arraycopy 消息
+/// (`typeArrayKlass.cpp` / `objArrayKlass.cpp` 的 `THROW_MSG`、`external_name`)。
+fn element_external(comp: &str) -> String {
+    match comp {
+        "B" => "byte".into(),
+        "C" => "char".into(),
+        "D" => "double".into(),
+        "F" => "float".into(),
+        "I" => "int".into(),
+        "J" => "long".into(),
+        "S" => "short".into(),
+        "Z" => "boolean".into(),
+        _ => {
+            if let Some(inner) = comp.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+                inner.replace('/', ".")
+            } else {
+                comp.replace('/', ".")
+            }
+        }
+    }
+}
+
+/// 数组端的 kind 描述(供越界消息):基本 → 类型名;引用 → `"object array"`
+/// (HotSpot `objArrayKlass.cpp:266/269` 字面量 "object array[%d]")。
+fn kind_label(is_prim: bool, comp: &str) -> String {
+    if is_prim {
+        element_external(comp)
+    } else {
+        "object array".into()
+    }
 }
 
 /// 组件 `a` 可赋给组件 `b`(JVMS 数组子类型递归 ⟺「`[a` instanceof `[b`」)。
@@ -241,6 +388,61 @@ mod tests {
             panic!("异常应为 Instance");
         };
         assert_eq!(i.class_name(), expected);
+    }
+
+    /// 取异常的 format_trace 文本(供 detailMessage 断言)。调用方须先求 result 再借 vm。
+    fn exc_trace(vm: &Vm<'_>, result: Result<Value, VmError>) -> String {
+        let Err(VmError::ThrownException(r)) = result else {
+            panic!("期望 ThrownException,得 {result:?}");
+        };
+        vm.format_trace(r)
+    }
+
+    #[test]
+    fn primitive_type_mismatch_carries_message() {
+        // int[] → byte[]:ASE 消息 "type mismatch: can not copy int[] into byte[]"
+        // (typeArrayKlass:126)。
+        let reg = ClassRegistry::new();
+        let mut vm = Vm::new(&reg);
+        let src = int_array(&mut vm, &[1, 2]);
+        let dst = array_of(&mut vm, "[B", vec![Slot::Int(0); 2]);
+        let result = system_arraycopy(&mut vm, src, 0, dst, 0, 2);
+        let trace = exc_trace(&vm, result);
+        assert!(
+            trace.contains("java/lang/ArrayStoreException: arraycopy: type mismatch: can not copy int[] into byte[]"),
+            "类型不符消息,得:\n{trace}"
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_carries_last_source_index_message() {
+        // src_pos(1)+length(2)=3 > src_len(2) → AIOOBE "last source index 3 out of bounds for int[2]"
+        // (typeArrayKlass:155)。
+        let reg = ClassRegistry::new();
+        let mut vm = Vm::new(&reg);
+        let src = int_array(&mut vm, &[1, 2]);
+        let dst = int_array(&mut vm, &[0; 2]);
+        let result = system_arraycopy(&mut vm, src, 1, dst, 0, 2);
+        let trace = exc_trace(&vm, result);
+        assert!(
+            trace.contains("java/lang/ArrayIndexOutOfBoundsException: arraycopy: last source index 3 out of bounds for int[2]"),
+            "越界消息,得:\n{trace}"
+        );
+    }
+
+    #[test]
+    fn negative_srcpos_carries_source_index_message() {
+        // src_pos=-1 → AIOOBE "source index -1 out of bounds for int[1]"(typeArrayKlass:138)。
+        let reg = ClassRegistry::new();
+        let mut vm = Vm::new(&reg);
+        let src = int_array(&mut vm, &[1]);
+        let dst = int_array(&mut vm, &[0]);
+        let result = system_arraycopy(&mut vm, src, -1, dst, 0, 1);
+        let trace = exc_trace(&vm, result);
+        assert!(
+            trace.contains("java/lang/ArrayIndexOutOfBoundsException: arraycopy: source index -1 out of bounds for int[1]"),
+            "负值消息,得:\n{trace}"
+        );
     }
 
     #[test]

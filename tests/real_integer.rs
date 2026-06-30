@@ -176,6 +176,10 @@ fn real_integer_valueof_intvalue_runs() {
     assert!(loaded >= 1, "闭包应载入 Integer 本身,实际:{loaded}");
     load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
     assert!(registry.get("java/util/HashMap").is_some(), "HashMap 须已预载");
+    // 真 String 须预载(4.10i):引导链 VM.saveProperties → HashMap.get(键 String.hashCode)
+    // 与 "true".equals(...) 现走真 String 字节码(分派 StringLatin1),非 4.10h 的 native 桩。
+    load_closure(&mut registry, &cp, "java/lang/String").unwrap();
+    assert!(registry.get("java/lang/String").is_some(), "String 须已预载");
 
     // 3) 真 Integer.intValue 须**非** native(桩无此法 → 证覆盖成功)。
     let int_lc = registry.get("java/lang/Integer").expect("Integer 须已注册");

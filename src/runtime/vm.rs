@@ -10,7 +10,6 @@
 use crate::oops::ClassRegistry;
 use crate::runtime::heap::Heap;
 use crate::runtime::string_pool::StringPool;
-use crate::runtime::Reference;
 
 /// 默认帧深度上限。高于 ackermann(3,3) 的递归深度(~120),正常小测试不会误触;
 /// 可经 [`Vm::with_stack_limit`] 调整(SOE 测试用小值快速触发)。
@@ -56,9 +55,15 @@ impl<'a> Vm<'a> {
         &mut self.heap
     }
 
-    /// 返回 `text` 的 intern 字符串引用(同文本恒同引用)。4.8:`ldc`/`ldc_w` 字符串字面量经此。
-    pub fn intern_string(&mut self, text: &str) -> Reference {
-        self.string_pool.intern(&mut self.heap, text)
+    /// 字符串 intern 池(4.8/4.10i):文本 → 堆引用的纯备忘;真 String 实例构造在
+    /// interpreter(`string::intern`),本池仅保证「同文本恒同引用」。
+    pub(crate) fn string_pool(&self) -> &StringPool {
+        &self.string_pool
+    }
+
+    /// 字符串 intern 池(可变)。
+    pub(crate) fn string_pool_mut(&mut self) -> &mut StringPool {
+        &mut self.string_pool
     }
 
     /// 类注册表(若启用)。

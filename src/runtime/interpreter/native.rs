@@ -105,9 +105,9 @@ pub(super) fn invoke(
             let Value::Reference(r) = args.first().copied().unwrap_or(Value::Void) else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
-            let text = match vm.heap().get(r) {
-                Some(Oop::String(s)) => s.text().to_string(),
-                _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+            // 收参为真 String 实例(经 intern):读回文本取原语名。
+            let Some(text) = super::string::read_text(vm, r)? else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
             if !is_primitive_name(&text) {
                 // 对应 jvm.cpp 的 THROW_MSG_NULL(ClassNotFoundException, utf)。
@@ -127,51 +127,40 @@ pub(super) fn invoke(
         // (VM.saveProperties 存进 directMemory,本场景不用;真值无意义)。
         ("java/lang/Runtime", "maxMemory", "()J") => Ok(Value::Long(i64::MAX)),
 
-        // String.equals(Ljava/lang/Object;)Z —— 临时脚手架(Oop::String 特殊变体上的方法,见
-        // invoke_virtual/interface 的 String 分派)。真 String.equals 退役 Oop::String 后由真字节码运行;
-        // 本臂仅 `equals(Object)`:`null`/非 String → false;同引用 → true;否则文本比较。
-        ("java/lang/String", "equals", "(Ljava/lang/Object;)Z") => {
-            let Some(this_ref) = this else {
-                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+        // jdk.internal.misc.Unsafe 的数组布局 native —— Unsafe.<clinit> 经
+        // `theUnsafe.arrayBaseOffset(X[].class)` / `arrayIndexScale(X[].class)`(皆为**非 native**
+        // 字节码包装器)转调私有 native `arrayBaseOffset0` / `arrayIndexScale0`,初始化各
+        // ARRAY_*_BASE_OFFSET / _INDEX_SCALE 静态字段(ArraysSupport.<clinit> 读之,进而
+        // StringLatin1.hashCode → ArraysSupport.hashCodeOfUnsigned 触发其初始化)。rustj 数组
+        // 无真实内存偏移:基偏移取常量、刻度按组件类型大小,仅供偏移算术(mismatch 等);
+        // **不参与 String.hashCode 计算**——后者经 `unsignedHashCode` 的朴素 baload 循环。
+        ("jdk/internal/misc/Unsafe", "arrayBaseOffset0", "(Ljava/lang/Class;)I") => Ok(Value::Int(16)),
+        ("jdk/internal/misc/Unsafe", "arrayIndexScale0", "(Ljava/lang/Class;)I") => {
+            let scale = match class_arg_name(vm, args).as_deref() {
+                Some("[B") | Some("[Z") => 1,
+                Some("[C") | Some("[S") => 2,
+                Some("[I") | Some("[F") => 4,
+                Some("[J") | Some("[D") => 8,
+                _ => 1, // 引用数组/未知 → 1(保守;hash 不用此值)
             };
-            let Some(Value::Reference(other_ref)) = args.first().copied() else {
-                return Ok(Value::Int(0)); // null 实参 → false
-            };
-            let this_text = match vm.heap().get(this_ref) {
-                Some(Oop::String(s)) => s.text().to_string(),
-                _ => {
-                    return Err(VmError::BadConstant(
-                        "String.equals 收者非 String(暂仅 Oop::String 支持)",
-                    ))
-                }
-            };
-            if other_ref == this_ref {
-                return Ok(Value::Int(1));
-            }
-            let eq = matches!(vm.heap().get(other_ref),
-                Some(Oop::String(s)) if s.text() == this_text);
-            Ok(Value::Int(if eq { 1 } else { 0 }))
+            Ok(Value::Int(scale))
         }
+        // 注:addressSize()/pageSize()/isBigEndian()/unalignedAccess() 均为返回常量字段
+        // (ADDRESS_SIZE / PAGE_SIZE / BIG_ENDIAN / UNALIGNED_ACCESS)的字节码方法;这些字段在
+        // Unsafe.class 中已是字面量初始化(不经 native),故 <clinit> 无更多 native 依赖。
 
-        // String.hashCode()I —— 临时脚手架:Java String.hashCode = h = 31*h + char(UTF-16 单元,
-        // 补码回绕)。按 encode_utf16 迭代以对齐 Java 的按代码单元求值(辅助平面字符=代理对两单元)。
-        ("java/lang/String", "hashCode", "()I") => {
+        // String.intern()Ljava/lang/String; —— String.java:5086 native。读 this 文本 → 经
+        // StringPool 规范化(同文本恒同引用),返规范引用。对应 jvm.cpp JVM_InternString / HotSpot
+        // StringTable。String 的其余方法(equals/hashCode/length/…)退役 Oop::String 后跑真字节码
+        // (经 invokevirtual 正常分派 → StringLatin1/StringUTF16),不经本表。
+        ("java/lang/String", "intern", "()Ljava/lang/String;") => {
             let Some(this_ref) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
-            let text = match vm.heap().get(this_ref) {
-                Some(Oop::String(s)) => s.text().to_string(),
-                _ => {
-                    return Err(VmError::BadConstant(
-                        "String.hashCode 收者非 String(暂仅 Oop::String 支持)",
-                    ))
-                }
+            let Some(text) = super::string::read_text(vm, this_ref)? else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
-            let mut h: i32 = 0;
-            for u in text.encode_utf16() {
-                h = h.wrapping_mul(31).wrapping_add(u as i32);
-            }
-            Ok(Value::Int(h))
+            Ok(Value::Reference(super::string::intern(vm, &text)?))
         }
 
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
@@ -186,6 +175,18 @@ fn is_primitive_name(name: &str) -> bool {
         name,
         "int" | "long" | "byte" | "char" | "short" | "boolean" | "double" | "float" | "void"
     )
+}
+
+/// 取第 0 参(Class 镜像)的内部名(如 `[B`);非 Class 实参 / 悬空 → `None`。
+/// 供 `Unsafe.arrayIndexScale(Class)` 按数组组件类型定刻度。
+fn class_arg_name(vm: &Vm<'_>, args: &[Value]) -> Option<String> {
+    let Value::Reference(r) = args.first().copied()? else {
+        return None;
+    };
+    match vm.heap().get(r)? {
+        Oop::Class(c) => Some(c.name().to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -241,55 +242,16 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn get_primitive_class_returns_class_oop() {
-        // jvm.cpp:770 JVM_FindPrimitiveClass:"int" → Class 镜像。
-        let mut vm = crate::runtime::Vm::default();
-        let s = vm.heap_mut().alloc(crate::oops::Oop::String(
-            crate::oops::StringOop::new("int".into()),
-        ));
-        let r = invoke(
-            &mut vm,
-            "java/lang/Class",
-            "getPrimitiveClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            None,
-            &[Value::Reference(s)],
-        )
-        .unwrap();
-        let Value::Reference(cls) = r else {
-            panic!("期望 Class 引用,得 {r:?}");
-        };
-        let crate::oops::Oop::Class(c) = vm.heap().get(cls).unwrap() else {
-            panic!("期望 Oop::Class");
-        };
-        assert_eq!(c.name(), "int");
-    }
+    // getPrimitiveClass 的 String 收参路径(返原语 Class 镜像 / 非原语抛 ClassNotFoundException)
+    // 经集成闸门覆盖:`real_integer.rs` 的 `Integer.<clinit>` 调 `Class.getPrimitiveClass("int")`
+    // 端到端(须先预载真 String)。单测层面仅覆盖缺参 → NPE 与 `is_primitive_name` 纯逻辑。
 
     #[test]
-    fn get_primitive_class_non_primitive_throws_class_not_found() {
-        // 非原语名 → ClassNotFoundException(jvm.cpp 的 THROW_MSG_NULL)。
-        let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
-        let s = vm.heap_mut().alloc(crate::oops::Oop::String(
-            crate::oops::StringOop::new("java/lang/Object".into()),
-        ));
-        let err = invoke(
-            &mut vm,
-            "java/lang/Class",
-            "getPrimitiveClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            None,
-            &[Value::Reference(s)],
-        )
-        .unwrap_err();
-        let crate::runtime::VmError::ThrownException(exc) = err else {
-            panic!("应抛 ThrownException,得 {err:?}");
-        };
-        let crate::oops::Oop::Instance(i) = vm.heap().get(exc).unwrap() else {
-            panic!("须为异常实例");
-        };
-        assert_eq!(i.class_name(), "java/lang/ClassNotFoundException");
+    fn is_primitive_name_recognizes_keywords() {
+        assert!(is_primitive_name("int"));
+        assert!(is_primitive_name("void"));
+        assert!(!is_primitive_name("java/lang/Object"));
+        assert!(!is_primitive_name("String"));
     }
 
     #[test]

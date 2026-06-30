@@ -11,6 +11,7 @@ mod exception;
 mod field;
 mod invoke;
 mod native;
+mod string;
 mod type_check;
 
 use crate::bytecode::opcode::{BytecodeError, Opcode};
@@ -1126,7 +1127,8 @@ impl<'a> Interpreter<'a> {
                     ConstantPoolEntry::Utf8(s) => s.clone(),
                     _ => return Err(VmError::BadConstant("ldc String 须指向 Utf8")),
                 };
-                let r = vm.intern_string(&text);
+                // 真 java/lang/String 实例(经 intern,同文本恒同引用)。需注册表预载 String。
+                let r = string::intern(vm, &text)?;
                 frame.operands.push_reference(r)?;
             }
             ConstantPoolEntry::Class { name_index } => {
@@ -1411,55 +1413,6 @@ mod tests {
         let interp = Interpreter::new(&code, &cp);
         let mut frame = Frame::new(0, 1);
         assert_eq!(interp.interpret(&mut frame).unwrap(), Value::Int(42));
-    }
-
-    /// 常量池:[1]=Utf8(s) [2]=String{string_index=1}。
-    fn cp_with_string(s: &str) -> ConstantPool {
-        use crate::classfile::Reader;
-        let mut b = vec![0x00, 0x03]; // count=3 → 索引 1..2
-        b.push(0x01); // [1] Utf8
-        b.extend_from_slice(&(s.len() as u16).to_be_bytes());
-        b.extend_from_slice(s.as_bytes());
-        b.push(0x08); // [2] String
-        b.extend_from_slice(&1u16.to_be_bytes()); // string_index=1
-        ConstantPool::parse(&mut Reader::new(&b)).unwrap()
-    }
-
-    #[test]
-    fn ldc_string_pushes_interned_reference() {
-        let cp = cp_with_string("hi");
-        let code = [Opcode::Ldc as u8, 0x02, Opcode::Areturn as u8];
-        let interp = Interpreter::new(&code, &cp);
-        let mut frame = Frame::new(0, 1);
-        let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
-        let v = interp.interpret_with(&mut frame, &mut vm).unwrap();
-        let Value::Reference(r) = v else {
-            panic!("期望 Value::Reference, 得 {v:?}");
-        };
-        assert!(!r.is_null());
-        match vm.heap().get(r).unwrap() {
-            crate::oops::Oop::String(s) => assert_eq!(s.text(), "hi"),
-            other => panic!("期望 Oop::String, 得 {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ldc_w_string_pushes_interned_reference() {
-        let cp = cp_with_string("hi");
-        let code = [Opcode::LdcW as u8, 0x00, 0x02, Opcode::Areturn as u8];
-        let interp = Interpreter::new(&code, &cp);
-        let mut frame = Frame::new(0, 1);
-        let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
-        let v = interp.interpret_with(&mut frame, &mut vm).unwrap();
-        let Value::Reference(r) = v else {
-            panic!("期望 Value::Reference, 得 {v:?}");
-        };
-        match vm.heap().get(r).unwrap() {
-            crate::oops::Oop::String(s) => assert_eq!(s.text(), "hi"),
-            other => panic!("期望 Oop::String, 得 {other:?}"),
-        }
     }
 
     #[test]
@@ -2596,9 +2549,10 @@ mod tests {
         use crate::runtime::Slot;
         // 元素存 Int(200),baload 符号扩展 -> (200 as i8) as i32 = -56。
         let mut vm = Vm::default();
-        let arr = vm
-            .heap_mut()
-            .alloc(Oop::Array(ArrayOop::new(vec![Slot::Int(200)])));
+        let arr = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(
+            "[B".to_string(),
+            vec![Slot::Int(200)],
+        )));
         // aload_0(引用); iconst_0(下标); baload; ireturn
         let code = [
             Opcode::Aload0 as u8,
@@ -2622,9 +2576,10 @@ mod tests {
         use crate::runtime::Slot;
         // 存 Int(0xFFFF),caload 零扩展 -> (0xFFFF as u16) as i32 = 65535。
         let mut vm = Vm::default();
-        let arr = vm
-            .heap_mut()
-            .alloc(Oop::Array(ArrayOop::new(vec![Slot::Int(0xFFFF)])));
+        let arr = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(
+            "[C".to_string(),
+            vec![Slot::Int(0xFFFF)],
+        )));
         let code = [
             Opcode::Aload0 as u8,
             Opcode::Iconst0 as u8,
@@ -2647,9 +2602,10 @@ mod tests {
         use crate::runtime::Slot;
         let reg = crate::oops::ClassRegistry::new();
         let mut vm = crate::runtime::Vm::new(&reg);
-        let arr = vm
-            .heap_mut()
-            .alloc(Oop::Array(ArrayOop::new(vec![Slot::Int(0)]))); // len 1
+        let arr = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(
+            "[I".to_string(),
+            vec![Slot::Int(0)],
+        ))); // len 1
         // 下标 5 越界
         let code = [
             Opcode::Aload0 as u8,

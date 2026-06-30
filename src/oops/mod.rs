@@ -9,11 +9,9 @@ pub mod class_oop;
 pub mod instance;
 pub mod klass;
 pub mod oop;
-pub mod string;
 
 pub use array::ArrayOop;
 pub use class_oop::ClassOop;
 pub use instance::InstanceOop;
 pub use klass::{ClassRegistry, InitState, LoadedClass, ResolvedField};
 pub use oop::Oop;
-pub use string::StringOop;

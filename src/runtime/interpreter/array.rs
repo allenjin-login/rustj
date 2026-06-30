@@ -28,33 +28,53 @@ pub(super) fn new_array(frame: &mut Frame, vm: &mut Vm<'_>, atype: u8) -> Result
     if count < 0 {
         return Err(throw_exception(vm, "java/lang/NegativeArraySizeException"));
     }
-    let default = match atype {
-        4 | 5 | 8 | 9 | 10 => Slot::Int(0), // boolean/char/byte/short/int
-        6 => Slot::Float(0.0),
-        7 => Slot::Double(0.0),
-        11 => Slot::Long(0),
+    // atype(JVMS Table 6.5.newarray)→(默认槽, 数组描述符)。描述符即运行时类型,供 checkcast。
+    let (default, desc) = match atype {
+        4 => (Slot::Int(0), "[Z"), // boolean
+        5 => (Slot::Int(0), "[C"), // char
+        6 => (Slot::Float(0.0), "[F"), // float
+        7 => (Slot::Double(0.0), "[D"), // double
+        8 => (Slot::Int(0), "[B"), // byte
+        9 => (Slot::Int(0), "[S"), // short
+        10 => (Slot::Int(0), "[I"), // int
+        11 => (Slot::Long(0), "[J"), // long
         _ => return Err(VmError::BadConstant("newarray 非法 atype")),
     };
     let elements = vec![default; count as usize];
-    let r = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(elements)));
+    let r = vm
+        .heap_mut()
+        .alloc(Oop::Array(ArrayOop::new(desc.to_string(), elements)));
     frame.operands.push_reference(r)?;
     Ok(())
 }
 
-/// `anewarray`:解析 Class(校验组件类型;4.3a 不存储),弹 count,造 null 引用数组,入堆,压引用。
+/// 组件内部名(类名或数组描述符)→ 数组描述符。`java/lang/String` → `[Ljava/lang/String;`;
+/// `[I` → `[[I`(数组组件前补 `[`)。对应 HotSpot `arrayKlass` 之名合成。
+fn array_descriptor(component: &str) -> String {
+    if component.starts_with('[') {
+        format!("[{component}")
+    } else {
+        format!("[L{component};")
+    }
+}
+
+/// `anewarray`:解析 Class(取组件名),弹 count,造 null 引用数组,入堆,压引用。
 pub(super) fn a_new_array(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
     vm: &mut Vm<'_>,
     class_index: u16,
 ) -> Result<(), VmError> {
-    let _component = resolve_class_name(interp.cp(), class_index)?;
+    let component = resolve_class_name(interp.cp(), class_index)?;
     let count = frame.operands.pop_int()?;
     if count < 0 {
         return Err(throw_exception(vm, "java/lang/NegativeArraySizeException"));
     }
     let elements = vec![Slot::Reference(Reference::null()); count as usize];
-    let r = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(elements)));
+    let r = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(
+        array_descriptor(&component),
+        elements,
+    )));
     frame.operands.push_reference(r)?;
     Ok(())
 }
@@ -83,12 +103,14 @@ fn parse_array_descriptor(desc: &str) -> Result<(usize, Slot), VmError> {
 
 /// 递归分配嵌套数组树。`counts[depth]` 为当前层长度。
 /// 最后一层:`dims == ndim` 填叶子默认值;`dims < ndim` 填 null(余下维度未分配)。
+/// `desc` 为全描述符(如 `[[I`);本层(第 `depth` 级)描述符 = 去掉 depth 个前导 `[`。
 fn alloc_multi(
     vm: &mut Vm<'_>,
     counts: &[i32],
     depth: usize,
     ndim: usize,
     base: Slot,
+    desc: &str,
 ) -> Result<Reference, VmError> {
     let len = counts[depth] as usize;
     let last = depth + 1 == counts.len();
@@ -101,11 +123,16 @@ fn alloc_multi(
                 elements.push(base);
             }
         } else {
-            let child = alloc_multi(vm, counts, depth + 1, ndim, base)?;
+            let child = alloc_multi(vm, counts, depth + 1, ndim, base, desc)?;
             elements.push(Slot::Reference(child));
         }
     }
-    Ok(vm.heap_mut().alloc(Oop::Array(ArrayOop::new(elements))))
+    // 外层(depth=0)取全描述符;每深入一级剥掉一个前导 '['([[I → [I)。
+    let this_desc = desc.get(depth..).unwrap_or(desc);
+    Ok(vm.heap_mut().alloc(Oop::Array(ArrayOop::new(
+        this_desc.to_string(),
+        elements,
+    ))))
 }
 
 /// `multianewarray`:解析描述符 → 弹 dims 个 count → 递归分配 → 压外层引用。
@@ -129,7 +156,7 @@ pub(super) fn multi_new_array(
     if counts.iter().any(|&c| c < 0) {
         return Err(throw_exception(vm, "java/lang/NegativeArraySizeException"));
     }
-    let r = alloc_multi(vm, &counts, 0, ndim, base)?;
+    let r = alloc_multi(vm, &counts, 0, ndim, base, &name)?;
     frame.operands.push_reference(r)?;
     Ok(())
 }
@@ -146,7 +173,7 @@ pub(super) fn array_length(frame: &mut Frame, vm: &mut Vm<'_>) -> Result<(), VmE
         .ok_or(VmError::BadConstant("arraylength 引用悬空"))?
     {
         Oop::Array(a) => a.length(),
-        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) => {
             return Err(VmError::BadConstant("arraylength 目标非数组"))
         }
     };
@@ -173,7 +200,7 @@ pub(super) fn array_load(
         .ok_or(VmError::BadConstant("aload 引用悬空"))?
     {
         Oop::Array(a) => a.length(),
-        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) => {
             return Err(VmError::BadConstant("aload 目标非数组"))
         }
     };
@@ -189,7 +216,7 @@ pub(super) fn array_load(
         .ok_or(VmError::BadConstant("aload 引用悬空"))?
     {
         Oop::Array(a) => a.element(index as usize),
-        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) => {
             return Err(VmError::BadConstant("aload 目标非数组"))
         }
     };
@@ -279,7 +306,7 @@ pub(super) fn array_store(
         .ok_or(VmError::BadConstant("astore 引用悬空"))?
     {
         Oop::Array(a) => a.length(),
-        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) => {
             return Err(VmError::BadConstant("astore 目标非数组"))
         }
     };
@@ -295,7 +322,7 @@ pub(super) fn array_store(
         .ok_or(VmError::BadConstant("astore 引用悬空"))?
     {
         Oop::Array(a) => a.set_element(idx, value),
-        Oop::Instance(_) | Oop::String(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) => {
             return Err(VmError::BadConstant("astore 目标非数组"))
         }
     }

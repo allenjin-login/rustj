@@ -9,6 +9,7 @@ use crate::oops::Oop;
 use crate::runtime::{Frame, Reference, Vm};
 
 /// 取 objectref(非 null)的(是否数组, 运行时类名)。own 字符串避免借用纠缠。
+/// 数组取其类型描述符(`[B` / `[Ljava/lang/String;`),实例取类内部名。
 fn object_type(vm: &Vm<'_>, objref: Reference) -> Result<(bool, Option<String>), VmError> {
     let obj = vm
         .heap()
@@ -16,13 +17,62 @@ fn object_type(vm: &Vm<'_>, objref: Reference) -> Result<(bool, Option<String>),
         .ok_or(VmError::BadConstant("checkcast/instanceof 引用悬空"))?;
     Ok(match obj {
         Oop::Instance(i) => (false, Some(i.class_name().to_string())),
-        Oop::Array(_) => (true, None),
-        Oop::String(_) => (false, Some("java/lang/String".to_string())),
+        Oop::Array(a) => (true, Some(a.class_name().to_string())),
         Oop::Class(_) => (false, Some("java/lang/Class".to_string())),
     })
 }
 
-/// 命中判定:objectref(非 null)是否 target 实例。数组仅 Object 命中。
+/// `[Ljava/lang/String;` 的组件段(`Ljava/lang/String;`)→ 类名 `java/lang/String`;
+/// 非引用组件(基本类型 / 仍含维度的数组)→ `None`。
+fn class_of_obj_desc(component: &str) -> Option<&str> {
+    let b = component.as_bytes();
+    if b.first() == Some(&b'L') && b.last() == Some(&b';') {
+        component.get(1..component.len() - 1)
+    } else {
+        None
+    }
+}
+
+/// 数组 `instanceof` 判定(JVMS §6.5.instanceof;HotSpot `arrayKlass::is_java_subtype_of`)。
+/// `sub` 为对象数组的运行时描述符;`target` 为 `instanceof`/`checkcast` 的右操作数解析名
+/// (数组描述符,或 `Object`/`Cloneable`/`java/io/Serializable` 之类超类)。规则:
+/// - 所有数组都是 `Object` / `Cloneable` / `java.io.Serializable` 的实例;
+/// - 同描述符 → 真;
+/// - `[Ljava/lang/Object;` 左值的组件为引用/数组时为真(基本类型数组非 `Object[]`);
+/// - 同维数组递归剥维;引用组件 `[Lsub;` vs `[Lsup;` 走类层 `is_instance`。
+fn array_instanceof(sub: &str, target: &str, reg: &crate::oops::ClassRegistry) -> bool {
+    match target {
+        "java/lang/Object" | "java/lang/Cloneable" | "java/io/Serializable" => return true,
+        _ => {}
+    }
+    if sub == target {
+        return true;
+    }
+    let Some(sub_comp) = sub.strip_prefix('[') else {
+        return false;
+    };
+    let Some(target_comp) = target.strip_prefix('[') else {
+        return false; // 非数组目标(且非上述超类)→ 不是数组的超类
+    };
+    // 目标是 Object[]:子数组组件为引用(L…)或数组([…)即成立;基本类型组件则否。
+    if target_comp == "Ljava/lang/Object;" {
+        return sub_comp.starts_with('[') || sub_comp.starts_with('L');
+    }
+    // 同为多维数组 → 递归剥一维。
+    if sub_comp.starts_with('[') && target_comp.starts_with('[') {
+        return array_instanceof(sub_comp, target_comp, reg);
+    }
+    // 引用组件 [Lsub; vs [Ltarget; → 组件类可赋值。
+    if let (Some(s_name), Some(t_name)) =
+        (class_of_obj_desc(sub_comp), class_of_obj_desc(target_comp))
+    {
+        return reg.is_instance(s_name, t_name);
+    }
+    false
+}
+
+/// 命中判定:objectref(非 null)是否 target 实例。数组走 [`array_instanceof`],实例走
+/// 类注册表的 `is_instance`(超类链 ∪ 接口闭包)。
 fn matches(
     interp: &Interpreter<'_>,
     vm: &Vm<'_>,
@@ -31,13 +81,13 @@ fn matches(
 ) -> Result<bool, VmError> {
     let target = resolve_class_name(interp.cp(), index)?;
     let (is_array, class_name) = object_type(vm, objref)?;
+    let reg = vm
+        .registry()
+        .ok_or(VmError::BadConstant("checkcast/instanceof 需类注册表"))?;
     Ok(if is_array {
-        target == "java/lang/Object"
+        array_instanceof(class_name.as_deref().unwrap_or(""), &target, reg)
     } else {
-        let reg = vm
-            .registry()
-            .ok_or(VmError::BadConstant("checkcast/instanceof 需类注册表"))?;
-        reg.is_instance(class_name.as_deref().unwrap(), &target)
+        reg.is_instance(class_name.as_deref().unwrap_or(""), &target)
     })
 }
 

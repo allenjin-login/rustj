@@ -1,6 +1,8 @@
 //! 方法信息(JVMS §4.6)与 `Code` 属性解析。对应 HotSpot `method.*` / `constMethod.*`。
 
-use crate::classfile::attributes::{parse_attributes, parse_code, Attribute, CodeAttribute};
+use crate::classfile::attributes::{
+    parse_attributes, parse_code, parse_line_number_table, Attribute, CodeAttribute,
+};
 use crate::classfile::{ClassFileError, Reader};
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 
@@ -43,7 +45,17 @@ impl MethodInfo {
             if let ConstantPoolEntry::Utf8(name) = cp.get(attr.name_index)?
                 && name == "Code"
             {
-                self.code = Some(parse_code(&attr.info)?);
+                let mut code = parse_code(&attr.info)?;
+                // Code 内嵌子属性中找 "LineNumberTable"(经 cp 识名)并解码 → 行号表。
+                for inner in &code.attributes {
+                    if let ConstantPoolEntry::Utf8(inner_name) = cp.get(inner.name_index)?
+                        && inner_name == "LineNumberTable"
+                    {
+                        code.line_number_table = parse_line_number_table(&inner.info)?;
+                        break;
+                    }
+                }
+                self.code = Some(code);
                 break;
             }
         }

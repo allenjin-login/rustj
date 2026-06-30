@@ -622,6 +622,7 @@ mod tests {
             code: Vec::new(),
             exception_table: Vec::new(),
             attributes: Vec::new(),
+            line_number_table: Vec::new(),
         }
     }
 

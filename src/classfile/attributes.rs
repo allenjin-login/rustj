@@ -22,6 +22,14 @@ pub struct ExceptionTableEntry {
     pub catch_type: u16,
 }
 
+/// `LineNumberTable` 条目(JVMS §4.7.12):`start_pc` 处的字节码归属 `line_number` 源行。
+/// 供栈轨迹行号解析(取最大的 `start_pc ≤ bci`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineNumberEntry {
+    pub start_pc: u16,
+    pub line_number: u16,
+}
+
 /// `Code` 属性深解析结果。解释器执行方法的必需信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeAttribute {
@@ -31,6 +39,8 @@ pub struct CodeAttribute {
     pub exception_table: Vec<ExceptionTableEntry>,
     /// `Code` 属性内嵌的属性(如 `LineNumberTable`)。本层只存原始字节。
     pub attributes: Vec<Attribute>,
+    /// `LineNumberTable` 子属性解码(JVMS §4.7.12);无该属性则空。供栈轨迹行号解析。
+    pub line_number_table: Vec<LineNumberEntry>,
 }
 
 /// 读取 `attributes_count` 个原始属性。
@@ -47,6 +57,21 @@ pub fn parse_attributes(reader: &mut Reader) -> Result<Vec<Attribute>, ClassFile
         attrs.push(Attribute { name_index, info });
     }
     Ok(attrs)
+}
+
+/// 解码 `LineNumberTable` 属性体(JVMS §4.7.12):`u2 length` 后接
+/// `{u2 start_pc; u2 line_number}[]`。cp 无关纯解码(属性名识别在 `resolve_code` 经 cp 做)。
+pub fn parse_line_number_table(info: &[u8]) -> Result<Vec<LineNumberEntry>, ClassFileError> {
+    let mut reader = Reader::new(info);
+    let count = usize::from(reader.u2()?);
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(LineNumberEntry {
+            start_pc: reader.u2()?,
+            line_number: reader.u2()?,
+        });
+    }
+    Ok(entries)
 }
 
 /// 深解析 `Code` 属性体字节。
@@ -79,6 +104,7 @@ pub fn parse_code(info: &[u8]) -> Result<CodeAttribute, ClassFileError> {
         code,
         exception_table,
         attributes,
+        line_number_table: Vec::new(),
     })
 }
 
@@ -150,6 +176,24 @@ mod tests {
                 handler_pc: 10,
                 catch_type: 7,
             }]
+        );
+    }
+
+    #[test]
+    fn parse_line_number_table_decodes_start_pc_and_line() {
+        // LineNumberTable 体:length=2,then (start_pc=0,line=3)、(start_pc=4,line=7)
+        let info = [
+            0x00, 0x02, // length
+            0x00, 0x00, 0x00, 0x03, // start_pc=0, line=3
+            0x00, 0x04, 0x00, 0x07, // start_pc=4, line=7
+        ];
+        let entries = parse_line_number_table(&info).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                LineNumberEntry { start_pc: 0, line_number: 3 },
+                LineNumberEntry { start_pc: 4, line_number: 7 },
+            ]
         );
     }
 

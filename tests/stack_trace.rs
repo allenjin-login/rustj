@@ -112,4 +112,20 @@ fn thrown_exception_carries_call_chain() {
     let mi = trace.find("mid").expect("轨迹应含 mid");
     let t = trace.find("top").expect("轨迹应含 top");
     assert!(d < mi && mi < t, "调用链顺序应 deep→mid→top(最内帧首),得:\n{trace}");
+
+    // 行号(SourceFile + LineNumberTable,默认 javac 即生成):deep 抛点 line 3、
+    // mid 调用点 line 4、top 调用点 line 5。格式 `at Class.method(File.java:LINE)`
+    // 镜像 HotSpot StackTraceElement。修前仅 `at Class.method`、无 `(…:LINE)` → 红。
+    assert!(
+        trace.contains("at Trace.deep(Trace.java:3)"),
+        "deep 帧须带抛点行号,得:\n{trace}"
+    );
+    assert!(
+        trace.contains("at Trace.mid(Trace.java:4)"),
+        "mid 帧须带调用点行号,得:\n{trace}"
+    );
+    assert!(
+        trace.contains("at Trace.top(Trace.java:5)"),
+        "top 帧须带调用点行号,得:\n{trace}"
+    );
 }

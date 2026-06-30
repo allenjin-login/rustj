@@ -105,6 +105,7 @@ fn synth_classfile(name: &str, super_name: Option<&str>) -> ClassFile {
             code: vec![0xb1],
             exception_table: Vec::new(),
             attributes: Vec::new(),
+            line_number_table: Vec::new(),
         }),
     };
 

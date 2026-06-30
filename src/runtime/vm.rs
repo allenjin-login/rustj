@@ -18,15 +18,18 @@ use crate::runtime::Reference;
 /// 可经 [`Vm::with_stack_limit`] 调整(SOE 测试用小值快速触发)。
 pub const DEFAULT_STACK_LIMIT: u32 = 512;
 
-/// 一个 Java 栈帧的身份切片(供栈轨迹):声明类内部名 + 方法名。
+/// 一个 Java 栈帧的身份切片(供栈轨迹):声明类内部名 + 方法名 + 抛出点 bci。
 ///
-/// 不含描述符/行号(行号需 `LineNumberTable` 解码 + 抛出点 pc,顺延)。
-/// 拥有 `String`:`push_frame` 来源生命周期不一(字节码帧借自常量池 / native 帧借自
-/// 调用方局部串),统一 owned 入栈最简。
+/// `pc` = 当前指令起始字节码偏移(`run()` 分派前写入);抛出时即抛点 bci,
+/// 陷入被调用者后冻结于调用点 invoke bci。行号由 `format_trace` 经类注册表
+/// 查 `LineNumberTable`(最大 `start_pc ≤ pc`)解析。不含描述符(重载按名+pc 范围匹配,
+/// 顺延)。拥有 `String`:`push_frame` 来源生命周期不一(字节码帧借自常量池 / native 帧
+/// 借自调用方局部串),统一 owned 入栈最简。
 #[derive(Debug, Clone)]
 pub struct CallFrame {
     pub class: String,
     pub method: String,
+    pub pc: u32,
 }
 
 /// 异常的元数据(`Throwable` 三要素的 rustj 侧镜像):捕获帧 / cause / detailMessage。
@@ -112,17 +115,28 @@ impl<'a> Vm<'a> {
     // ---- 栈轨迹捕获(4.10j+) ----
 
     /// 入一个 Java 栈帧(类内部名 + 方法名)。`interpret_with` 入口与 `native::invoke`
-    /// 入口各推一帧。克隆入 owned [`CallFrame`](各来源生命周期不一)。
+    /// 入口各推一帧。克隆入 owned [`CallFrame`](各来源生命周期不一)。`pc` 初始 0,
+    /// 由 [`Self::set_top_frame_pc`] 在 `run()` 分派前持续刷新。
     pub(crate) fn push_frame(&mut self, class: &str, method: &str) {
         self.call_stack.push(CallFrame {
             class: class.to_string(),
             method: method.to_string(),
+            pc: 0,
         });
     }
 
     /// 退一个 Java 栈帧(与 `push_frame` 配对;`interpret_with`/`native::invoke` 出口调)。
     pub(crate) fn pop_frame(&mut self) {
         self.call_stack.pop();
+    }
+
+    /// 刷新**栈顶**帧的 bci(`run()` 分派前调,记当前指令起始)。抛出时即抛点 bci;
+    /// 调用者陷入被调用者后,其顶帧 pc 冻结于 invoke 点(其 run loop 挂起前最后写入)。
+    /// 栈为空(匿名纯算术帧)时无操作。
+    pub(crate) fn set_top_frame_pc(&mut self, pc: u32) {
+        if let Some(top) = self.call_stack.last_mut() {
+            top.pc = pc;
+        }
     }
 
     /// 在抛出点快照当前调用链,绑定到异常句柄(此刻 `call_stack` 满)。
@@ -151,7 +165,56 @@ impl<'a> Vm<'a> {
             .message = Some(message.into());
     }
 
-    /// 格式化异常的栈轨迹文本:`ExcClass[: message]\n\t at Class.method\n …`,
+    /// 解析一帧的源位置后缀(`(File.java:LINE)`),供 [`Self::format_trace`]。经注册表查
+    /// 声明类 → 同名方法且 `pc` 落在 `code` 长度内(重载按 pc 范围消歧)→ 其
+    /// `LineNumberTable` 取最大 `start_pc ≤ pc` 的 `line_number`;配合 `SourceFile` 文件名。
+    /// 无注册表 / 类未加载 / 无表 / 无文件 → 空串(渲染裸 `at Class.method`)。镜像 HotSpot
+    /// `Method::line_number_from_bci`。
+    fn frame_location_suffix(&self, f: &CallFrame) -> String {
+        use crate::classfile::attributes::LineNumberEntry;
+        use crate::constant_pool::ConstantPoolEntry;
+        let Some(reg) = self.registry() else {
+            return String::new();
+        };
+        let Some(lc) = reg.get(&f.class) else {
+            return String::new();
+        };
+        let file = lc.cf.source_file_name();
+        let pc = f.pc as usize;
+        // 取同名且 pc 在 code 长度内的方法,解析最大 start_pc ≤ pc 的行号。
+        let mut best: Option<(u16, u16)> = None; // (start_pc, line_number)
+        for m in &lc.cf.methods {
+            let Ok(ConstantPoolEntry::Utf8(name)) = lc.cf.constant_pool.get(m.name_index) else {
+                continue;
+            };
+            if name.as_str() != f.method {
+                continue;
+            }
+            let Some(code) = &m.code else {
+                continue;
+            };
+            if pc >= code.code.len() {
+                continue;
+            }
+            for &LineNumberEntry { start_pc, line_number } in &code.line_number_table {
+                if start_pc as usize <= pc
+                    && best.is_none_or(|(b_start, _)| start_pc >= b_start)
+                {
+                    best = Some((start_pc, line_number));
+                }
+            }
+            if best.is_some() {
+                break; // 首个匹配(含 pc)的方法即用
+            }
+        }
+        match (file, best.map(|(_, line)| line)) {
+            (Some(f_name), Some(line)) => format!("({f_name}:{line})"),
+            _ => String::new(),
+        }
+    }
+
+
+    /// 格式化异常的栈轨迹文本:`ExcClass[: message]\n\tat Class.method(File.java:LINE)`、
     /// **最内(抛出)帧在前**(Java 惯例)。随后沿 cause 链每跳输出
     /// `\nCaused by: <cause 类>[: message]` + cause 自身帧。深度上限 64(防环/失控链)。
     /// 无快照且无 cause/message → 空串(旧契约)。供测试/诊断;顶层未捕获时自动打印。
@@ -197,6 +260,10 @@ impl<'a> Vm<'a> {
                     out.push_str(&f.class);
                     out.push('.');
                     out.push_str(&f.method);
+                    let loc = self.frame_location_suffix(f);
+                    if !loc.is_empty() {
+                        out.push_str(&loc);
+                    }
                 }
             }
             cur = self

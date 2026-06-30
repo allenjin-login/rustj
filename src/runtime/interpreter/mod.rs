@@ -238,6 +238,8 @@ impl<'a> Interpreter<'a> {
             if pc >= self.code.len() {
                 return Err(VmError::BadPc(pc));
             }
+            // 记当前指令起始 bci 到栈顶帧(供栈轨迹行号):抛出时即抛点,调用者陷入后冻结于 invoke 点。
+            vm.set_top_frame_pc(pc as u32);
             let op = Opcode::from_u8(self.code[pc])?;
             // 单步执行;运行时异常(ThrownException)由本帧异常表捕获,未命中才上传
             // (跨帧则由上层 invoke 的 finish_invoke 扫调用者表)。同帧/跨帧共用 find_handler。

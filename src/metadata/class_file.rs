@@ -52,6 +52,30 @@ impl ClassFile {
             _ => None,
         }
     }
+
+    /// 类级 `SourceFile` 属性(JVMS §4.7.10)指向的源文件名(如 `"Math.java"`)。
+    /// 懒扫 `self.attributes` 按名 "SourceFile"(经 cp 识名),取体 `u2 sourcefile_index` → Utf8。
+    /// 无该属性 / 结构异常 → `None`。供栈轨迹行号渲染 `at Class.method(File.java:LINE)`。
+    pub fn source_file_name(&self) -> Option<&str> {
+        for attr in &self.attributes {
+            let Ok(ConstantPoolEntry::Utf8(name)) = self.constant_pool.get(attr.name_index)
+            else {
+                continue;
+            };
+            if name != "SourceFile" {
+                continue;
+            }
+            if attr.info.len() < 2 {
+                return None;
+            }
+            let idx = u16::from_be_bytes([attr.info[0], attr.info[1]]);
+            match self.constant_pool.get(idx).ok()? {
+                ConstantPoolEntry::Utf8(file) => return Some(file.as_str()),
+                _ => return None,
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

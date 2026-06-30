@@ -196,6 +196,7 @@ mod tests {
                 ],
                 exception_table: Vec::new(),
                 attributes: Vec::new(),
+                line_number_table: Vec::new(),
             }),
         };
         ClassFile {
@@ -264,6 +265,7 @@ mod tests {
                 ],
                 exception_table: Vec::new(),
                 attributes: Vec::new(),
+                line_number_table: Vec::new(),
             }),
         };
         ClassFile {

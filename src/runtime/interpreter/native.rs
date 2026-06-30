@@ -104,6 +104,29 @@ pub(super) fn invoke(
             super::arraycopy::system_arraycopy(vm, src, src_pos, dst, dst_pos, length)
         }
 
+        // Float/Double 的 IEEE-754 位转换 native(均 @IntrinsicCandidate)——位模式原样重解,
+        // Rust `to_bits`/`from_bits` 安全实现。解锁 `Math.<clinit>`(其 negativeZeroFloatBits /
+        // negativeZeroDoubleBits 静态字段初始化器 `Math.java:2043-2044` 调此二 raw native);
+        // 进而解锁 `Arrays.copyOfRange`(`Math.min`)→ `String.<init>` → `StringBuilder.toString`。
+        // 注:`floatToIntBits`/`doubleToLongBits`(非 raw)是纯 Java 字节码包装器(NaN 折叠到
+        // 规范值后转调本 raw native),故不入此表。
+        ("java/lang/Float", "floatToRawIntBits", "(F)I") => match args.first() {
+            Some(Value::Float(f)) => Ok(Value::Int(f.to_bits() as i32)),
+            _ => Err(VmError::BadConstant("floatToRawIntBits 实参须为 float")),
+        },
+        ("java/lang/Float", "intBitsToFloat", "(I)F") => match args.first() {
+            Some(Value::Int(i)) => Ok(Value::Float(f32::from_bits(*i as u32))),
+            _ => Err(VmError::BadConstant("intBitsToFloat 实参须为 int")),
+        },
+        ("java/lang/Double", "doubleToRawLongBits", "(D)J") => match args.first() {
+            Some(Value::Double(d)) => Ok(Value::Long(d.to_bits() as i64)),
+            _ => Err(VmError::BadConstant("doubleToRawLongBits 实参须为 double")),
+        },
+        ("java/lang/Double", "longBitsToDouble", "(J)D") => match args.first() {
+            Some(Value::Long(l)) => Ok(Value::Double(f64::from_bits(*l as u64))),
+            _ => Err(VmError::BadConstant("longBitsToDouble 实参须为 long")),
+        },
+
         // System.currentTimeMillis()J —— jvm.cpp JVM_CurrentTimeMillis:墙钟毫秒(自 Unix 纪元)。
         ("java/lang/System", "currentTimeMillis", "()J") => {
             let millis = SystemTime::now()
@@ -301,6 +324,95 @@ mod tests {
             panic!("须为异常实例");
         };
         assert_eq!(i.class_name(), "java/lang/NullPointerException");
+    }
+
+    #[test]
+    fn float_to_raw_int_bits_is_ieee754_reinterpret() {
+        let mut vm = crate::runtime::Vm::default();
+        // 1.0f 的 IEEE-754 位 = 0x3f800000。
+        assert_eq!(
+            invoke(&mut vm, "java/lang/Float", "floatToRawIntBits", "(F)I", None, &[Value::Float(1.0)])
+                .unwrap(),
+            Value::Int(0x3f800000)
+        );
+        // -0.0f(Math.<clinit> 的 negativeZeroFloatBits 来源)= 0x80000000。
+        assert_eq!(
+            invoke(&mut vm, "java/lang/Float", "floatToRawIntBits", "(F)I", None, &[Value::Float(-0.0)])
+                .unwrap(),
+            Value::Int(0x8000_0000u32 as i32)
+        );
+        // 正无穷 = 0x7f800000。
+        assert_eq!(
+            invoke(&mut vm, "java/lang/Float", "floatToRawIntBits", "(F)I", None, &[Value::Float(f32::INFINITY)])
+                .unwrap(),
+            Value::Int(0x7f800000)
+        );
+    }
+
+    #[test]
+    fn float_to_raw_int_bits_preserves_nan_bits() {
+        // raw 变体**不**折叠 NaN:特定 NaN 位模式原样保留(与 floatToIntBits 折叠到 0x7fc00000 区分)。
+        let mut vm = crate::runtime::Vm::default();
+        let nan = f32::from_bits(0x7fc0_0042); // 一个带尾数的 NaN
+        assert_eq!(
+            invoke(&mut vm, "java/lang/Float", "floatToRawIntBits", "(F)I", None, &[Value::Float(nan)])
+                .unwrap(),
+            Value::Int(0x7fc0_0042)
+        );
+    }
+
+    #[test]
+    fn int_bits_to_float_is_inverse_of_raw() {
+        let mut vm = crate::runtime::Vm::default();
+        // 0x3f800000 → 1.0f;0x80000000 → -0.0f。
+        assert_eq!(
+            invoke(&mut vm, "java/lang/Float", "intBitsToFloat", "(I)F", None, &[Value::Int(0x3f800000)])
+                .unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(
+            invoke(&mut vm, "java/lang/Float", "intBitsToFloat", "(I)F", None, &[Value::Int(0x8000_0000u32 as i32)])
+                .unwrap(),
+            Value::Float(-0.0)
+        );
+        // 位 → NaN(逆:from_bits 与 to_bits 互逆;NaN!=NaN 故比位,不比值)。
+        let got = invoke(&mut vm, "java/lang/Float", "intBitsToFloat", "(I)F", None, &[Value::Int(0x7fc0_0042)])
+            .unwrap();
+        let Value::Float(f) = got else {
+            panic!("须 Float,得 {got:?}");
+        };
+        assert_eq!(f.to_bits(), 0x7fc0_0042, "intBitsToFloat 须原样保留 NaN 位");
+    }
+
+    #[test]
+    fn double_to_raw_long_bits_and_inverse() {
+        let mut vm = crate::runtime::Vm::default();
+        // 1.0d 的 IEEE-754 位 = 0x3ff0000000000000(Math.<clinit> 经此路径取 negativeZeroDoubleBits)。
+        assert_eq!(
+            invoke(&mut vm, "java/lang/Double", "doubleToRawLongBits", "(D)J", None, &[Value::Double(1.0)])
+                .unwrap(),
+            Value::Long(0x3ff0_0000_0000_0000u64 as i64)
+        );
+        // -0.0d = 0x8000000000000000。
+        assert_eq!(
+            invoke(&mut vm, "java/lang/Double", "doubleToRawLongBits", "(D)J", None, &[Value::Double(-0.0)])
+                .unwrap(),
+            Value::Long(i64::MIN)
+        );
+        // 逆:longBitsToDouble。
+        assert_eq!(
+            invoke(&mut vm, "java/lang/Double", "longBitsToDouble", "(J)D", None, &[Value::Long(0x3ff0_0000_0000_0000u64 as i64)])
+                .unwrap(),
+            Value::Double(1.0)
+        );
+        // raw 保留 NaN 位(long 级;NaN!=NaN 故比位)。
+        let nan_bits = 0x7ff8_0000_0000_0042u64 as i64;
+        let got = invoke(&mut vm, "java/lang/Double", "longBitsToDouble", "(J)D", None, &[Value::Long(nan_bits)])
+            .unwrap();
+        let Value::Double(d) = got else {
+            panic!("须 Double,得 {got:?}");
+        };
+        assert_eq!(d.to_bits(), nan_bits as u64, "longBitsToDouble 须原样保留 NaN 位");
     }
 
     #[test]

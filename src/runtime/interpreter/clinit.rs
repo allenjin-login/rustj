@@ -44,7 +44,8 @@ fn run_clinit(lc: &LoadedClass, vm: &mut Vm<'_>) -> Result<(), VmError> {
     };
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
+        .with_exception_table(&code.exception_table)
+        .with_identity(lc.name(), "<clinit>");
     run_with_depth(vm, |vm| interp.interpret_with(&mut frame, vm))?;
     Ok(())
 }
@@ -101,14 +102,19 @@ pub(crate) fn ensure_class_initialized(
         }
         Err(VmError::ThrownException(cause)) => {
             lc.set_init_state(InitState::Failed);
-            // 超类初始化失败已上传 EIIE/NCDFO → 原样;本类 <clinit> 直接抛的业务异常 → 包 EIIE。
+            // 超类初始化失败已上传 EIIE/NCDFO → 原样;本类 <clinit> 直接抛的业务异常 → 包 EIIE,
+            // 并登记 cause(EIIE.cause = 原异常),对应 `new ExceptionInInitializerError(cause)`。
+            // cause 自身轨迹含 clinit 内部位置 → format_trace 渲染 "Caused by:" 不丢根因。
             if is_init_failure_class(vm, cause) {
                 Err(VmError::ThrownException(cause))
             } else {
-                Err(throw_exception(
-                    vm,
-                    "java/lang/ExceptionInInitializerError",
-                ))
+                // throw_exception 恒返 ThrownException(reference);取引用记 cause 后再包 Err。
+                let eiie = throw_exception(vm, "java/lang/ExceptionInInitializerError");
+                let VmError::ThrownException(eiie) = eiie else {
+                    unreachable!("throw_exception 恒返 ThrownException")
+                };
+                vm.record_cause(eiie, cause);
+                Err(VmError::ThrownException(eiie))
             }
         }
         Err(e) => {
@@ -236,6 +242,68 @@ mod tests {
         assert_eq!(
             *reg.get("Cls").unwrap().static_storage.borrow(),
             vec![Slot::Int(5)]
+        );
+    }
+
+    /// 合成 `Cls` 的 `<clinit>` 执行 `1/0` → ArithmeticException(供 EIIE cause 链测试)。
+    /// 复用 [`cp_with_static_field`](含 "<clinit>"/"()V" 于 #5/#6、this/super 于 #7/#8)。
+    fn cls_with_throwing_clinit() -> ClassFile {
+        let clinit = MethodInfo {
+            access_flags: AccessFlags::from_bits(ACC_STATIC),
+            name_index: 5, // "<clinit>"
+            descriptor_index: 6, // "()V"
+            attributes: Vec::new(),
+            code: Some(CodeAttribute {
+                max_stack: 2,
+                max_locals: 0,
+                code: vec![
+                    Opcode::Iconst1 as u8,
+                    Opcode::Iconst0 as u8,
+                    Opcode::Idiv as u8, // 除零 → ArithmeticException
+                    Opcode::Return as u8, // 不可达(idiv 已抛)
+                ],
+                exception_table: Vec::new(),
+                attributes: Vec::new(),
+            }),
+        };
+        ClassFile {
+            minor_version: 0,
+            major_version: 52,
+            constant_pool: cp_with_static_field(),
+            access_flags: AccessFlags::from_bits(0),
+            this_class: 7,
+            super_class: 8,
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![clinit],
+            attributes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clinit_failure_eiie_carries_cause_and_clinit_frame() {
+        // Cls.<clinit> 1/0 → ArithmeticException;ensure_class_initialized 包 EIIE。
+        // 真实 JVM:new ExceptionInInitializerError(cause) 保留 cause;cause 自身轨迹含 clinit 帧。
+        // ClassRegistry::new() 预装 ArithmeticException / ExceptionInInitializerError 引导桩。
+        let mut reg = ClassRegistry::new();
+        reg.load(cls_with_throwing_clinit()).unwrap();
+        let mut vm = Vm::new(&reg);
+        let err = ensure_class_initialized(&mut vm, "Cls").unwrap_err();
+        let VmError::ThrownException(eiie) = err else {
+            panic!("须包为 EIIE(ThrownException),得 {err:?}");
+        };
+        let trace = vm.format_trace(eiie);
+        assert!(
+            trace.starts_with("java/lang/ExceptionInInitializerError"),
+            "头部须为 EIIE,得:\n{trace}"
+        );
+        assert!(
+            trace.contains("Caused by: java/lang/ArithmeticException"),
+            "须渲染 cause 链,得:\n{trace}"
+        );
+        assert!(
+            trace.contains("Cls.<clinit>"),
+            "cause 轨迹须含 clinit 帧,得:\n{trace}"
         );
     }
 }

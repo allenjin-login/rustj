@@ -43,6 +43,10 @@ pub struct Vm<'a> {
     call_stack: Vec<CallFrame>,
     /// 抛出时快照的调用链,键 = 异常对象句柄(`Reference` 单调不复用)。
     traces: HashMap<Reference, Vec<CallFrame>>,
+    /// 异常的包裹 cause 链:wrapper → 被包 cause。对应 `Throwable.cause` /
+    /// `new ExceptionInInitializerError(cause)`;与 `traces` 并行,`format_trace` 追链渲染
+    /// "Caused by:"(EIIE 头 + cause 自身轨迹含 clinit 内部位置)。
+    causes: HashMap<Reference, Reference>,
 }
 
 impl<'a> Vm<'a> {
@@ -56,6 +60,7 @@ impl<'a> Vm<'a> {
             stack_limit: DEFAULT_STACK_LIMIT,
             call_stack: Vec::new(),
             traces: HashMap::new(),
+            causes: HashMap::new(),
         }
     }
 
@@ -117,24 +122,53 @@ impl<'a> Vm<'a> {
         self.traces.insert(exc, self.call_stack.clone());
     }
 
+    /// 登记包裹异常的 cause(对应 `new ExceptionInInitializerError(cause)` 设 `Throwable.cause`)。
+    /// `format_trace` 据此追链渲染 "Caused by:"——被包异常**自身**的轨迹携带真正抛出点
+    /// (如 clinit 内部位置),从而顶层不再丢失根因。
+    pub(crate) fn record_cause(&mut self, wrapper: Reference, cause: Reference) {
+        self.causes.insert(wrapper, cause);
+    }
+
     /// 格式化异常的栈轨迹文本:`ExcClass\n\t at Class.method\n …`,**最内(抛出)帧在前**
-    /// (Java 惯例)。无快照 → 空串。供测试/诊断;顶层未捕获时由 `interpret_with` 自动打印。
+    /// (Java 惯例)。随后沿 [`causes`](Self::record_cause) 追链,每跳输出
+    /// `\nCaused by: <cause 类>` + cause 自身帧。深度上限 64(防环/失控链)。无快照且无
+    /// cause → 空串(保持旧契约)。供测试/诊断;顶层未捕获时由 `interpret_with` 自动打印。
     pub fn format_trace(&self, exc: Reference) -> String {
         use crate::oops::Oop;
-        let Some(frames) = self.traces.get(&exc) else {
+        // 头异常既无帧又无 cause → 无信息,返空串(旧契约)。
+        if !self.traces.contains_key(&exc) && !self.causes.contains_key(&exc) {
             return String::new();
-        };
-        let class = match self.heap.get(exc) {
-            Some(Oop::Instance(i)) => i.class_name().to_string(),
-            _ => "<unknown>".to_string(),
-        };
-        let mut out = String::from(&class);
-        // call_stack 入栈序 = 外层→内层(抛出帧在最末);Java 惯例最内帧首 → 逆序打印。
-        for f in frames.iter().rev() {
-            out.push_str("\n\tat ");
-            out.push_str(&f.class);
-            out.push('.');
-            out.push_str(&f.method);
+        }
+        let mut out = String::new();
+        let mut cur = Some(exc);
+        let mut head = true;
+        let mut depth = 0u32;
+        while let Some(e) = cur {
+            if depth >= 64 {
+                break;
+            }
+            depth += 1;
+            let class = match self.heap.get(e) {
+                Some(Oop::Instance(i)) => i.class_name().to_string(),
+                _ => "<unknown>".to_string(),
+            };
+            if head {
+                out.push_str(&class);
+                head = false;
+            } else {
+                out.push_str("\nCaused by: ");
+                out.push_str(&class);
+            }
+            // call_stack 入栈序 = 外层→内层(抛出帧在最末);Java 惯例最内帧首 → 逆序打印。
+            if let Some(frames) = self.traces.get(&e) {
+                for f in frames.iter().rev() {
+                    out.push_str("\n\tat ");
+                    out.push_str(&f.class);
+                    out.push('.');
+                    out.push_str(&f.method);
+                }
+            }
+            cur = self.causes.get(&e).copied();
         }
         out
     }
@@ -150,6 +184,7 @@ impl Default for Vm<'_> {
             stack_limit: DEFAULT_STACK_LIMIT,
             call_stack: Vec::new(),
             traces: HashMap::new(),
+            causes: HashMap::new(),
         }
     }
 }

@@ -15,7 +15,7 @@ use crate::oops::{InitState, LoadedClass, Oop};
 use crate::runtime::{Frame, Reference, Vm};
 
 use super::invoke::run_with_depth;
-use super::{throw_exception, Interpreter, VmError};
+use super::{set_throwable_field, throw_exception, Interpreter, VmError};
 
 /// 在 `cf` 的方法表中找 `<clinit>()V`,取其 `Code`(无则 `None`)。
 fn find_clinit(cf: &ClassFile) -> Option<&CodeAttribute> {
@@ -114,6 +114,15 @@ pub(crate) fn ensure_class_initialized(
                     unreachable!("throw_exception 恒返 ThrownException")
                 };
                 vm.record_cause(eiie, cause);
+                // 同步到真 Throwable 的 cause 字段(镜像 capture_backtrace),使真 getCause()
+                // 字节码(Throwable.java:448 `return (cause==this ? null : cause);`)读回根因引用。
+                set_throwable_field(
+                    vm,
+                    eiie,
+                    "cause",
+                    crate::metadata::descriptor::FieldType::Class("java/lang/Throwable".into()),
+                    crate::runtime::Slot::Reference(cause),
+                );
                 Err(VmError::ThrownException(eiie))
             }
         }

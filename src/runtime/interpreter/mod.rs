@@ -78,6 +78,19 @@ pub(super) fn throw_exception_with_message(
     let err = throw_exception(vm, class_name);
     if let VmError::ThrownException(r) = err {
         vm.record_message(r, message);
+        // 把 message 也同步到真 Throwable 的 detailMessage 字段(镜像 capture_backtrace),
+        // 使 JVM 自动抛出(不经真 <init>)的异常经真 getMessage() 字节码能读回正确消息
+        // (Throwable.java:409 `return detailMessage;`)。intern 失败(String 未预载)→
+        // 最佳努力跳过(format_trace 仍读 exception_meta 的并行镜像)。
+        if let Ok(msg_ref) = string::intern(vm, message) {
+            set_throwable_field(
+                vm,
+                r,
+                "detailMessage",
+                crate::metadata::descriptor::FieldType::Class("java/lang/String".into()),
+                crate::runtime::Slot::Reference(msg_ref),
+            );
+        }
         VmError::ThrownException(r)
     } else {
         err
@@ -116,6 +129,36 @@ pub(super) fn capture_backtrace(vm: &mut Vm<'_>, exc: Reference) {
     if let Some(crate::oops::Oop::Instance(i)) = vm.heap_mut().get_mut(exc) {
         i.set_field(bt_ord, Slot::Reference(exc));
         i.set_field(depth_ord, Slot::Int(depth));
+    }
+}
+
+/// 在**真** Throwable 实例上置一实例字段(按名 + 类型解析全局序号,沿用 4.2 扁平前缀不变量:
+/// 子类布局是超类前缀 → 序号在子类实例一致),使真字节码(`getMessage` 读 `detailMessage` /
+/// `getCause` 读 `cause`)可读回。桩 Throwable(无该字段,未经真 `<init>`)→ `instance_field`
+/// 返 None → 静默跳过。对应 [`capture_backtrace`] 之于 `backtrace`/`depth`:把 message/cause
+/// 同步到真字段,补齐 JVM 自动抛出(不经真 `<init>`)的缺口。失败不影响 `format_trace`
+/// (其读 `exception_meta` 的并行镜像)。
+pub(super) fn set_throwable_field(
+    vm: &mut Vm<'_>,
+    exc: Reference,
+    name: &str,
+    ft: crate::metadata::descriptor::FieldType,
+    slot: crate::runtime::Slot,
+) {
+    let ord = {
+        let Some(reg) = vm.registry() else {
+            return;
+        };
+        let Some(lc) = reg.get("java/lang/Throwable") else {
+            return;
+        };
+        let Some(ord) = reg.instance_field(lc, name, &ft) else {
+            return;
+        };
+        ord
+    };
+    if let Some(crate::oops::Oop::Instance(i)) = vm.heap_mut().get_mut(exc) {
+        i.set_field(ord, slot);
     }
 }
 

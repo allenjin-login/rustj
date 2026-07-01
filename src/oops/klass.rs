@@ -260,6 +260,9 @@ impl ClassRegistry {
     /// 虚分派:从 `class_name` 沿超类链找首个 (name, desc) 方法 → (声明类, 方法)。
     ///
     /// 对应 HotSpot `InstanceKlass::find_method` 上行查找(我们用线性查找,不用 vtable)。
+    /// 链**含 `java/lang/Object`**:子类实例上未覆写的 `getClass`/`hashCode`/`toString`/
+    /// `equals` 等须解析到 `Object` 的声明法(真 Object 有这些 native;引导桩仅有 `<init>`,
+    /// 走进去也匹配不到 → 返 None,与旧短路等价,故对桩无害)。
     pub fn find_virtual_method<'a>(
         &'a self,
         class_name: &str,
@@ -276,11 +279,7 @@ impl ClassRegistry {
             {
                 return Some((lc, m));
             }
-            current = lc
-                .super_class_name
-                .as_deref()
-                .filter(|s| *s != "java/lang/Object")
-                .and_then(|s| self.get(s));
+            current = lc.super_class_name.as_deref().and_then(|s| self.get(s));
         }
         None
     }

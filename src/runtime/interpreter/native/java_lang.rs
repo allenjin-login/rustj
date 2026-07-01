@@ -4,7 +4,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::oops::{ClassOop, Oop};
+use crate::oops::Oop;
 use crate::runtime::{Reference, Slot, Value, Vm, VmError};
 
 use super::super::{capture_backtrace, throw_exception};
@@ -35,6 +35,23 @@ pub(super) fn dispatch(
         ("java/lang/Object", "hashCode", "()I") => {
             let id = this.and_then(Reference::id).unwrap_or(0) as i32;
             Ok(Value::Int(id))
+        }
+
+        // Object.getClass()Ljava/lang/Class; —— Object.java:68 public final native
+        // (HotSpot 为 intrinsic)。返接收者运行时类的 Class 镜像(intern:同类恒同引用,使
+        // `obj.getClass() == Foo.class` 成立)。Instance→类名;Array→数组描述符([I/…);
+        // Class 镜像自身→java.lang.Class。
+        ("java/lang/Object", "getClass", "()Ljava/lang/Class;") => {
+            let Some(r) = this else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let name = match vm.heap().get(r) {
+                Some(Oop::Instance(i)) => i.class_name().to_string(),
+                Some(Oop::Array(a)) => a.class_name().to_string(),
+                Some(Oop::Class(_)) => "java/lang/Class".to_string(),
+                _ => return Err(throw_exception(vm, "java/lang/InternalError")),
+            };
+            Ok(Value::Reference(vm.intern_class_mirror(&name)))
         }
 
         // System.arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V —— jvm.cpp:293-305
@@ -113,8 +130,7 @@ pub(super) fn dispatch(
                 // 对应 jvm.cpp 的 THROW_MSG_NULL(ClassNotFoundException, utf)。
                 return Err(throw_exception(vm, "java/lang/ClassNotFoundException"));
             }
-            let cls = Oop::Class(ClassOop::new(text));
-            Ok(Value::Reference(vm.heap_mut().alloc(cls)))
+            Ok(Value::Reference(vm.intern_class_mirror(&text)))
         }
 
         // Class.desiredAssertionStatus()Z —— javac 断言初始化(`!Foo.class.desiredAssertionStatus()`)
@@ -263,10 +279,8 @@ fn init_stack_trace_elements(
             Some(fl) => Some(super::super::string::intern(vm, &fl)?),
             None => None,
         };
-        // declaringClassObject = 声明类的 Class 镜像(供 computeFormat 的非 null 哨兵)。
-        let dco_ref = vm
-            .heap_mut()
-            .alloc(Oop::Class(ClassOop::new(f.class.clone())));
+        // declaringClassObject = 声明类的 Class 镜像(intern;供 computeFormat 的非 null 哨兵)。
+        let dco_ref = vm.intern_class_mirror(&f.class);
 
         if let Some(Oop::Instance(inst)) = vm.heap_mut().get_mut(ste_ref) {
             inst.set_field(ord_dc, Slot::Reference(dc_ref));

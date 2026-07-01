@@ -1297,15 +1297,13 @@ impl<'a> Interpreter<'a> {
                 frame.operands.push_reference(r)?;
             }
             ConstantPoolEntry::Class { name_index } => {
-                // 类字面量(`Foo.class`):ldc 取 CONSTANT_Class → 推 Class 镜像。
-                // 对应 HotSpot `ldc` 解析 Class 常量 → `java_lang_Class::as_Klass` 的镜像。
+                // 类字面量(`Foo.class`):ldc 取 CONSTANT_Class → 推 Class 镜像(intern,
+                // 同类恒同引用)。对应 HotSpot `ldc` 解析 Class 常量 → `Klass::_java_mirror`。
                 let name = match self.cp.get(*name_index)? {
                     ConstantPoolEntry::Utf8(s) => s.clone(),
                     _ => return Err(VmError::BadConstant("ldc Class 须指向 Utf8 名")),
                 };
-                let r = vm
-                    .heap_mut()
-                    .alloc(crate::oops::Oop::Class(crate::oops::ClassOop::new(name)));
+                let r = vm.intern_class_mirror(&name);
                 frame.operands.push_reference(r)?;
             }
             _ => {

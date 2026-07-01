@@ -61,6 +61,10 @@ pub struct Vm<'a> {
     call_stack: Vec<CallFrame>,
     /// 异常 → 元数据(帧 / cause / detailMessage),键 = 异常对象句柄。
     exception_meta: HashMap<Reference, ExceptionMeta>,
+    /// Class 镜像 intern 表(4.10t):内部类名(`java/lang/Foo`、`int`、`[I` …)→ 唯一 Class
+    /// 镜像引用。对应 HotSpot 每个 `Klass` 持有单一 `_java_mirror`(Class 对象)。保证
+    /// `Foo.class == Foo.class`、`obj.getClass() == Foo.class` 等 Class 对象身份相等。
+    class_mirrors: HashMap<String, Reference>,
 }
 
 impl<'a> Vm<'a> {
@@ -74,6 +78,7 @@ impl<'a> Vm<'a> {
             stack_limit: DEFAULT_STACK_LIMIT,
             call_stack: Vec::new(),
             exception_meta: HashMap::new(),
+            class_mirrors: HashMap::new(),
         }
     }
 
@@ -102,6 +107,20 @@ impl<'a> Vm<'a> {
     /// 字符串 intern 池(可变)。
     pub(crate) fn string_pool_mut(&mut self) -> &mut StringPool {
         &mut self.string_pool
+    }
+
+    /// Class 镜像 intern(4.10t):同一内部类名恒返回同一 Class 镜像引用(对应 HotSpot 每
+    /// `Klass` 的单一 `_java_mirror`)。首次分配 `Oop::Class` 并缓存;后续命中直接返。
+    /// 使 `Foo.class == Foo.class`、`obj.getClass() == Foo.class` 等 Class 身份相等成立。
+    pub(crate) fn intern_class_mirror(&mut self, name: &str) -> Reference {
+        if let Some(r) = self.class_mirrors.get(name) {
+            return *r;
+        }
+        let r = self.heap.alloc(crate::oops::Oop::Class(crate::oops::ClassOop::new(
+            name.to_string(),
+        )));
+        self.class_mirrors.insert(name.to_string(), r);
+        r
     }
 
     /// 类注册表(若启用)。
@@ -295,6 +314,7 @@ impl Default for Vm<'_> {
             stack_limit: DEFAULT_STACK_LIMIT,
             call_stack: Vec::new(),
             exception_meta: HashMap::new(),
+            class_mirrors: HashMap::new(),
         }
     }
 }

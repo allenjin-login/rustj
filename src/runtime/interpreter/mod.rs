@@ -61,8 +61,9 @@ pub(super) fn throw_exception(vm: &mut Vm<'_>, class_name: &str) -> VmError {
         .unwrap_or_else(|| panic!("{class_name} 应作为引导桩已加载(内部不变量)"));
     let oop = Oop::Instance(reg.new_instance(lc));
     let reference = vm.heap_mut().alloc(oop);
-    // 捕获抛出点调用链(此刻 call_stack 满),供 format_trace / 顶层自动打印。
-    vm.record_trace(reference);
+    // 捕获抛出点 backtrace(快照调用链 + 置真 Throwable 的 backtrace/depth 字段),
+    // 供 format_trace / 真 getStackTrace / 顶层自动打印。
+    capture_backtrace(vm, reference);
     VmError::ThrownException(reference)
 }
 
@@ -80,6 +81,41 @@ pub(super) fn throw_exception_with_message(
         VmError::ThrownException(r)
     } else {
         err
+    }
+}
+
+/// 捕获 `Throwable` 的 backtrace(对应 `Throwable.fillInStackTrace(int)` native,
+/// Throwable.java:822):快照调用链入 `exception_meta`(rustj 的 backtrace 镜像),并在
+/// **真** Throwable 实例上置 `backtrace`= 自指 + `depth`= 帧数——使真
+/// `getOurStackTrace` → `StackTraceElement.of(backtrace, depth)`(STE.java:556)→ native
+/// `initStackTraceElements(ste, this, depth)` 能据 `this` 回填帧。桩 Throwable(无
+/// `backtrace`/`depth` 字段,未经真 `<init>`)→ 仅 `record_trace`,其 getStackTrace 路径
+/// 另走。`fillInStackTrace` native 与 [`throw_exception`] 均调之。
+pub(super) fn capture_backtrace(vm: &mut Vm<'_>, exc: Reference) {
+    use crate::metadata::descriptor::FieldType;
+    use crate::runtime::Slot;
+    vm.record_trace(exc);
+    // 真 Throwable:置 backtrace(自指,非 null 哨兵)+ depth。字段解析失败(桩)→ 静默跳过。
+    let depth = vm.exception_frames(exc).map_or(0, |f| f.len() as i32);
+    let object_ft = FieldType::Class("java/lang/Object".into());
+    let (bt_ord, depth_ord) = {
+        let Some(reg) = vm.registry() else {
+            return;
+        };
+        let Some(lc) = reg.get("java/lang/Throwable") else {
+            return;
+        };
+        let Some(bt) = reg.instance_field(lc, "backtrace", &object_ft) else {
+            return;
+        };
+        let Some(d) = reg.instance_field(lc, "depth", &FieldType::Int) else {
+            return;
+        };
+        (bt, d)
+    };
+    if let Some(crate::oops::Oop::Instance(i)) = vm.heap_mut().get_mut(exc) {
+        i.set_field(bt_ord, Slot::Reference(exc));
+        i.set_field(depth_ord, Slot::Int(depth));
     }
 }
 

@@ -165,20 +165,16 @@ impl<'a> Vm<'a> {
             .message = Some(message.into());
     }
 
-    /// 解析一帧的源位置后缀(`(File.java:LINE)`),供 [`Self::format_trace`]。经注册表查
-    /// 声明类 → 同名方法且 `pc` 落在 `code` 长度内(重载按 pc 范围消歧)→ 其
-    /// `LineNumberTable` 取最大 `start_pc ≤ pc` 的 `line_number`;配合 `SourceFile` 文件名。
-    /// 无注册表 / 类未加载 / 无表 / 无文件 → 空串(渲染裸 `at Class.method`)。镜像 HotSpot
-    /// `Method::line_number_from_bci`。
-    fn frame_location_suffix(&self, f: &CallFrame) -> String {
+    /// 解析一帧的源文件名 + 行号(`(file, line)`),供 [`Self::format_trace`] 与
+    /// `StackTraceElement.initStackTraceElements` 构造 STE。经注册表查声明类 → 同名方法且
+    /// `pc` 落在 `code` 长度内(重载按 pc 范围消歧)→ 其 `LineNumberTable` 取最大
+    /// `start_pc ≤ pc` 的 `line_number`;配合 `SourceFile` 文件名。文件名与行号**须同时**
+    /// 可得(对齐 HotSpot:无文件则不印行);否则 `None`。镜像 `Method::line_number_from_bci`。
+    pub(crate) fn frame_source(&self, f: &CallFrame) -> Option<(&str, u16)> {
         use crate::classfile::attributes::LineNumberEntry;
         use crate::constant_pool::ConstantPoolEntry;
-        let Some(reg) = self.registry() else {
-            return String::new();
-        };
-        let Some(lc) = reg.get(&f.class) else {
-            return String::new();
-        };
+        let reg = self.registry()?;
+        let lc = reg.get(&f.class)?;
         let file = lc.cf.source_file_name();
         let pc = f.pc as usize;
         // 取同名且 pc 在 code 长度内的方法,解析最大 start_pc ≤ pc 的行号。
@@ -208,9 +204,23 @@ impl<'a> Vm<'a> {
             }
         }
         match (file, best.map(|(_, line)| line)) {
-            (Some(f_name), Some(line)) => format!("({f_name}:{line})"),
-            _ => String::new(),
+            (Some(f_name), Some(line)) => Some((f_name, line)),
+            _ => None,
         }
+    }
+
+    /// 渲染一帧的源位置后缀(`(File.java:LINE)`);无文件/无行号 → 空串(裸 `at Class.method`)。
+    fn frame_location_suffix(&self, f: &CallFrame) -> String {
+        match self.frame_source(f) {
+            Some((file, line)) => format!("({file}:{line})"),
+            None => String::new(),
+        }
+    }
+
+    /// 取异常捕获的调用链快照(`Throwable.fillInStackTrace` / `throw_exception` 捕获)。
+    /// 供 `Throwable.getStackTrace` native 构造 `StackTraceElement[]`。键 = 异常句柄。
+    pub(crate) fn exception_frames(&self, exc: Reference) -> Option<&[CallFrame]> {
+        self.exception_meta.get(&exc).map(|m| m.frames.as_slice())
     }
 
 

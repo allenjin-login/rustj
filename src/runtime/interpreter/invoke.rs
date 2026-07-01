@@ -441,6 +441,24 @@ pub(super) fn invoke_virtual(
         return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
     }
 
+    // 数组 receiver:仅 `Object.clone()` 浅拷贝(同描述符 + 复制元素槽),解锁
+    // `Throwable.getOurStackTrace().clone()`(StackTraceElement[])等;其余数组方法顺延。
+    if let Some(Oop::Array(a)) = vm.heap().get(objref) {
+        if method_name == "clone" {
+            let copy = a.clone();
+            let r = vm.heap_mut().alloc(Oop::Array(copy));
+            return finish_invoke(
+                interp,
+                frame,
+                vm,
+                caller_pc,
+                Ok(Value::Reference(r)),
+                md.return_type,
+            );
+        }
+        return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
+    }
+
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
     let runtime_class = vm
         .heap()
@@ -448,9 +466,7 @@ pub(super) fn invoke_virtual(
         .ok_or(VmError::BadConstant("invokevirtual 引用悬空"))?;
     let runtime_class = match runtime_class {
         Oop::Instance(i) => i.class_name().to_string(),
-        Oop::Array(_) => {
-            return Err(VmError::BadConstant("invoke 目标为数组(数组方法 clone 等顺延)"))
-        }
+        Oop::Array(_) => unreachable!("数组 receiver 已先行 clone/顺延分派"),
         Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
     };
 
@@ -530,6 +546,23 @@ pub(super) fn invoke_interface(
         return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
     }
 
+    // 数组 receiver:仅 `Object.clone()` 浅拷贝(同 invoke_virtual)。
+    if let Some(Oop::Array(a)) = vm.heap().get(objref) {
+        if method_name == "clone" {
+            let copy = a.clone();
+            let r = vm.heap_mut().alloc(Oop::Array(copy));
+            return finish_invoke(
+                interp,
+                frame,
+                vm,
+                caller_pc,
+                Ok(Value::Reference(r)),
+                md.return_type,
+            );
+        }
+        return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
+    }
+
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
     let runtime_class = vm
         .heap()
@@ -537,9 +570,7 @@ pub(super) fn invoke_interface(
         .ok_or(VmError::BadConstant("invokeinterface 引用悬空"))?;
     let runtime_class = match runtime_class {
         Oop::Instance(i) => i.class_name().to_string(),
-        Oop::Array(_) => {
-            return Err(VmError::BadConstant("invoke 目标为数组(数组方法 clone 等顺延)"))
-        }
+        Oop::Array(_) => unreachable!("数组 receiver 已先行 clone/顺延分派"),
         Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
     };
 

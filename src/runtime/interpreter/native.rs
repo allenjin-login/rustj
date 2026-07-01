@@ -18,9 +18,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::oops::{ClassOop, Oop};
-use crate::runtime::{Reference, Vm};
+use crate::runtime::{Reference, Slot, Vm};
 
-use super::{throw_exception, Value, VmError};
+use super::{capture_backtrace, throw_exception, Value, VmError};
 
 /// 派发一个 native 方法调用。
 ///
@@ -44,12 +44,12 @@ pub(super) fn invoke(
     vm.push_frame(class, name);
     let result = match (class, name, desc) {
         // Throwable.fillInStackTrace(I)Ljava/lang/Throwable; —— 每个 Throwable 构造器首调
-        // (捕获栈回溯)。rustj 在此快照当前调用链(record_trace),对应 HotSpot 的栈回溯捕获;
-        // 返回 this 以便链式。stub 异常不经真 <init>,其轨迹由 throw_exception 直接捕获。
+        // (捕获栈回溯)。rustj 经 capture_backtrace 快照调用链入 exception_meta 并置真
+        // Throwable 的 backtrace/depth 字段,对应 HotSpot 的栈回溯捕获;返回 this 以便链式。
         ("java/lang/Throwable", "fillInStackTrace", "(I)Ljava/lang/Throwable;") => {
             match this {
                 Some(r) => {
-                    vm.record_trace(r);
+                    capture_backtrace(vm, r);
                     Ok(Value::Reference(r))
                 }
                 None => Err(throw_exception(vm, "java/lang/NullPointerException")),
@@ -171,6 +171,21 @@ pub(super) fn invoke(
         // 由 invoke 路径按 "java/lang/Class" 经本表分派(见 invoke_virtual/interface)。
         ("java/lang/Class", "desiredAssertionStatus", "()Z") => Ok(Value::Int(0)),
 
+        // Class.getClassLoader0()Ljava/lang/ClassLoader; —— Class.java:987(字段读字节码),
+        // 但 Oop::Class 镜像经本表分派(无真实 ClassLoader 字段)。rustj 视所有类为引导类
+        // → null。真 STE.computeFormat(STE.java:466)据此:`loader instanceof BuiltinClassLoader`
+        // 对 null 安全(instanceof null → 0),不走该分支。
+        ("java/lang/Class", "getClassLoader0", "()Ljava/lang/ClassLoader;") => {
+            Ok(Value::Reference(Reference::null()))
+        }
+        // Class.getModule()Ljava/lang/Module; —— Class.java:1005。镜像无 Module 字段 → null。
+        // computeFormat 传 m 给 isHashedInJavaBase(m)(STE.java:512):其首判
+        // `!VM.isModuleSystemInited()`(VM.java:92,字节码读 initLevel,默认 0 < MODULE_SYSTEM_INITED
+        // → 假;故 !假 = 真 → 返真,短路,不 deref m)→ format 取默认,无 NPE。
+        ("java/lang/Class", "getModule", "()Ljava/lang/Module;") => {
+            Ok(Value::Reference(Reference::null()))
+        }
+
         // Runtime.maxMemory()J —— jvm.cpp JVM_MaxMemory:堆上限。rustj 堆为无界 Vec → 取 i64::MAX
         // (VM.saveProperties 存进 directMemory,本场景不用;真值无意义)。
         ("java/lang/Runtime", "maxMemory", "()J") => Ok(Value::Long(i64::MAX)),
@@ -211,11 +226,129 @@ pub(super) fn invoke(
             Ok(Value::Reference(super::string::intern(vm, &text)?))
         }
 
+        // StackTraceElement.initStackTraceElements(ste[], backtrace, depth)V —— STE.java:590
+        // private static native,由 STE.of(STE.java:556,经 Throwable.getOurStackTrace 转调)
+        // 逐元素回填。backtrace = capture_backtrace 置入的 Throwable 自指句柄,据此从
+        // exception_meta 取捕获帧,**逆序**(最内帧 → ste[0],Java 惯例)回填每个 STE 的
+        // declaringClass/methodName/fileName/lineNumber + declaringClassObject(供随后
+        // finishInit→computeFormat 判类加载器/模块;rustj Class 镜像无此二者,native 返 null)。
+        ("java/lang/StackTraceElement", "initStackTraceElements",
+         "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V") => {
+            let (elements, backtrace, depth) =
+                match (args.first(), args.get(1), args.get(2)) {
+                    (Some(Value::Reference(e)), Some(Value::Reference(b)), Some(Value::Int(d))) => {
+                        (*e, *b, *d)
+                    }
+                    _ => return Err(VmError::BadConstant("initStackTraceElements 实参缺失/类型不符")),
+                };
+            init_stack_trace_elements(vm, elements, backtrace, depth)?;
+            Ok(Value::Void)
+        }
+
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     };
     vm.pop_frame();
     result
+}
+
+/// `StackTraceElement.initStackTraceElements(ste[], backtrace, depth)` 的实现(见分派臂注释)。
+/// 据 backtrace(= Throwable 自指句柄)取 exception_meta 捕获帧,**逆序**回填 ste[i] 五字段。
+fn init_stack_trace_elements(
+    vm: &mut Vm<'_>,
+    elements: Reference,
+    backtrace: Reference,
+    depth: i32,
+) -> Result<(), VmError> {
+    use crate::metadata::descriptor::FieldType;
+
+    const STE: &str = "java/lang/StackTraceElement";
+    if depth <= 0 {
+        return Ok(());
+    }
+
+    // 取捕获帧(exception_meta),逆序使最内帧对应 ste[0](Java 惯例)。to_vec 释放共享借用。
+    let frames: Vec<crate::runtime::vm::CallFrame> = vm
+        .exception_frames(backtrace)
+        .map(|f| f.to_vec())
+        .unwrap_or_default();
+    if frames.is_empty() {
+        return Ok(());
+    }
+
+    // 解析 STE 五字段序号(借注册表 'a;出块 owned,后续可 &mut vm)。
+    let str_ft = FieldType::Class("java/lang/String".into());
+    let class_ft = FieldType::Class("java/lang/Class".into());
+    let (ord_dc, ord_mn, ord_fn, ord_ln, ord_dco) = {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("initStackTraceElements 需注册表"))?;
+        let lc = reg
+            .get(STE)
+            .ok_or(VmError::BadConstant("StackTraceElement 未预载"))?;
+        let ord_dc = reg
+            .instance_field(lc, "declaringClass", &str_ft)
+            .ok_or(VmError::BadConstant("STE.declaringClass 未找到"))?;
+        let ord_mn = reg
+            .instance_field(lc, "methodName", &str_ft)
+            .ok_or(VmError::BadConstant("STE.methodName 未找到"))?;
+        let ord_fn = reg
+            .instance_field(lc, "fileName", &str_ft)
+            .ok_or(VmError::BadConstant("STE.fileName 未找到"))?;
+        let ord_ln = reg
+            .instance_field(lc, "lineNumber", &FieldType::Int)
+            .ok_or(VmError::BadConstant("STE.lineNumber 未找到"))?;
+        let ord_dco = reg
+            .instance_field(lc, "declaringClassObject", &class_ft)
+            .ok_or(VmError::BadConstant("STE.declaringClassObject 未找到"))?;
+        (ord_dc, ord_mn, ord_fn, ord_ln, ord_dco)
+    };
+
+    // 逐帧(逆序)回填 ste[i]。
+    let n = (depth as usize).min(frames.len());
+    for i in 0..n {
+        let f = &frames[frames.len() - 1 - i];
+        let declaring_dotted = f.class.replace('/', ".");
+        let method = f.method.clone();
+        let (file_owned, line) = match vm.frame_source(f) {
+            Some((fl, ln)) => (Some(fl.to_string()), ln),
+            None => (None, 0),
+        };
+
+        // 取 ste[i] 句柄(借堆读 → owned Reference,释放借用后再 &mut vm)。
+        let ste_ref = match vm.heap().get(elements) {
+            Some(Oop::Array(a)) => match a.element(i) {
+                Slot::Reference(r) => Some(r),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(ste_ref) = ste_ref else {
+            continue;
+        };
+
+        let dc_ref = super::string::intern(vm, &declaring_dotted)?;
+        let mn_ref = super::string::intern(vm, &method)?;
+        let fn_ref = match file_owned {
+            Some(fl) => Some(super::string::intern(vm, &fl)?),
+            None => None,
+        };
+        // declaringClassObject = 声明类的 Class 镜像(供 computeFormat 的非 null 哨兵)。
+        let dco_ref = vm
+            .heap_mut()
+            .alloc(Oop::Class(ClassOop::new(f.class.clone())));
+
+        if let Some(Oop::Instance(inst)) = vm.heap_mut().get_mut(ste_ref) {
+            inst.set_field(ord_dc, Slot::Reference(dc_ref));
+            inst.set_field(ord_mn, Slot::Reference(mn_ref));
+            if let Some(fr) = fn_ref {
+                inst.set_field(ord_fn, Slot::Reference(fr));
+            }
+            inst.set_field(ord_ln, Slot::Int(line as i32));
+            inst.set_field(ord_dco, Slot::Reference(dco_ref));
+        }
+    }
+    Ok(())
 }
 
 /// 原语关键字名(`"int"`/…/`"void"`)判定——`name2type` 的等价物

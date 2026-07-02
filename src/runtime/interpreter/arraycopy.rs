@@ -276,6 +276,7 @@ pub(super) fn element_component(vm: &Vm<'_>, r: Reference) -> Result<String, VmE
         Some(Oop::Instance(i)) => format!("L{};", i.class_name()),
         Some(Oop::Array(a)) => a.class_name().to_string(),
         Some(Oop::Class(_)) => "Ljava/lang/Class;".to_string(),
+        Some(Oop::Lambda(l)) => format!("L{};", l.sam_type()),
         None => return Err(VmError::BadConstant("arraycopy 元素引用悬空")),
     })
 }

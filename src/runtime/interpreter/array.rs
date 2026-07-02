@@ -173,7 +173,7 @@ pub(super) fn array_length(frame: &mut Frame, vm: &mut Vm<'_>) -> Result<(), VmE
         .ok_or(VmError::BadConstant("arraylength 引用悬空"))?
     {
         Oop::Array(a) => a.length(),
-        Oop::Instance(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) | Oop::Lambda(_) => {
             return Err(VmError::BadConstant("arraylength 目标非数组"))
         }
     };
@@ -200,7 +200,7 @@ pub(super) fn array_load(
         .ok_or(VmError::BadConstant("aload 引用悬空"))?
     {
         Oop::Array(a) => a.length(),
-        Oop::Instance(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) | Oop::Lambda(_) => {
             return Err(VmError::BadConstant("aload 目标非数组"))
         }
     };
@@ -216,7 +216,7 @@ pub(super) fn array_load(
         .ok_or(VmError::BadConstant("aload 引用悬空"))?
     {
         Oop::Array(a) => a.element(index as usize),
-        Oop::Instance(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) | Oop::Lambda(_) => {
             return Err(VmError::BadConstant("aload 目标非数组"))
         }
     };
@@ -306,7 +306,7 @@ pub(super) fn array_store(
         .ok_or(VmError::BadConstant("astore 引用悬空"))?
     {
         Oop::Array(a) => a.length(),
-        Oop::Instance(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) | Oop::Lambda(_) => {
             return Err(VmError::BadConstant("astore 目标非数组"))
         }
     };
@@ -345,7 +345,7 @@ pub(super) fn array_store(
         .ok_or(VmError::BadConstant("astore 引用悬空"))?
     {
         Oop::Array(a) => a.set_element(idx, value),
-        Oop::Instance(_) | Oop::Class(_) => {
+        Oop::Instance(_) | Oop::Class(_) | Oop::Lambda(_) => {
             return Err(VmError::BadConstant("astore 目标非数组"))
         }
     }

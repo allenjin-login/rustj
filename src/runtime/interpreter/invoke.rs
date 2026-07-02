@@ -18,7 +18,8 @@ use crate::classfile::attributes::CodeAttribute;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_method_descriptor, FieldType, ReturnDescriptor};
 use crate::metadata::{ClassFile, MethodInfo};
-use crate::oops::{LoadedClass, Oop};
+use crate::oops::lambda::REF_INVOKE_STATIC;
+use crate::oops::{LoadedClass, LambdaOop, Oop};
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
 use super::{clinit, exception, native, throw_exception, Interpreter, Value, VmError};
@@ -335,6 +336,69 @@ fn run_callee(
     finish_invoke(interp, frame, vm, caller_pc, result, return_type)
 }
 
+/// SAM 调用派发到 lambda 实现方法(对应 `LambdaMetafactory` 生成的合成类实现 SAM)。
+/// rustj 沿「按名特判」综合:闭包记实现方法身份 + 捕获;SAM 调用时**捕获前置 ++ SAM 实参**
+/// 交给实现方法执行(实现字节码本就期望「捕获…,SAM 形参…」序)。
+///
+/// 仅 `REF_INVOKE_STATIC` 派发——覆盖无状态 lambda 体 + 静态方法引用 + 实例捕获 lambda
+/// (javac 把 lambda 体编为 `private static`,实例捕获把 `this` 作显式捕获前置)。其余句柄
+/// 种类(实例方法引用 / 构造器引用)顺延报错(spec 4.10aa §4)。
+fn dispatch_lambda(
+    interp: &Interpreter<'_>,
+    frame: &mut Frame,
+    vm: &mut Vm<'_>,
+    caller_pc: usize,
+    lambda: LambdaOop,
+    args: Vec<Arg>,
+    return_type: ReturnDescriptor,
+) -> Result<InvokeFlow, VmError> {
+    if lambda.impl_kind() != REF_INVOKE_STATIC {
+        return Err(VmError::BadConstant(
+            "lambda 实现方法句柄种类未支持(仅 REF_invokeStatic)",
+        ));
+    }
+    let impl_class = lambda.impl_class().to_string();
+    let impl_name = lambda.impl_name().to_string();
+    let impl_desc = lambda.impl_desc().to_string();
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("lambda 派发需要类注册表"))?;
+    clinit::ensure_class_initialized(vm, &impl_class)?;
+    let target_lc = registry
+        .get(&impl_class)
+        .ok_or(VmError::BadConstant("lambda 实现类未加载"))?;
+    let target_method = find_method(&target_lc.cf, &impl_name, &impl_desc)?;
+    // 捕获(按捕获时类型序)前置 ++ SAM 实参 → 实现方法局部变量(静态无 this)。
+    let mut all = Vec::with_capacity(lambda.captures().len() + args.len());
+    for v in lambda.captures().iter().copied() {
+        all.push(arg_from_value(v)?);
+    }
+    all.extend(args);
+    // 实现为 native(方法引用到 native 静态,如 Integer::valueOf)→ 内置 native 分派(无 this)。
+    if target_method.access_flags.is_native() {
+        return dispatch_native(
+            interp, frame, vm, caller_pc, &impl_class, &impl_name, &impl_desc, None, all, return_type,
+        );
+    }
+    let code = target_method
+        .code
+        .as_ref()
+        .ok_or(VmError::BadConstant("lambda 实现方法无 Code(抽象)"))?;
+    run_callee(interp, frame, vm, caller_pc, target_lc, target_method, code, None, all, return_type)
+}
+
+/// `Value → Arg`(闭包捕获还原为实参)。void 不可能是捕获值。
+fn arg_from_value(v: Value) -> Result<Arg, VmError> {
+    Ok(match v {
+        Value::Int(x) => Arg::Int(x),
+        Value::Long(x) => Arg::Long(x),
+        Value::Float(x) => Arg::Float(x),
+        Value::Double(x) => Arg::Double(x),
+        Value::Reference(r) => Arg::Reference(r),
+        Value::Void => return Err(VmError::BadConstant("lambda 捕获值不可为 void")),
+    })
+}
+
 /// 执行 `invokedynamic`:解析调用点 → 引导方法 → 按 (类,名) 特判综合目标。
 ///
 /// JDK 9+ 默认把动态字符串拼接编为 `invokedynamic makeConcatWithConstants`
@@ -380,6 +444,10 @@ pub(super) fn invoke_dynamic(
         let recipe = resolve_recipe(cp, &entry.bootstrap_arguments)?;
         let result = concat_with_recipe(vm, &recipe, &args, &md.parameters)?;
         finish_invoke(interp, frame, vm, caller_pc, Ok(result), md.return_type)
+    } else if bsm_class == "java/lang/invoke/LambdaMetafactory" && bsm_name == "metafactory" {
+        // lambda / 函数式接口:闭包 Oop 记实现方法身份 + 捕获;SAM 调用时转发实现体(见 spec 4.10aa)。
+        let result = build_lambda(vm, cp, &entry.bootstrap_arguments, &md.return_type, args)?;
+        finish_invoke(interp, frame, vm, caller_pc, Ok(result), md.return_type)
     } else {
         // 未识别的引导方法(如 LambdaMetafactory.metafactory)→ 未支持。诊断打印具体
         // (类,名)以便定位下一个待实现的引导方法;返回静态错误(BadConstant 取 &'static str)。
@@ -418,6 +486,35 @@ fn resolve_method_handle(cp: &ConstantPool, index: u16) -> Result<(String, Strin
     };
     let (class, name, _desc) = resolve_methodref(cp, *reference_index)?;
     Ok((class, name))
+}
+
+/// 解析 lambda 实现方法句柄(`metafactory` 的 `bootstrap_arguments[1]`)→
+/// `(声明类, 方法名, 描述符, reference_kind)`。`reference_kind` 判静态/虚/构造器
+/// 引用(本层仅派发 `REF_INVOKE_STATIC`,见 [`dispatch_lambda`])。
+fn resolve_impl_handle(
+    cp: &ConstantPool,
+    bsm_args: &[u16],
+) -> Result<(String, String, String, u8), VmError> {
+    let &idx = bsm_args
+        .get(1)
+        .ok_or(VmError::BadConstant("metafactory 缺实现方法句柄实参"))?;
+    let ConstantPoolEntry::MethodHandle {
+        reference_kind,
+        reference_index,
+    } = cp.get(idx)?
+    else {
+        return Err(VmError::BadConstant("metafactory 实现实参须为 MethodHandle"));
+    };
+    let (class, name, desc) = resolve_methodref(cp, *reference_index)?;
+    Ok((class, name, desc, *reference_kind))
+}
+
+/// factoryType 返回类型 → 函数式接口内部名(`FieldType::Class` 存裸内部名,无需剥 `L;`)。
+fn interface_name_of(ret: &ReturnDescriptor) -> Result<String, VmError> {
+    match ret {
+        ReturnDescriptor::FieldType(FieldType::Class(name)) => Ok(name.clone()),
+        _ => Err(VmError::BadConstant("metafactory factoryType 返回须为引用(函数式接口)类型")),
+    }
 }
 
 /// 取 `makeConcatWithConstants` 的 recipe(首个引导实参,`CONSTANT_String`)→ owned 文本。
@@ -497,6 +594,25 @@ fn stringify_arg(vm: &Vm<'_>, arg: &Arg, ft: &FieldType, out: &mut String) {
         }
         _ => {}
     }
+}
+
+/// 综合闭包对象(对应 `LambdaMetafactory.metafactory` 链入调用点返 `CallSite` 的语义)。
+/// 引导实参 `[0]`=SAM 方法类型、`[1]`=实现方法句柄、`[2]`=动态方法类型;本层只用 `[1]`
+/// 取实现身份。捕获 = 已按 factoryType 形参弹出的动态实参(`pop_args` 结果)。
+/// 结果为新分配的 `Oop::Lambda` 引用,按调用点返回类型(函数式接口)回填。
+fn build_lambda(
+    vm: &mut Vm<'_>,
+    cp: &ConstantPool,
+    bsm_args: &[u16],
+    factory_return: &ReturnDescriptor,
+    captures: Vec<Arg>,
+) -> Result<Value, VmError> {
+    let (impl_class, impl_name, impl_desc, impl_kind) = resolve_impl_handle(cp, bsm_args)?;
+    let sam_type = interface_name_of(factory_return)?;
+    let captured: Vec<Value> = captures.into_iter().map(Value::from).collect();
+    let lambda = LambdaOop::new(impl_class, impl_name, impl_desc, impl_kind, sam_type, captured);
+    let r = vm.heap_mut().alloc(Oop::Lambda(lambda));
+    Ok(Value::Reference(r))
 }
 
 /// 执行 `invokestatic`:解析目标方法、传递实参、递归解释、回填返回值。
@@ -699,6 +815,11 @@ pub(super) fn invoke_virtual(
         return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
     }
 
+    // Lambda 闭包 receiver:捕获 ++ SAM 实参交给实现方法(lambda$<caller>$0)静态执行。
+    if let Some(Oop::Lambda(lambda)) = vm.heap().get(objref).cloned() {
+        return dispatch_lambda(interp, frame, vm, caller_pc, lambda, args, md.return_type);
+    }
+
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
     let runtime_class = vm
         .heap()
@@ -708,6 +829,7 @@ pub(super) fn invoke_virtual(
         Oop::Instance(i) => i.class_name().to_string(),
         Oop::Array(_) => unreachable!("数组 receiver 已先行 clone/顺延分派"),
         Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
+        Oop::Lambda(_) => unreachable!("闭包 receiver 已先行 SAM 派发"),
     };
 
     let registry = vm
@@ -810,6 +932,11 @@ pub(super) fn invoke_interface(
         return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
     }
 
+    // Lambda 闭包 receiver:捕获 ++ SAM 实参交给实现方法(lambda$<caller>$0)静态执行。
+    if let Some(Oop::Lambda(lambda)) = vm.heap().get(objref).cloned() {
+        return dispatch_lambda(interp, frame, vm, caller_pc, lambda, args, md.return_type);
+    }
+
     // 运行时类 = 对象实际类(owned String,释放堆借用)。
     let runtime_class = vm
         .heap()
@@ -819,6 +946,7 @@ pub(super) fn invoke_interface(
         Oop::Instance(i) => i.class_name().to_string(),
         Oop::Array(_) => unreachable!("数组 receiver 已先行 clone/顺延分派"),
         Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
+        Oop::Lambda(_) => unreachable!("闭包 receiver 已先行 SAM 派发"),
     };
 
     let registry = vm

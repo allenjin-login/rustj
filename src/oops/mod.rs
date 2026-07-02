@@ -8,10 +8,12 @@ pub mod bootstrap;
 pub mod class_oop;
 pub mod instance;
 pub mod klass;
+pub mod lambda;
 pub mod oop;
 
 pub use array::ArrayOop;
 pub use class_oop::ClassOop;
 pub use instance::InstanceOop;
 pub use klass::{ClassRegistry, InitState, LoadedClass, ResolvedField};
+pub use lambda::LambdaOop;
 pub use oop::Oop;

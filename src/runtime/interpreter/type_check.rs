@@ -19,6 +19,8 @@ fn object_type(vm: &Vm<'_>, objref: Reference) -> Result<(bool, Option<String>),
         Oop::Instance(i) => (false, Some(i.class_name().to_string())),
         Oop::Array(a) => (true, Some(a.class_name().to_string())),
         Oop::Class(_) => (false, Some("java/lang/Class".to_string())),
+        // 闭包按其函数式接口类型上报(局部正确性;完整可赋值性顺延,见 spec 4.10aa §3.4)。
+        Oop::Lambda(l) => (false, Some(l.sam_type().to_string())),
     })
 }
 

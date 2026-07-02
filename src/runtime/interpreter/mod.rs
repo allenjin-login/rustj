@@ -1058,6 +1058,37 @@ impl<'a> Interpreter<'a> {
                 frame.operands.pop_slot()?;
                 pc += 1;
             }
+            // dup/swap 族(JVMS §6.5)——cat-2 占两槽(下值上 Top)的栈搬运,
+            // 语义封装于 [`OperandStack`] 的同名方法。ArrayList 的 `a[size++]=e` 等
+            // 数组自更新/构造器赋值模式普遍经此族;此前均 `UnsupportedOpcode`。
+            Opcode::DupX1 => {
+                frame.operands.dup_x1()?;
+                pc += 1;
+            }
+            Opcode::DupX2 => {
+                frame.operands.dup_x2()?;
+                pc += 1;
+            }
+            Opcode::Dup2 => {
+                frame.operands.dup2()?;
+                pc += 1;
+            }
+            Opcode::Dup2X1 => {
+                frame.operands.dup2_x1()?;
+                pc += 1;
+            }
+            Opcode::Dup2X2 => {
+                frame.operands.dup2_x2()?;
+                pc += 1;
+            }
+            Opcode::Pop2 => {
+                frame.operands.pop2()?;
+                pc += 1;
+            }
+            Opcode::Swap => {
+                frame.operands.swap()?;
+                pc += 1;
+            }
             // ---- 对象与字段(4.1)----
             Opcode::AconstNull => {
                 frame.operands.push_reference(Reference::null())?;
@@ -2173,6 +2204,61 @@ mod tests {
         // iconst_5; iconst_3; pop; ireturn -> 5
         let code = [Opcode::Iconst5 as u8, Opcode::Iconst3 as u8, Opcode::Pop as u8, Opcode::Ireturn as u8];
         assert_eq!(run_int(&code, 2), 5);
+    }
+
+    #[test]
+    fn dup_x1_inserts_copy_two_down() {
+        // iconst_1; iconst_2 → [1,2]; dup_x1 → [2,1,2]; iadd → [2,3]; iadd → [5]
+        let code = [
+            Opcode::Iconst1 as u8,
+            Opcode::Iconst2 as u8,
+            Opcode::DupX1 as u8,
+            Opcode::Iadd as u8,
+            Opcode::Iadd as u8,
+            Opcode::Ireturn as u8,
+        ];
+        assert_eq!(run_int(&code, 4), 5);
+    }
+
+    #[test]
+    fn dup2_duplicates_top_two_cat1() {
+        // [1,2]; dup2 → [1,2,1,2]; 三次 iadd → 1+2+1+2 = 6
+        let code = [
+            Opcode::Iconst1 as u8,
+            Opcode::Iconst2 as u8,
+            Opcode::Dup2 as u8,
+            Opcode::Iadd as u8,
+            Opcode::Iadd as u8,
+            Opcode::Iadd as u8,
+            Opcode::Ireturn as u8,
+        ];
+        assert_eq!(run_int(&code, 4), 6);
+    }
+
+    #[test]
+    fn swap_reverses_top_two() {
+        // [5,1]; swap → [1,5]; isub = value2(1) - value1(5) = -4(无 swap 则 5-1=4)
+        let code = [
+            Opcode::Iconst5 as u8,
+            Opcode::Iconst1 as u8,
+            Opcode::Swap as u8,
+            Opcode::Isub as u8,
+            Opcode::Ireturn as u8,
+        ];
+        assert_eq!(run_int(&code, 2), -4);
+    }
+
+    #[test]
+    fn pop2_discards_top_two_cat1() {
+        // [1,2]; pop2 → []; iconst_3; ireturn -> 3
+        let code = [
+            Opcode::Iconst1 as u8,
+            Opcode::Iconst2 as u8,
+            Opcode::Pop2 as u8,
+            Opcode::Iconst3 as u8,
+            Opcode::Ireturn as u8,
+        ];
+        assert_eq!(run_int(&code, 2), 3);
     }
 
     // ---- 控制流 ----

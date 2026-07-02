@@ -14,10 +14,11 @@
 //! 这是"简易帧管理器":正确、安全、零额外结构。显式帧栈(用于深度上限 /
 //! `StackOverflowError` 检测)留待对象模型层。
 
+use crate::classfile::attributes::CodeAttribute;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_method_descriptor, FieldType, ReturnDescriptor};
 use crate::metadata::{ClassFile, MethodInfo};
-use crate::oops::Oop;
+use crate::oops::{LoadedClass, Oop};
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
 use super::{clinit, exception, native, throw_exception, Interpreter, Value, VmError};
@@ -254,6 +255,86 @@ fn push_return(frame: &mut Frame, v: Value) -> Result<(), VmError> {
     Ok(())
 }
 
+/// 弹出全部实参并翻正序(`args[i]` ↔ `parameters[i]`)。调用者栈上正序(arg0 底、argN 顶),
+/// 故逆序弹出后再翻转;long/double 经 [`pop_arg`] 占单个 `Arg`。static/special/virtual/
+/// interface/invokedynamic 共用。
+fn pop_args(frame: &mut Frame, params: &[FieldType]) -> Result<Vec<Arg>, VmError> {
+    let mut args = Vec::with_capacity(params.len());
+    for ft in params.iter().rev() {
+        args.push(pop_arg(frame, ft)?);
+    }
+    args.reverse();
+    Ok(args)
+}
+
+/// 内置 native 分派:`Vec<Arg>` → `Vec<Value>`,调 [`native::invoke`],再经 [`finish_invoke`]
+/// 回填返回值 / 捕获异常。静态 native 传 `this = None`,实例 native 传 `Some(objref)`。
+/// `class` 为 native 声明类(静态 = 解析类名;实例 = 目标类的 `name()`,借自 detached 注册表,
+/// 故与 `&mut vm` 不冲突)。
+///
+/// 参数多系 4 处调用点统一 fan-in 的必然结果(调用点 4 元 + 方法标识 + this + args + 返回类型);
+/// 收敛为多生命周期 struct 反更晦涩,故豁免 `too_many_arguments`。
+#[allow(clippy::too_many_arguments)]
+fn dispatch_native(
+    interp: &Interpreter<'_>,
+    frame: &mut Frame,
+    vm: &mut Vm<'_>,
+    caller_pc: usize,
+    class: &str,
+    name: &str,
+    desc: &str,
+    this: Option<Reference>,
+    args: Vec<Arg>,
+    return_type: ReturnDescriptor,
+) -> Result<InvokeFlow, VmError> {
+    let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
+    let result = native::invoke(vm, class, name, desc, this, &nargs);
+    finish_invoke(interp, frame, vm, caller_pc, result, return_type)
+}
+
+/// 跑被调用者解释帧:造帧 →(实例)写 `local[0]=objref` → 实参按序写入局部变量 →
+/// 构造解释器(目标字节码 + 常量池 + 异常表 + 身份)→ [`run_with_depth`] 递归 →
+/// [`finish_invoke`] 回填 / 捕获。`objref=None`(静态)实参自 slot 0;`Some`(实例)
+/// `local[0]=objref`、实参自 slot 1。static/special/virtual/interface 共用。
+///
+/// 参数多系 4 处调用点统一 fan-in 的必然结果;同 [`dispatch_native`] 豁免 `too_many_arguments`。
+#[allow(clippy::too_many_arguments)]
+fn run_callee(
+    interp: &Interpreter<'_>,
+    frame: &mut Frame,
+    vm: &mut Vm<'_>,
+    caller_pc: usize,
+    target_lc: &LoadedClass,
+    target_method: &MethodInfo,
+    code: &CodeAttribute,
+    objref: Option<Reference>,
+    args: Vec<Arg>,
+    return_type: ReturnDescriptor,
+) -> Result<InvokeFlow, VmError> {
+    let mut callee = Frame::new(code.max_locals, code.max_stack);
+    let mut slot: u16 = match objref {
+        Some(r) => {
+            callee.locals.set_reference(0, r)?;
+            1
+        }
+        None => 0,
+    };
+    for a in args {
+        let advance = store_arg(&mut callee.locals, slot, a)?;
+        slot = slot
+            .checked_add(advance)
+            .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
+    }
+    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table)
+        .with_identity(
+            target_lc.name(),
+            cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
+        );
+    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
+    finish_invoke(interp, frame, vm, caller_pc, result, return_type)
+}
+
 /// 执行 `invokedynamic`:解析调用点 → 引导方法 → 按 (类,名) 特判综合目标。
 ///
 /// JDK 9+ 默认把动态字符串拼接编为 `invokedynamic makeConcatWithConstants`
@@ -274,12 +355,8 @@ pub(super) fn invoke_dynamic(
     let (bsm_index, _linkage_name, desc) = resolve_invoke_dynamic(cp, index)?;
     let md = parse_method_descriptor(&desc)?;
 
-    // 动态实参按调用点描述符的形参类型逆序弹出 → 翻正序(args[i] 对应 param_types[i])。
-    let mut args: Vec<Arg> = Vec::with_capacity(md.parameters.len());
-    for ft in md.parameters.iter().rev() {
-        args.push(pop_arg(frame, ft)?);
-    }
-    args.reverse();
+    // 动态实参按调用点描述符的形参类型弹出并翻正序(args[i] ↔ parameters[i])。
+    let args = pop_args(frame, &md.parameters)?;
 
     // 取声明类的 BootstrapMethods 表(经 identity → registry → cf.bootstrap_methods())。
     let registry = vm
@@ -445,50 +522,42 @@ pub(super) fn invoke_static(
         .ok_or(VmError::BadConstant("invokestatic 目标类未加载"))?;
     let target_method = find_method(&target_lc.cf, &method_name, &desc)?;
     let md = parse_method_descriptor(&desc)?;
-    // ACC_NATIVE(无 Code)→ 内置 native 分派表(移植 prims/jvm.cpp 的 JVM_* 桥;
-    // 详见 `native::invoke`)。静态 native 无 `this`,实参自调用者栈逆序弹出转正序。
+    // 实参在调用者栈上正序(arg0 底、argN 顶);弹出并翻正序(args[i] ↔ parameters[i])。
+    let args = pop_args(frame, &md.parameters)?;
+    // ACC_NATIVE(无 Code)→ 内置 native 分派表(移植 prims/jvm.cpp 的 JVM_* 桥);静态 native 无 this。
     if target_method.access_flags.is_native() {
-        let mut nargs: Vec<Value> = Vec::with_capacity(md.parameters.len());
-        for ft in md.parameters.iter().rev() {
-            nargs.push(pop_arg(frame, ft)?.into());
-        }
-        nargs.reverse();
-        let result = native::invoke(vm, &class_name, &method_name, &desc, None, &nargs);
-        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+        return dispatch_native(
+            interp,
+            frame,
+            vm,
+            caller_pc,
+            &class_name,
+            &method_name,
+            &desc,
+            None,
+            args,
+            md.return_type,
+        );
     }
     let code = target_method
         .code
         .as_ref()
         .ok_or(VmError::BadConstant("invokestatic 目标方法无 Code(抽象)"))?;
 
-    // 实参在调用者栈上为正序(arg0 在底,argN 在顶);逆序弹出后翻转为正序,
-    // 再按 JVM 调用约定写入被调用者局部变量 0..(long/double 占两槽)。
-    let mut args: Vec<Arg> = Vec::with_capacity(md.parameters.len());
-    for ft in md.parameters.iter().rev() {
-        args.push(pop_arg(frame, ft)?);
-    }
-    args.reverse();
-
-    let mut callee = Frame::new(code.max_locals, code.max_stack);
-    let mut slot: u16 = 0;
-    for v in args {
-        let advance = store_arg(&mut callee.locals, slot, v)?;
-        slot = slot
-            .checked_add(advance)
-            .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
-    }
-
-    // 递归:用目标方法的字节码与常量池 + 异常表构造新解释器,沿用同一 Vm(堆 + 注册表)。
-    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table)
-        .with_identity(
-            target_lc.name(),
-            cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
-        );
-    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
-
-    // 回填返回值 / 捕获被调用者抛出的异常(单点)。
-    finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
+    // 递归解释被调用者:静态无 objref,实参自 slot 0 写入。沿用同一 Vm(堆 + 注册表),
+    // 返回值回填 / 异常捕获经 [`finish_invoke`] 单点。
+    run_callee(
+        interp,
+        frame,
+        vm,
+        caller_pc,
+        target_lc,
+        target_method,
+        code,
+        None,
+        args,
+        md.return_type,
+    )
 }
 
 /// 执行 `invokespecial`:4.1 仅 `<init>`(构造器)。
@@ -506,13 +575,9 @@ pub(super) fn invoke_special(
     let (class_name, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
     let md = parse_method_descriptor(&desc)?;
 
-    let mut args: Vec<Arg> = Vec::with_capacity(md.parameters.len());
-    for ft in md.parameters.iter().rev() {
-        args.push(pop_arg(frame, ft)?);
-    }
-    // 逆序弹出得 argN..arg0,翻回正序 arg0..argN 后再写局部变量(与 `invoke_static` 一致);
-    // 下游 native 分派的 `nargs` 亦取此正序声明序。
-    args.reverse();
+    // 实参正序弹出(argN 在顶,逆序弹后翻正序);再弹 objref。下游 native 分派的 nargs
+    // 亦取此正序声明序。
+    let args = pop_args(frame, &md.parameters)?;
     let objref = frame.operands.pop_reference()?;
 
     let registry = vm
@@ -543,35 +608,37 @@ pub(super) fn invoke_special(
     };
     // ACC_NATIVE → 内置 native 分派表(声明类 = 解析到的目标类)。
     if target_method.access_flags.is_native() {
-        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
-        let native_class = target_lc.name().to_string();
-        let result = native::invoke(vm, &native_class, &method_name, &desc, Some(objref), &nargs);
-        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+        return dispatch_native(
+            interp,
+            frame,
+            vm,
+            caller_pc,
+            target_lc.name(),
+            &method_name,
+            &desc,
+            Some(objref),
+            args,
+            md.return_type,
+        );
     }
     let code = target_method
         .code
         .as_ref()
         .ok_or(VmError::BadConstant("invokespecial 目标方法无 Code(抽象)"))?;
 
-    let mut callee = Frame::new(code.max_locals, code.max_stack);
-    callee.locals.set_reference(0, objref)?;
-    let mut slot: u16 = 1;
-    for a in args {
-        let advance = store_arg(&mut callee.locals, slot, a)?;
-        slot = slot
-            .checked_add(advance)
-            .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
-    }
-
-    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table)
-        .with_identity(
-            target_lc.name(),
-            cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
-        );
-    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
-
-    finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
+    // 递归解释被调用者:objref 为 local[0],实参自 slot 1 写入。
+    run_callee(
+        interp,
+        frame,
+        vm,
+        caller_pc,
+        target_lc,
+        target_method,
+        code,
+        Some(objref),
+        args,
+        md.return_type,
+    )
 }
 
 /// 执行 `invokevirtual`:按对象**运行时实际类**沿超类链虚分派。
@@ -589,13 +656,9 @@ pub(super) fn invoke_virtual(
     let (_declared_class, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
     let md = parse_method_descriptor(&desc)?;
 
-    let mut args: Vec<Arg> = Vec::with_capacity(md.parameters.len());
-    for ft in md.parameters.iter().rev() {
-        args.push(pop_arg(frame, ft)?);
-    }
-    // 逆序弹出得 argN..arg0,翻回正序 arg0..argN 后再写局部变量(与 `invoke_static` 一致);
-    // 下游 native 分派的 `nargs` 亦取此正序声明序。
-    args.reverse();
+    // 实参正序弹出(argN 在顶,逆序弹后翻正序);再弹 objref。下游 native 分派的 nargs
+    // 亦取此正序声明序。
+    let args = pop_args(frame, &md.parameters)?;
     let objref = frame.operands.pop_reference()?;
     if objref.is_null() {
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
@@ -604,9 +667,18 @@ pub(super) fn invoke_virtual(
     // Class 镜像(Oop::Class)非注册表类,经 "java/lang/Class" 的 native 表分派
     // (desiredAssertionStatus 等)。先于 runtime_class 解析(其按类链查表,镜像无类链)。
     if matches!(vm.heap().get(objref), Some(Oop::Class(_))) {
-        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
-        let result = native::invoke(vm, "java/lang/Class", &method_name, &desc, Some(objref), &nargs);
-        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+        return dispatch_native(
+            interp,
+            frame,
+            vm,
+            caller_pc,
+            "java/lang/Class",
+            &method_name,
+            &desc,
+            Some(objref),
+            args,
+            md.return_type,
+        );
     }
 
     // 数组 receiver:仅 `Object.clone()` 浅拷贝(同描述符 + 复制元素槽),解锁
@@ -651,34 +723,36 @@ pub(super) fn invoke_virtual(
     };
     // ACC_NATIVE → 内置 native 分派表(Object.hashCode 等虚方法 native 经此)。
     if target_method.access_flags.is_native() {
-        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
-        let native_class = target_lc.name().to_string();
-        let result = native::invoke(vm, &native_class, &method_name, &desc, Some(objref), &nargs);
-        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+        return dispatch_native(
+            interp,
+            frame,
+            vm,
+            caller_pc,
+            target_lc.name(),
+            &method_name,
+            &desc,
+            Some(objref),
+            args,
+            md.return_type,
+        );
     }
     let Some(code) = target_method.code.as_ref() else {
         return Err(throw_exception(vm, "java/lang/AbstractMethodError"));
     };
 
-    let mut callee = Frame::new(code.max_locals, code.max_stack);
-    callee.locals.set_reference(0, objref)?;
-    let mut slot: u16 = 1;
-    for a in args {
-        let advance = store_arg(&mut callee.locals, slot, a)?;
-        slot = slot
-            .checked_add(advance)
-            .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
-    }
-
-    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table)
-        .with_identity(
-            target_lc.name(),
-            cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
-        );
-    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
-
-    finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
+    // 递归解释被调用者:objref 为 local[0],实参自 slot 1 写入。
+    run_callee(
+        interp,
+        frame,
+        vm,
+        caller_pc,
+        target_lc,
+        target_method,
+        code,
+        Some(objref),
+        args,
+        md.return_type,
+    )
 }
 
 /// 执行 `invokeinterface`:按对象运行时实际类分派。语义与 `invokevirtual` 一致
@@ -695,13 +769,9 @@ pub(super) fn invoke_interface(
     let (_declared_iface, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
     let md = parse_method_descriptor(&desc)?;
 
-    let mut args: Vec<Arg> = Vec::with_capacity(md.parameters.len());
-    for ft in md.parameters.iter().rev() {
-        args.push(pop_arg(frame, ft)?);
-    }
-    // 逆序弹出得 argN..arg0,翻回正序 arg0..argN 后再写局部变量(与 `invoke_static` 一致);
-    // 下游 native 分派的 `nargs` 亦取此正序声明序。
-    args.reverse();
+    // 实参正序弹出(argN 在顶,逆序弹后翻正序);再弹 objref。下游 native 分派的 nargs
+    // 亦取此正序声明序。
+    let args = pop_args(frame, &md.parameters)?;
     let objref = frame.operands.pop_reference()?;
     if objref.is_null() {
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
@@ -709,9 +779,18 @@ pub(super) fn invoke_interface(
 
     // Class 镜像经 "java/lang/Class" 的 native 表分派(同 invoke_virtual)。
     if matches!(vm.heap().get(objref), Some(Oop::Class(_))) {
-        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
-        let result = native::invoke(vm, "java/lang/Class", &method_name, &desc, Some(objref), &nargs);
-        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+        return dispatch_native(
+            interp,
+            frame,
+            vm,
+            caller_pc,
+            "java/lang/Class",
+            &method_name,
+            &desc,
+            Some(objref),
+            args,
+            md.return_type,
+        );
     }
 
     // 数组 receiver:仅 `Object.clone()` 浅拷贝(同 invoke_virtual)。
@@ -754,34 +833,36 @@ pub(super) fn invoke_interface(
     };
     // ACC_NATIVE → 内置 native 分派表。
     if target_method.access_flags.is_native() {
-        let nargs: Vec<Value> = args.into_iter().map(Value::from).collect();
-        let native_class = target_lc.name().to_string();
-        let result = native::invoke(vm, &native_class, &method_name, &desc, Some(objref), &nargs);
-        return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
+        return dispatch_native(
+            interp,
+            frame,
+            vm,
+            caller_pc,
+            target_lc.name(),
+            &method_name,
+            &desc,
+            Some(objref),
+            args,
+            md.return_type,
+        );
     }
     let Some(code) = target_method.code.as_ref() else {
         return Err(throw_exception(vm, "java/lang/AbstractMethodError"));
     };
 
-    let mut callee = Frame::new(code.max_locals, code.max_stack);
-    callee.locals.set_reference(0, objref)?;
-    let mut slot: u16 = 1;
-    for a in args {
-        let advance = store_arg(&mut callee.locals, slot, a)?;
-        slot = slot
-            .checked_add(advance)
-            .ok_or(VmError::BadConstant("局部变量槽位溢出"))?;
-    }
-
-    let callee_interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table)
-        .with_identity(
-            target_lc.name(),
-            cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
-        );
-    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
-
-    finish_invoke(interp, frame, vm, caller_pc, result, md.return_type)
+    // 递归解释被调用者:objref 为 local[0],实参自 slot 1 写入。
+    run_callee(
+        interp,
+        frame,
+        vm,
+        caller_pc,
+        target_lc,
+        target_method,
+        code,
+        Some(objref),
+        args,
+        md.return_type,
+    )
 }
 
 #[cfg(test)]

@@ -53,6 +53,24 @@ impl ClassFile {
         }
     }
 
+    /// 类级 `BootstrapMethods` 属性(JVMS §4.7.21):供 `invokedynamic` / `CONSTANT_Dynamic`
+    /// 解析引导方法。懒扫 `self.attributes` 按名 "BootstrapMethods"(经 cp 识名)解码。
+    /// 无该属性 / 结构异常 → 空 `Vec`。返回 **owned**(规避借用纠缠:调用方常需随后 `&mut vm`)。
+    /// 重复解码的代价可接受(同一调用点多次 invokedynamic 会在解释器层缓存,顺延)。
+    pub fn bootstrap_methods(&self) -> Vec<crate::classfile::attributes::BootstrapMethodEntry> {
+        use crate::classfile::attributes::parse_bootstrap_methods;
+        for attr in &self.attributes {
+            let Ok(ConstantPoolEntry::Utf8(name)) = self.constant_pool.get(attr.name_index) else {
+                continue;
+            };
+            if name != "BootstrapMethods" {
+                continue;
+            }
+            return parse_bootstrap_methods(&attr.info).unwrap_or_default();
+        }
+        Vec::new()
+    }
+
     /// 类级 `SourceFile` 属性(JVMS §4.7.10)指向的源文件名(如 `"Math.java"`)。
     /// 懒扫 `self.attributes` 按名 "SourceFile"(经 cp 识名),取体 `u2 sourcefile_index` → Utf8。
     /// 无该属性 / 结构异常 → `None`。供栈轨迹行号渲染 `at Class.method(File.java:LINE)`。

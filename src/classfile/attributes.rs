@@ -30,6 +30,15 @@ pub struct LineNumberEntry {
     pub line_number: u16,
 }
 
+/// `BootstrapMethods` 属性条目(JVMS §4.7.21):供 `invokedynamic` / `CONSTANT_Dynamic`
+/// 解析引导方法。`bootstrap_method_ref` = `CONSTANT_MethodHandle` 常量池索引;
+/// `bootstrap_arguments` = 引导方法附加实参的常量池索引(recipe 常为首个 `CONSTANT_String`)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapMethodEntry {
+    pub bootstrap_method_ref: u16,
+    pub bootstrap_arguments: Vec<u16>,
+}
+
 /// `Code` 属性深解析结果。解释器执行方法的必需信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeAttribute {
@@ -69,6 +78,28 @@ pub fn parse_line_number_table(info: &[u8]) -> Result<Vec<LineNumberEntry>, Clas
         entries.push(LineNumberEntry {
             start_pc: reader.u2()?,
             line_number: reader.u2()?,
+        });
+    }
+    Ok(entries)
+}
+
+/// 解码 `BootstrapMethods` 属性体(JVMS §4.7.21):`u2 num_bootstrap_methods` 后接
+/// `{ u2 bootstrap_method_ref; u2 num_bootstrap_arguments; u2[num] bootstrap_arguments }[]`。
+/// cp 无关纯解码(属性名识别在 `ClassFile::bootstrap_methods` 经 cp 做)。
+pub fn parse_bootstrap_methods(info: &[u8]) -> Result<Vec<BootstrapMethodEntry>, ClassFileError> {
+    let mut reader = Reader::new(info);
+    let count = usize::from(reader.u2()?);
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let bootstrap_method_ref = reader.u2()?;
+        let nargs = usize::from(reader.u2()?);
+        let mut bootstrap_arguments = Vec::with_capacity(nargs);
+        for _ in 0..nargs {
+            bootstrap_arguments.push(reader.u2()?);
+        }
+        entries.push(BootstrapMethodEntry {
+            bootstrap_method_ref,
+            bootstrap_arguments,
         });
     }
     Ok(entries)
@@ -202,6 +233,43 @@ mod tests {
         let info = [0x00, 0x00]; // 只有 max_stack
         assert!(matches!(
             parse_code(&info),
+            Err(ClassFileError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_bootstrap_methods_decodes_entries_and_args() {
+        // num_bootstrap_methods=2
+        // bsm0: ref=#29, num_args=1, args=[#27]
+        // bsm1: ref=#40, num_args=0
+        let info = [
+            0x00, 0x02, // count
+            0x00, 0x1D, 0x00, 0x01, 0x00, 0x1B, // bsm0
+            0x00, 0x28, 0x00, 0x00, // bsm1
+        ];
+        let entries = parse_bootstrap_methods(&info).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0],
+            BootstrapMethodEntry {
+                bootstrap_method_ref: 0x1D,
+                bootstrap_arguments: vec![0x1B],
+            }
+        );
+        assert_eq!(
+            entries[1],
+            BootstrapMethodEntry {
+                bootstrap_method_ref: 0x28,
+                bootstrap_arguments: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_methods_rejects_truncated() {
+        let info = [0x00, 0x01, 0x00, 0x1D]; // count=1 但 ref 后缺 num_args
+        assert!(matches!(
+            parse_bootstrap_methods(&info),
             Err(ClassFileError::Truncated { .. })
         ));
     }

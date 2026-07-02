@@ -254,6 +254,174 @@ fn push_return(frame: &mut Frame, v: Value) -> Result<(), VmError> {
     Ok(())
 }
 
+/// 执行 `invokedynamic`:解析调用点 → 引导方法 → 按 (类,名) 特判综合目标。
+///
+/// JDK 9+ 默认把动态字符串拼接编为 `invokedynamic makeConcatWithConstants`
+/// (引导方法 `java/lang/invoke/StringConcatFactory.makeConcatWithConstants`)。
+/// 真实 HotSpot **运行**引导方法(返 `CallSite`,链入调用点);rustj 沿用「按语义移植」
+/// 决策(同 native 表特判 `JVM_*`),**按引导方法 (类,名) 特判**,直接综合(详见 spec 4.10u)。
+///
+/// `index` 指向 `CONSTANT_InvokeDynamic`:其 name_and_type 给**动态调用点类型**
+/// (实参类型 + 返回类型,**非**引导方法描述符)。由调用方推进 `pc += 5`。
+pub(super) fn invoke_dynamic(
+    interp: &Interpreter<'_>,
+    frame: &mut Frame,
+    vm: &mut Vm<'_>,
+    index: u16,
+    caller_pc: usize,
+) -> Result<InvokeFlow, VmError> {
+    let cp = interp.cp();
+    let (bsm_index, _linkage_name, desc) = resolve_invoke_dynamic(cp, index)?;
+    let md = parse_method_descriptor(&desc)?;
+
+    // 动态实参按调用点描述符的形参类型逆序弹出 → 翻正序(args[i] 对应 param_types[i])。
+    let mut args: Vec<Arg> = Vec::with_capacity(md.parameters.len());
+    for ft in md.parameters.iter().rev() {
+        args.push(pop_arg(frame, ft)?);
+    }
+    args.reverse();
+
+    // 取声明类的 BootstrapMethods 表(经 identity → registry → cf.bootstrap_methods())。
+    let registry = vm
+        .registry()
+        .ok_or(VmError::BadConstant("invokedynamic 需要类注册表"))?;
+    let this_class = interp
+        .declaring_class()
+        .ok_or(VmError::BadConstant("invokedynamic 需方法身份(声明类)"))?;
+    let lc = registry
+        .get(this_class)
+        .ok_or(VmError::BadConstant("invokedynamic 声明类未加载"))?;
+    let bsm_table = lc.cf.bootstrap_methods();
+    let entry = bsm_table
+        .get(usize::from(bsm_index))
+        .ok_or(VmError::BadConstant("BootstrapMethod 索引越界"))?;
+
+    // 解析引导方法句柄 → (引导方法类, 名);按 (类, 名) 特判综合。
+    let (bsm_class, bsm_name) = resolve_method_handle(cp, entry.bootstrap_method_ref)?;
+    if bsm_class == "java/lang/invoke/StringConcatFactory" && bsm_name == "makeConcatWithConstants"
+    {
+        let recipe = resolve_recipe(cp, &entry.bootstrap_arguments)?;
+        let result = concat_with_recipe(vm, &recipe, &args, &md.parameters)?;
+        finish_invoke(interp, frame, vm, caller_pc, Ok(result), md.return_type)
+    } else {
+        // 未识别的引导方法(如 LambdaMetafactory.metafactory)→ 未支持。诊断打印具体
+        // (类,名)以便定位下一个待实现的引导方法;返回静态错误(BadConstant 取 &'static str)。
+        eprintln!(
+            "[invokedynamic] 未支持的引导方法:{bsm_class}.{bsm_name} \
+             (仅 StringConcatFactory.makeConcatWithConstants 已实现)"
+        );
+        Err(VmError::BadConstant(
+            "invokedynamic 引导方法未实现(详见诊断输出)",
+        ))
+    }
+}
+
+/// 解析 `CONSTANT_InvokeDynamic` 条目 → `(bootstrap_method_attr_index, 调用点名, 调用点描述符)`。
+fn resolve_invoke_dynamic(cp: &ConstantPool, index: u16) -> Result<(u16, String, String), VmError> {
+    let ConstantPoolEntry::InvokeDynamic {
+        bootstrap_method_attr_index,
+        name_and_type_index,
+    } = cp.get(index)?
+    else {
+        return Err(VmError::BadConstant("invokedynamic 操作数须为 InvokeDynamic"));
+    };
+    let (name, desc) = name_and_type(cp, *name_and_type_index)?;
+    Ok((*bootstrap_method_attr_index, name, desc))
+}
+
+/// 解析 `CONSTANT_MethodHandle`(引导方法引用)→ (声明类内部名, 方法名)。
+/// `reference_index` 指向 `Methodref`/`InterfaceMethodref`,复用 `resolve_methodref`。
+fn resolve_method_handle(cp: &ConstantPool, index: u16) -> Result<(String, String), VmError> {
+    let ConstantPoolEntry::MethodHandle {
+        reference_kind: _,
+        reference_index,
+    } = cp.get(index)?
+    else {
+        return Err(VmError::BadConstant("引导方法引用须为 MethodHandle"));
+    };
+    let (class, name, _desc) = resolve_methodref(cp, *reference_index)?;
+    Ok((class, name))
+}
+
+/// 取 `makeConcatWithConstants` 的 recipe(首个引导实参,`CONSTANT_String`)→ owned 文本。
+/// recipe 用 `` 标动态实参占位、`` 标常量占位、其余字符为字面量。
+fn resolve_recipe(cp: &ConstantPool, bsm_args: &[u16]) -> Result<String, VmError> {
+    let &first = bsm_args
+        .first()
+        .ok_or(VmError::BadConstant("makeConcatWithConstants 缺 recipe"))?;
+    let ConstantPoolEntry::String { string_index } = cp.get(first)?
+    else {
+        return Err(VmError::BadConstant("makeConcatWithConstants recipe 须为 String"));
+    };
+    utf8(cp, *string_index)
+}
+
+/// 按 recipe 拼接动态实参 → `String` 引用(对应 `StringConcatFactory` 链入的拼接语义)。
+/// `` 占位取下一个实参按其类型字符串化;其它字符字面量拼入;``(常量占位)
+/// 少见于简单拼接,本层 best-effort 跳过(记债)。结果经 `string::intern` 规范化。
+fn concat_with_recipe(
+    vm: &mut Vm<'_>,
+    recipe: &str,
+    args: &[Arg],
+    param_types: &[FieldType],
+) -> Result<Value, VmError> {
+    let mut out = String::new();
+    let mut ai: usize = 0;
+    for c in recipe.chars() {
+        if c == '\u{0001}' {
+            let arg = args
+                .get(ai)
+                .ok_or(VmError::BadConstant("recipe 占位数超过动态实参数"))?;
+            let ft = param_types
+                .get(ai)
+                .ok_or(VmError::BadConstant("recipe 占位数超过实参类型数"))?;
+            stringify_arg(vm, arg, ft, &mut out);
+            ai += 1;
+        } else if c == '\u{0002}' {
+            // 常量占位:顺延(后续 bootstrap 常量实参;少见于简单拼接,记债)。
+        } else {
+            out.push(c);
+        }
+    }
+    let r = super::string::intern(vm, &out)?;
+    Ok(Value::Reference(r))
+}
+
+/// 把单个动态实参按其字段类型字符串化,追加到 `out`(对应 Java `String.valueOf` 语义)。
+/// float/double 用 Rust `{:?}` 格式(**非 Java 精确**:NaN/无穷/定点规则,独立债,后续)。
+fn stringify_arg(vm: &Vm<'_>, arg: &Arg, ft: &FieldType, out: &mut String) {
+    use std::fmt::Write;
+    match (ft, arg) {
+        // 引用:null → "null"(Java 语义);非 null String → 读文本(非 String 罕见,best-effort 跳过)。
+        (FieldType::Class(_) | FieldType::Array(_), Arg::Reference(r)) => {
+            if r.is_null() {
+                out.push_str("null");
+            } else if let Ok(Some(t)) = super::string::read_text(vm, *r) {
+                out.push_str(&t);
+            }
+        }
+        (FieldType::Boolean, Arg::Int(x)) => out.push_str(if *x != 0 { "true" } else { "false" }),
+        (FieldType::Char, Arg::Int(x)) => {
+            if let Some(ch) = char::from_u32(*x as u32) {
+                out.push(ch);
+            }
+        }
+        (FieldType::Int | FieldType::Byte | FieldType::Short, Arg::Int(x)) => {
+            let _ = write!(out, "{x}");
+        }
+        (FieldType::Long, Arg::Long(x)) => {
+            let _ = write!(out, "{x}");
+        }
+        (FieldType::Float, Arg::Float(f)) => {
+            let _ = write!(out, "{f:?}");
+        }
+        (FieldType::Double, Arg::Double(d)) => {
+            let _ = write!(out, "{d:?}");
+        }
+        _ => {}
+    }
+}
+
 /// 执行 `invokestatic`:解析目标方法、传递实参、递归解释、回填返回值。
 ///
 /// 由分派循环读取 u2 索引后调用;返回后由调用方推进 `pc += 3`。

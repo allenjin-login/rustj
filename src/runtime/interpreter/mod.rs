@@ -267,6 +267,12 @@ impl<'a> Interpreter<'a> {
         self.exception_table
     }
 
+    /// 当前方法的声明类内部名(借自 `identity.class`,寿命 `'a`)。供 `invokedynamic`
+    /// 据声明类查 `BootstrapMethods` 表。匿名帧(无 identity,如纯算术单测)→ `None`。
+    pub(crate) fn declaring_class(&self) -> Option<&'a str> {
+        self.identity.as_ref().map(|id| id.class)
+    }
+
     /// 便捷入口:无对象/类上下文,用默认空 [`Vm`] 执行(纯数值路径)。
     ///
     /// 既有单帧测试与此路径兼容;需要对象/字段/`invokestatic` 时用 [`Self::interpret_with`]。
@@ -1139,6 +1145,15 @@ impl<'a> Interpreter<'a> {
                 let index = self.read_u2(pc + 1)?;
                 // count(pc+3) 与尾 0(pc+4)对运行时冗余,随 pc += 5 丢弃。
                 match invoke::invoke_interface(self, frame, vm, index, pc)? {
+                    invoke::InvokeFlow::Fallthrough => pc += 5,
+                    invoke::InvokeFlow::Jump(h) => pc = h,
+                }
+            }
+            // ---- invokedynamic(4.10u):JDK9+ 动态拼接 / lambda 调用点 ----
+            Opcode::Invokedynamic => {
+                // index(pc+1..2)指向 InvokeDynamic;pc+3..4 为 0 0(冗余,随 pc += 5 丢弃)。
+                let index = self.read_u2(pc + 1)?;
+                match invoke::invoke_dynamic(self, frame, vm, index, pc)? {
                     invoke::InvokeFlow::Fallthrough => pc += 5,
                     invoke::InvokeFlow::Jump(h) => pc = h,
                 }

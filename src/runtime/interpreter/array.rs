@@ -316,6 +316,29 @@ pub(super) fn array_store(
             "java/lang/ArrayIndexOutOfBoundsException",
         ));
     }
+    // 引用数组(aastore)组件类型可赋性检查:非 null 元素须可赋给数组组件类型,否则
+    // ArrayStoreException(HotSpot `ObjArrayKlass::array_store`,4.10i 延后项,本层落地)。
+    // 基本数组种类由 `pop_array_value` 的槽类型保证,不走此查。读/判/写分时:不可变借读组件
+    // + 判定收敛进块(释放)后再以 `&mut vm` 抛 ASE / 写入,镜像 `arraycopy::copy_elements`。
+    if let ArrayKind::Ref = kind
+        && let Slot::Reference(elem) = &value
+        && !elem.is_null()
+    {
+        let not_assignable = {
+            let Some(reg) = vm.registry() else {
+                return Err(VmError::BadConstant("aastore 组件可赋性检查需类注册表"));
+            };
+            let array_comp = match vm.heap().get(arrayref) {
+                Some(Oop::Array(a)) => super::arraycopy::component_of(a.class_name()).to_string(),
+                _ => return Err(VmError::BadConstant("aastore 目标非数组")),
+            };
+            let elem_comp = super::arraycopy::element_component(vm, *elem)?;
+            !super::arraycopy::component_assignable(&elem_comp, &array_comp, reg)
+        };
+        if not_assignable {
+            return Err(throw_exception(vm, "java/lang/ArrayStoreException"));
+        }
+    }
     match vm
         .heap_mut()
         .get_mut(arrayref)

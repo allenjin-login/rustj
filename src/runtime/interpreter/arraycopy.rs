@@ -271,7 +271,7 @@ fn write_element(vm: &mut Vm<'_>, r: Reference, idx: usize, slot: Slot) -> Resul
 
 /// 元素运行时类型 → 组件描述符(供 [`component_assignable`] 比对 dst 组件)。
 /// 实例 `java/lang/String` → `Ljava/lang/String;`;数组 `[I` → `[I`;Class 镜像 → `Ljava/lang/Class;`。
-fn element_component(vm: &Vm<'_>, r: Reference) -> Result<String, VmError> {
+pub(super) fn element_component(vm: &Vm<'_>, r: Reference) -> Result<String, VmError> {
     Ok(match vm.heap().get(r) {
         Some(Oop::Instance(i)) => format!("L{};", i.class_name()),
         Some(Oop::Array(a)) => a.class_name().to_string(),
@@ -282,7 +282,7 @@ fn element_component(vm: &Vm<'_>, r: Reference) -> Result<String, VmError> {
 
 /// 数组描述符的组件段(`[B`→`B`、`[Ljava/lang/String;`→`Ljava/lang/String;`、`[[I`→`[I`)。
 /// 数组描述符必以 `[`(单字节)起;防御性 `get(1..)`。
-fn component_of(desc: &str) -> &str {
+pub(super) fn component_of(desc: &str) -> &str {
     desc.get(1..).unwrap_or("")
 }
 
@@ -328,7 +328,7 @@ fn kind_label(is_prim: bool, comp: &str) -> String {
 /// 数组描述符 = 组件前补单个 `[`(基本 `I`→`[I`;`Ljava/lang/String;`→`[Ljava/lang/String;`;
 /// `[I`→`[[I`),**不加**右括号(`L…;` 自终结)。复用 [`array_instanceof`]:同描述符/超类
 /// Object[] 等短路在前,不触注册表;引用组件方走 `is_instance`。
-fn component_assignable(a: &str, b: &str, reg: &crate::oops::ClassRegistry) -> bool {
+pub(super) fn component_assignable(a: &str, b: &str, reg: &crate::oops::ClassRegistry) -> bool {
     array_instanceof(&format!("[{a}"), &format!("[{b}"), reg)
 }
 

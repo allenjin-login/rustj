@@ -111,6 +111,7 @@ class Box {
 interface BoxToInt { int apply(Box b); }
 interface BoxIntToInt { int apply(Box b, int n); }
 interface IntSupplier { int get(); }
+interface BoxFactory { Box make(int v); }
 public class MethodRefGate {
     // 无绑定实例方法引用:Box::get → 接收者来自 SAM 首参。
     public static int unbound() {
@@ -127,6 +128,11 @@ public class MethodRefGate {
         Box b = new Box(7);
         IntSupplier f = b::get;
         return f.get();
+    }
+    // 构造器引用:Box::new → 分配 + <init>(combined) + 返新实例。
+    public static int ctor() {
+        BoxFactory f = Box::new;
+        return f.make(99).v;
     }
 }
 "#;
@@ -146,7 +152,7 @@ fn instance_method_reference_real_bytecode() {
     let dir = compile_dir(SOURCE, "MethodRefGate");
     let mut registry = ClassRegistry::new();
     // 本地类(Box / 接口 / MethodRefGate)。
-    for cls in ["MethodRefGate", "Box", "BoxToInt", "BoxIntToInt", "IntSupplier"] {
+    for cls in ["MethodRefGate", "Box", "BoxToInt", "BoxIntToInt", "IntSupplier", "BoxFactory"] {
         registry
             .load(parse(&std::fs::read(dir.join(format!("{cls}.class"))).unwrap()).unwrap())
             .unwrap();
@@ -161,4 +167,5 @@ fn instance_method_reference_real_bytecode() {
     assert_eq!(run(&mut vm, "MethodRefGate", "unbound", "()I"), Value::Int(42), "Box::get apply(new Box(42))");
     assert_eq!(run(&mut vm, "MethodRefGate", "unboundArg", "()I"), Value::Int(15), "Box::plus apply(new Box(10),5)");
     assert_eq!(run(&mut vm, "MethodRefGate", "bound", "()I"), Value::Int(7), "b::get(b=new Box(7))");
+    assert_eq!(run(&mut vm, "MethodRefGate", "ctor", "()I"), Value::Int(99), "Box::new make(99).v");
 }

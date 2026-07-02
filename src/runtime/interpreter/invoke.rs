@@ -18,7 +18,10 @@ use crate::classfile::attributes::CodeAttribute;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_method_descriptor, FieldType, ReturnDescriptor};
 use crate::metadata::{ClassFile, MethodInfo};
-use crate::oops::lambda::{REF_INVOKE_INTERFACE, REF_INVOKE_SPECIAL, REF_INVOKE_STATIC, REF_INVOKE_VIRTUAL};
+use crate::oops::lambda::{
+    REF_INVOKE_INTERFACE, REF_INVOKE_SPECIAL, REF_INVOKE_STATIC, REF_INVOKE_VIRTUAL,
+    REF_NEW_INVOKE_SPECIAL,
+};
 use crate::oops::{LoadedClass, LambdaOop, Oop};
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
@@ -348,7 +351,7 @@ fn run_callee(
 ///   余下为实现形参。按接收者**运行时类虚分派**(尊重覆写,同 invokevirtual)。
 ///
 /// 实例捕获 lambda(`x -> this.f + x`)的 `this` 经 javac 编为静态实现的首参,仍走静态路径。
-/// 构造器引用(`REF_newInvokeSpecial`,`Foo::new`)顺延报错。
+/// 构造器引用(`REF_newInvokeSpecial`,`Foo::new`)见下方 ctor_ref 分支:分配 + <init> + 返新实例。
 fn dispatch_lambda(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
@@ -363,9 +366,10 @@ fn dispatch_lambda(
         kind,
         REF_INVOKE_VIRTUAL | REF_INVOKE_SPECIAL | REF_INVOKE_INTERFACE
     );
-    if !instance_ref && kind != REF_INVOKE_STATIC {
+    let ctor_ref = kind == REF_NEW_INVOKE_SPECIAL;
+    if !instance_ref && !ctor_ref && kind != REF_INVOKE_STATIC {
         return Err(VmError::BadConstant(
-            "lambda 实现方法句柄种类未支持(仅 invokeStatic/Virtual/Special/Interface)",
+            "lambda 实现方法句柄种类未支持(仅 invokeStatic/Virtual/Special/Interface/NewInvokeSpecial)",
         ));
     }
     let impl_class = lambda.impl_class().to_string();
@@ -386,6 +390,44 @@ fn dispatch_lambda(
         .registry()
         .ok_or(VmError::BadConstant("lambda 派发需要类注册表"))?;
     clinit::ensure_class_initialized(vm, &impl_class)?;
+
+    // 构造器引用(`Foo::new`):combined = 构造器形参;分配新实例 + 跑 <init>(void 返回),
+    // 再把新实例按 SAM 返回类型回填(<init> 返 void,不能直接复用 run_callee 的回填)。
+    if ctor_ref {
+        let target_lc = registry
+            .get(&impl_class)
+            .ok_or(VmError::BadConstant("lambda 构造类未加载"))?;
+        let target_method = find_method(&target_lc.cf, &impl_name, &impl_desc)?;
+        let code = target_method
+            .code
+            .as_ref()
+            .ok_or(VmError::BadConstant("lambda 构造器无 Code"))?;
+        let new_ref = vm
+            .heap_mut()
+            .alloc(Oop::Instance(registry.new_instance(target_lc)));
+        return match run_callee(
+            interp,
+            frame,
+            vm,
+            caller_pc,
+            target_lc,
+            target_method,
+            code,
+            Some(new_ref),
+            combined,
+            ReturnDescriptor::Void,
+        )? {
+            InvokeFlow::Fallthrough => finish_invoke(
+                interp,
+                frame,
+                vm,
+                caller_pc,
+                Ok(Value::Reference(new_ref)),
+                return_type,
+            ),
+            jump @ InvokeFlow::Jump(_) => Ok(jump),
+        };
+    }
 
     // (objref, 实现形参, 目标类, 目标方法):实例引用剥首位接收者 + 按其类虚分派。
     let (objref, impl_args, target_lc, target_method) = if instance_ref {

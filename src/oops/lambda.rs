@@ -12,10 +12,11 @@ use crate::runtime::Value;
 
 /// `CONSTANT_MethodHandle` 的 reference_kind(JVMS §4.4.8)。lambda 实现方法的句柄种类:
 /// `InvokeStatic` = lambda 体 / 静态方法引用;`InvokeVirtual`/`InvokeSpecial`/`InvokeInterface`
-/// = 实例方法引用(接收者隐含,派发时由捕获或 SAM 首参供给)。构造器引用(`NewInvokeSpecial`)顺延。
+/// = 实例方法引用(接收者隐含,派发时由捕获或 SAM 首参供给);`NewInvokeSpecial` = 构造器引用。
 pub(crate) const REF_INVOKE_VIRTUAL: u8 = 5;
 pub(crate) const REF_INVOKE_STATIC: u8 = 6;
 pub(crate) const REF_INVOKE_SPECIAL: u8 = 7;
+pub(crate) const REF_NEW_INVOKE_SPECIAL: u8 = 8;
 pub(crate) const REF_INVOKE_INTERFACE: u8 = 9;
 
 /// Lambda 闭包:实现方法身份 + 捕获,供 SAM 调用派发。

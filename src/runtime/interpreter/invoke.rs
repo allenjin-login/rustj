@@ -18,7 +18,7 @@ use crate::classfile::attributes::CodeAttribute;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_method_descriptor, FieldType, ReturnDescriptor};
 use crate::metadata::{ClassFile, MethodInfo};
-use crate::oops::lambda::REF_INVOKE_STATIC;
+use crate::oops::lambda::{REF_INVOKE_INTERFACE, REF_INVOKE_SPECIAL, REF_INVOKE_STATIC, REF_INVOKE_VIRTUAL};
 use crate::oops::{LoadedClass, LambdaOop, Oop};
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
@@ -178,7 +178,8 @@ fn method_matches(cf: &ClassFile, m: &MethodInfo, name: &str, desc: &str) -> boo
     name_ok && desc_ok
 }
 
-/// 一个调用实参(含引用),用于在调用者栈与被调用者局部变量间传递。
+/// 一个调用实参(含引用),用于在调用者栈与被调用者局部变量间传递。全变体 Copy。
+#[derive(Clone, Copy)]
 enum Arg {
     Int(i32),
     Long(i64),
@@ -338,11 +339,16 @@ fn run_callee(
 
 /// SAM 调用派发到 lambda 实现方法(对应 `LambdaMetafactory` 生成的合成类实现 SAM)。
 /// rustj 沿「按名特判」综合:闭包记实现方法身份 + 捕获;SAM 调用时**捕获前置 ++ SAM 实参**
-/// 交给实现方法执行(实现字节码本就期望「捕获…,SAM 形参…」序)。
+/// (合称 combined)交给实现方法执行。
 ///
-/// 仅 `REF_INVOKE_STATIC` 派发——覆盖无状态 lambda 体 + 静态方法引用 + 实例捕获 lambda
-/// (javac 把 lambda 体编为 `private static`,实例捕获把 `this` 作显式捕获前置)。其余句柄
-/// 种类(实例方法引用 / 构造器引用)顺延报错(spec 4.10aa §4)。
+/// 按实现方法句柄 reference_kind 分两路:
+/// - `REF_INVOKE_STATIC`(lambda 体 / 静态方法引用):实现为静态,combined 即其形参。
+/// - `REF_INVOKE_VIRTUAL`/`SPECIAL`/`INTERFACE`(实例方法引用 `obj::method` / `Type::method`):
+///   接收者隐含——combined 的**首位**为接收者(无绑定时来自 SAM 首参,绑定时来自捕获);
+///   余下为实现形参。按接收者**运行时类虚分派**(尊重覆写,同 invokevirtual)。
+///
+/// 实例捕获 lambda(`x -> this.f + x`)的 `this` 经 javac 编为静态实现的首参,仍走静态路径。
+/// 构造器引用(`REF_newInvokeSpecial`,`Foo::new`)顺延报错。
 fn dispatch_lambda(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
@@ -352,39 +358,73 @@ fn dispatch_lambda(
     args: Vec<Arg>,
     return_type: ReturnDescriptor,
 ) -> Result<InvokeFlow, VmError> {
-    if lambda.impl_kind() != REF_INVOKE_STATIC {
+    let kind = lambda.impl_kind();
+    let instance_ref = matches!(
+        kind,
+        REF_INVOKE_VIRTUAL | REF_INVOKE_SPECIAL | REF_INVOKE_INTERFACE
+    );
+    if !instance_ref && kind != REF_INVOKE_STATIC {
         return Err(VmError::BadConstant(
-            "lambda 实现方法句柄种类未支持(仅 REF_invokeStatic)",
+            "lambda 实现方法句柄种类未支持(仅 invokeStatic/Virtual/Special/Interface)",
         ));
     }
     let impl_class = lambda.impl_class().to_string();
     let impl_name = lambda.impl_name().to_string();
     let impl_desc = lambda.impl_desc().to_string();
+
+    // combined = 捕获(按捕获类型序)前置 ++ SAM 实参。
+    let mut combined: Vec<Arg> = lambda
+        .captures()
+        .iter()
+        .copied()
+        .map(arg_from_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    combined.extend(args);
+
+    // 解析实现类初始化(声明类;实例引用的虚分派按接收者类,但初始化仍触声明类)。
     let registry = vm
         .registry()
         .ok_or(VmError::BadConstant("lambda 派发需要类注册表"))?;
     clinit::ensure_class_initialized(vm, &impl_class)?;
-    let target_lc = registry
-        .get(&impl_class)
-        .ok_or(VmError::BadConstant("lambda 实现类未加载"))?;
-    let target_method = find_method(&target_lc.cf, &impl_name, &impl_desc)?;
-    // 捕获(按捕获时类型序)前置 ++ SAM 实参 → 实现方法局部变量(静态无 this)。
-    let mut all = Vec::with_capacity(lambda.captures().len() + args.len());
-    for v in lambda.captures().iter().copied() {
-        all.push(arg_from_value(v)?);
-    }
-    all.extend(args);
-    // 实现为 native(方法引用到 native 静态,如 Integer::valueOf)→ 内置 native 分派(无 this)。
+
+    // (objref, 实现形参, 目标类, 目标方法):实例引用剥首位接收者 + 按其类虚分派。
+    let (objref, impl_args, target_lc, target_method) = if instance_ref {
+        let first = combined
+            .first()
+            .copied()
+            .ok_or(VmError::BadConstant("实例方法引用缺接收者"))?;
+        combined.remove(0);
+        let Arg::Reference(recv) = first else {
+            return Err(VmError::BadConstant("实例方法引用的接收者须为引用"));
+        };
+        let recv_class = match vm.heap().get(recv) {
+            Some(Oop::Instance(i)) => i.class_name().to_string(),
+            _ => return Err(VmError::BadConstant("实例方法引用接收者须为实例")),
+        };
+        let (lc, m) = registry
+            .resolve_dispatch(&recv_class, &impl_name, &impl_desc)
+            .ok_or(VmError::BadConstant("lambda 实例方法引用未解析到方法(抽象?)"))?;
+        (Some(recv), combined, lc, m)
+    } else {
+        let lc = registry
+            .get(&impl_class)
+            .ok_or(VmError::BadConstant("lambda 实现类未加载"))?;
+        let m = find_method(&lc.cf, &impl_name, &impl_desc)?;
+        (None, combined, lc, m)
+    };
+
+    // 实现为 native(方法引用到 native,如 Object::hashCode)→ 内置 native 分派。
     if target_method.access_flags.is_native() {
         return dispatch_native(
-            interp, frame, vm, caller_pc, &impl_class, &impl_name, &impl_desc, None, all, return_type,
+            interp, frame, vm, caller_pc, &impl_class, &impl_name, &impl_desc, objref, impl_args,
+            return_type,
         );
     }
     let code = target_method
         .code
         .as_ref()
         .ok_or(VmError::BadConstant("lambda 实现方法无 Code(抽象)"))?;
-    run_callee(interp, frame, vm, caller_pc, target_lc, target_method, code, None, all, return_type)
+    run_callee(interp, frame, vm, caller_pc, target_lc, target_method, code, objref, impl_args, return_type)
 }
 
 /// `Value → Arg`(闭包捕获还原为实参)。void 不可能是捕获值。

@@ -10,15 +10,22 @@
 
 use crate::runtime::Value;
 
-/// `CONSTANT_MethodHandle` 的 reference_kind(JVMS §4.4.8)。仅本层用 `InvokeStatic`。
+/// `CONSTANT_MethodHandle` 的 reference_kind(JVMS §4.4.8)。lambda 实现方法的句柄种类:
+/// `InvokeStatic` = lambda 体 / 静态方法引用;`InvokeVirtual`/`InvokeSpecial`/`InvokeInterface`
+/// = 实例方法引用(接收者隐含,派发时由捕获或 SAM 首参供给)。构造器引用(`NewInvokeSpecial`)顺延。
+pub(crate) const REF_INVOKE_VIRTUAL: u8 = 5;
 pub(crate) const REF_INVOKE_STATIC: u8 = 6;
+pub(crate) const REF_INVOKE_SPECIAL: u8 = 7;
+pub(crate) const REF_INVOKE_INTERFACE: u8 = 9;
 
 /// Lambda 闭包:实现方法身份 + 捕获,供 SAM 调用派发。
 ///
 /// - `impl_*`:lambda 体(`lambda$<caller>$0`)或方法引用的 (类, 名, 描述符);描述符含
 ///   捕获形参在前、SAM 形参在后(javac 把 lambda 体编为 `private static`,实例捕获把
 ///   `this` 作显式捕获前置)。
-/// - `impl_kind`:`MethodHandle` reference_kind;本层仅派发 `REF_INVOKE_STATIC`(6)。
+/// - `impl_kind`:`MethodHandle` reference_kind;支持 `REF_INVOKE_STATIC`(lambda 体 / 静态方法
+///   引用)与 `REF_INVOKE_VIRTUAL`/`SPECIAL`/`INTERFACE`(实例方法引用——接收者为捕获或 SAM 首参)。
+///   构造器引用(`REF_newInvokeSpecial`)顺延。
 /// - `sam_type`:函数式接口内部名(factoryType 返回),供未来 `instanceof`/`checkcast`。
 /// - `captures`:按捕获类型序的值(SAM 派发时前置到 SAM 实参)。
 #[derive(Debug, Clone, PartialEq)]

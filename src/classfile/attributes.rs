@@ -105,6 +105,143 @@ pub fn parse_bootstrap_methods(info: &[u8]) -> Result<Vec<BootstrapMethodEntry>,
     Ok(entries)
 }
 
+/// `Module` 属性的 `requires` 项(JVMS §4.7.25):CP `Module` 索引 + 标志位 + 版本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRequiresEntry {
+    pub requires_index: u16,
+    /// `ACC_TRANSITIVE`(0x20)/`ACC_STATIC_PHASE`(0x40)/`ACC_SYNTHETIC`(0x1000)/`ACC_MANDATED`(0x8000)。
+    pub requires_flags: u16,
+    pub requires_version_index: u16,
+}
+
+/// `Module` 属性的 `exports` 项:CP `Package` 索引 + 标志位 + 限定导出目标模块(`Module` 索引列表)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleExportsEntry {
+    pub exports_index: u16,
+    pub exports_flags: u16,
+    pub exports_to: Vec<u16>,
+}
+
+/// `Module` 属性的 `opens` 项:结构同 [`ModuleExportsEntry`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleOpensEntry {
+    pub opens_index: u16,
+    pub opens_flags: u16,
+    pub opens_to: Vec<u16>,
+}
+
+/// `Module` 属性的 `provides` 项:CP `Class`(服务)索引 + 实现类(`Class` 索引列表)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleProvidesEntry {
+    pub provides_index: u16,
+    pub provides_with: Vec<u16>,
+}
+
+/// `Module` 属性深解析结果(JVMS §4.7.25,**常量池索引形式**)。常量池 `Module`/`Package`/`Utf8`
+/// 名解析在调用方(`ModuleDescriptor::from_class_file`)经 cp 做——本结构保持 cp 无关纯解码
+/// (镜像 `BootstrapMethodEntry`,属性名识别亦在调用方)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleAttribute {
+    pub module_name_index: u16,
+    /// `ACC_OPEN`(0x20)/`ACC_SYNTHETIC`(0x1000)/`ACC_MANDATED`(0x8000)。
+    pub module_flags: u16,
+    pub module_version_index: u16,
+    pub requires: Vec<ModuleRequiresEntry>,
+    pub exports: Vec<ModuleExportsEntry>,
+    pub opens: Vec<ModuleOpensEntry>,
+    /// CP `Class` 索引(服务接口)。
+    pub uses: Vec<u16>,
+    pub provides: Vec<ModuleProvidesEntry>,
+}
+
+/// 解码 `Module` 属性体字节(JVMS §4.7.25)。cp 无关纯解码;属性名识别在
+/// `ModuleDescriptor::from_class_file` 经 cp 做。
+pub fn parse_module_attribute(info: &[u8]) -> Result<ModuleAttribute, ClassFileError> {
+    let mut reader = Reader::new(info);
+    let module_name_index = reader.u2()?;
+    let module_flags = reader.u2()?;
+    let module_version_index = reader.u2()?;
+
+    let requires_count = usize::from(reader.u2()?);
+    let mut requires = Vec::with_capacity(requires_count);
+    for _ in 0..requires_count {
+        let requires_index = reader.u2()?;
+        let requires_flags = reader.u2()?;
+        let requires_version_index = reader.u2()?;
+        requires.push(ModuleRequiresEntry {
+            requires_index,
+            requires_flags,
+            requires_version_index,
+        });
+    }
+
+    let exports_count = usize::from(reader.u2()?);
+    let mut exports = Vec::with_capacity(exports_count);
+    for _ in 0..exports_count {
+        let exports_index = reader.u2()?;
+        let exports_flags = reader.u2()?;
+        let to_count = usize::from(reader.u2()?);
+        let mut exports_to = Vec::with_capacity(to_count);
+        for _ in 0..to_count {
+            exports_to.push(reader.u2()?);
+        }
+        exports.push(ModuleExportsEntry {
+            exports_index,
+            exports_flags,
+            exports_to,
+        });
+    }
+
+    let opens_count = usize::from(reader.u2()?);
+    let mut opens = Vec::with_capacity(opens_count);
+    for _ in 0..opens_count {
+        let opens_index = reader.u2()?;
+        let opens_flags = reader.u2()?;
+        let to_count = usize::from(reader.u2()?);
+        let mut opens_to = Vec::with_capacity(to_count);
+        for _ in 0..to_count {
+            opens_to.push(reader.u2()?);
+        }
+        opens.push(ModuleOpensEntry {
+            opens_index,
+            opens_flags,
+            opens_to,
+        });
+    }
+
+    let uses_count = usize::from(reader.u2()?);
+    let mut uses = Vec::with_capacity(uses_count);
+    for _ in 0..uses_count {
+        uses.push(reader.u2()?);
+    }
+
+    let provides_count = usize::from(reader.u2()?);
+    let mut provides = Vec::with_capacity(provides_count);
+    for _ in 0..provides_count {
+        let provides_index = reader.u2()?;
+        let with_count = usize::from(reader.u2()?);
+        let mut provides_with = Vec::with_capacity(with_count);
+        for _ in 0..with_count {
+            provides_with.push(reader.u2()?);
+        }
+        provides.push(ModuleProvidesEntry {
+            provides_index,
+            provides_with,
+        });
+    }
+
+    Ok(ModuleAttribute {
+        module_name_index,
+        module_flags,
+        module_version_index,
+        requires,
+        exports,
+        opens,
+        uses,
+        provides,
+    })
+}
+
 /// 深解析 `Code` 属性体字节。
 pub fn parse_code(info: &[u8]) -> Result<CodeAttribute, ClassFileError> {
     let mut reader = Reader::new(info);
@@ -270,6 +407,76 @@ mod tests {
         let info = [0x00, 0x01, 0x00, 0x1D]; // count=1 但 ref 后缺 num_args
         assert!(matches!(
             parse_bootstrap_methods(&info),
+            Err(ClassFileError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_module_attribute_decodes_requires_exports_uses_provides() {
+        // 最小 Module 属性体(JVMS §4.7.25):
+        //   module_name_index=6, module_flags=0, module_version_index=0
+        //   requires_count=1: { requires_index=10, flags=0x0040(STATIC_PHASE), version=0 }
+        //   exports_count=1:   { exports_index=20, flags=0, to_count=0 }
+        //   opens_count=0
+        //   uses_count=1:    uses_index=30
+        //   provides_count=1:{ provides_index=40, with_count=1, with=[50] }
+        let info = [
+            0x00, 0x06, // module_name_index
+            0x00, 0x00, // module_flags
+            0x00, 0x00, // module_version_index
+            0x00, 0x01, // requires_count
+            0x00, 0x0A, 0x00, 0x40, 0x00, 0x00, // requires[0]
+            0x00, 0x01, // exports_count
+            0x00, 0x14, 0x00, 0x00, 0x00, 0x00, // exports[0]
+            0x00, 0x00, // opens_count
+            0x00, 0x01, // uses_count
+            0x00, 0x1E, // uses[0]
+            0x00, 0x01, // provides_count
+            0x00, 0x28, 0x00, 0x01, 0x00, 0x32, // provides[0]
+        ];
+        let m = parse_module_attribute(&info).unwrap();
+        assert_eq!(m.module_name_index, 6);
+        assert_eq!(m.module_flags, 0);
+        assert_eq!(m.module_version_index, 0);
+        assert_eq!(m.requires.len(), 1);
+        assert_eq!(m.requires[0].requires_index, 10);
+        assert_eq!(m.requires[0].requires_flags, 0x0040);
+        assert_eq!(m.requires[0].requires_version_index, 0);
+        assert_eq!(m.exports.len(), 1);
+        assert_eq!(m.exports[0].exports_index, 20);
+        assert!(m.exports[0].exports_to.is_empty());
+        assert!(m.opens.is_empty());
+        assert_eq!(m.uses, vec![30]);
+        assert_eq!(m.provides.len(), 1);
+        assert_eq!(m.provides[0].provides_index, 40);
+        assert_eq!(m.provides[0].provides_with, vec![50]);
+    }
+
+    #[test]
+    fn parse_module_attribute_decodes_qualified_export() {
+        // exports 带 to 列表:exports_index=7, flags=0, to_count=2, to=[11, 13]
+        let info = [
+            0x00, 0x06, // module_name_index
+            0x00, 0x00, // module_flags
+            0x00, 0x00, // module_version_index
+            0x00, 0x00, // requires_count=0
+            0x00, 0x01, // exports_count=1
+            0x00, 0x07, 0x00, 0x00, 0x00, 0x02, 0x00, 0x0B, 0x00, 0x0D,
+            0x00, 0x00, // opens_count=0
+            0x00, 0x00, // uses_count=0
+            0x00, 0x00, // provides_count=0
+        ];
+        let m = parse_module_attribute(&info).unwrap();
+        assert_eq!(m.exports.len(), 1);
+        assert_eq!(m.exports[0].exports_to, vec![11, 13]);
+    }
+
+    #[test]
+    fn parse_module_attribute_rejects_truncated() {
+        // 仅 module_name_index,缺后续
+        let info = [0x00, 0x06];
+        assert!(matches!(
+            parse_module_attribute(&info),
             Err(ClassFileError::Truncated { .. })
         ));
     }

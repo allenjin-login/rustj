@@ -37,6 +37,15 @@ pub(super) fn dispatch(
             Ok(Value::Int(id))
         }
 
+        // Object.notify()/notifyAll()/wait() —— jvm.cpp JVM_MonitorNotify/NotifyAll/Wait。
+        // rustj 单线程:管程恒已满足、无 wait set → **空操作**(无并发线程可唤醒/等待)。
+        // 解锁 `synchronized` 块尾的 `lock.notifyAll()`(如 VM.initLevel)等;真阻塞/调度顺延。
+        ("java/lang/Object", "notify", "()V") => Ok(Value::Void),
+        ("java/lang/Object", "notifyAll", "()V") => Ok(Value::Void),
+        ("java/lang/Object", "wait", "()V") => Ok(Value::Void),
+        ("java/lang/Object", "wait", "(J)V") => Ok(Value::Void),
+        ("java/lang/Object", "wait", "(JI)V") => Ok(Value::Void),
+
         // Object.getClass()Ljava/lang/Class; —— Object.java:68 public final native
         // (HotSpot 为 intrinsic)。返接收者运行时类的 Class 镜像(intern:同类恒同引用,使
         // `obj.getClass() == Foo.class` 成立)。Instance→类名(Class 镜像自身为 java/lang/Class

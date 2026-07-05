@@ -11,6 +11,7 @@ mod clinit;
 mod exception;
 mod field;
 mod invoke;
+pub mod launch;
 mod native;
 mod string;
 mod type_check;
@@ -1315,6 +1316,23 @@ impl<'a> Interpreter<'a> {
                     VmError::ThrownException(exc)
                 };
                 return Err(err);
+            }
+            // monitorenter/monitorexit(JVMS §6.5 monitorenter/monitorexit):进入/退出 objref 的管程。
+            // rustj 单线程解释器——管程恒已满足(无并发争用),故两指令均**空操作 + 弹 objref**
+            //(对应 HotSpot `ObjectSynchronizer::enter`/`exit` 在单线程下的快路径)。解锁所有
+            // `synchronized` 方法/块(java.base 普遍使用,如 `VM.initLevel` 的 `synchronized(lock)`)。
+            // null objref → NPE(忠实 JVM);管程计数/重入/IllegalMonitorStateException 顺延。
+            Opcode::Monitorenter => {
+                if frame.operands.pop_reference()?.is_null() {
+                    return Err(throw_exception(vm, "java/lang/NullPointerException"));
+                }
+                pc += 1;
+            }
+            Opcode::Monitorexit => {
+                if frame.operands.pop_reference()?.is_null() {
+                    return Err(throw_exception(vm, "java/lang/NullPointerException"));
+                }
+                pc += 1;
             }
             other => return Err(VmError::UnsupportedOpcode(other)),
         }

@@ -270,12 +270,12 @@ fn write_element(vm: &mut Vm<'_>, r: Reference, idx: usize, slot: Slot) -> Resul
 }
 
 /// 元素运行时类型 → 组件描述符(供 [`component_assignable`] 比对 dst 组件)。
-/// 实例 `java/lang/String` → `Ljava/lang/String;`;数组 `[I` → `[I`;Class 镜像 → `Ljava/lang/Class;`。
+/// 实例 `java/lang/String` → `Ljava/lang/String;`;数组 `[I` → `[I`;Class 镜像为
+/// `java/lang/Class` Instance → `Ljava/lang/Class;`(经 Instance 臂)。
 pub(super) fn element_component(vm: &Vm<'_>, r: Reference) -> Result<String, VmError> {
     Ok(match vm.heap().get(r) {
         Some(Oop::Instance(i)) => format!("L{};", i.class_name()),
         Some(Oop::Array(a)) => a.class_name().to_string(),
-        Some(Oop::Class(_)) => "Ljava/lang/Class;".to_string(),
         Some(Oop::Lambda(l)) => format!("L{};", l.sam_type()),
         None => return Err(VmError::BadConstant("arraycopy 元素引用悬空")),
     })

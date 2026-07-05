@@ -64,15 +64,49 @@ java.base 不依赖完整 JNIEnv。
   ——java.base 不 requires 自己;断言 `exports` 含 `java/lang`、`java/util` 包,`requires` 仅(可能)transitive。
 - 纯解析层,零 VM 改动。
 
-### Layer 4.12 — ClassLoader 身份
+### Layer 4.12 — **退役 `Oop::Class` → 真 `java/lang/Class` Instance**(修订:探针发现)
 
-- `LoaderId` 枚举(Bootstrap/Platform/App)+ `LoadedClass.loader: LoaderId`(默认 Bootstrap;
-  闭包加载器载入的真类继承 Bootstrap——java.base 全 Bootstrap)。
-- Native `Class.getClassLoader0()Ljava/lang/ClassLoader;`:Bootstrap→`null`(忠实);其余→
-  预载 ClassLoader 镜像。
-- 最小桩 native:`ClassLoader.findLoadedClass0`/`findBootstrapClass`(返类镜像或 null)、
-  `defineClass1`(占位/顺延真实动态定义)。
-- 闸门:真 java.base 类的 `getClass()`/`getClassLoader()` 经真 `Class` 字节码返 null。
+> **修订原因(2026-07-05 探针)**:JDK 25 的 `Class.getClassLoader()`(Class.java:982)、
+> `getModule()`(:1005)、`getName()`(:959)、`isArray()`(:817)、`isPrimitive()`(:860)、
+> `getComponentType()`(:1303) **全是真字节码字段读**(`return classLoader;` / `return name != null ? name : initClassName();` / `return componentType != null;` / `return primitive;`)。
+> 但 rustj 的 `Oop::Class` 镜像在 `invokevirtual/interface` 收者为镜像时**整体路由到固定 native 表**
+> (invoke.rs:867/985),从不回落真 Class 字节码;native 表又只含若干桩(`getModule`→null、
+> `getClassLoader0`→null、`desiredAssertionStatus`→0),`public getClassLoader`/`getName`/…
+> 不在表 → `UnsatisfiedLinkError`。**这是「完整加载 java.base + 反射 + 模块系统」的真地基阻塞。**
+
+- **表示变更**:移除 `Oop::Class(ClassOop)` 变体与 `ClassOop` 结构(`oops/class_oop.rs`)。
+  Class 镜像改为真 `Oop::Instance`(`java/lang/Class`)。`java/lang/Class` 已被 `load_closure`
+  传递预载(loader.rs:256-260,Object.getClass 返回类型)→ **无新闭包风险**;其 `<clinit>`
+  仅 `runtimeSetup()`→`registerNatives()`(空操作,Class.java:232-241)→ **安全**。
+- **`intern_class_mirror(name)`**:取 `java/lang/Class` 的 `LoadedClass` → `new_instance` →
+  经 `instance_field(lc,name,desc)` 动态查序号,置 VM 字段:`name`(外部形:类 `/`→`.`、
+  原语如 `int`、数组 `[I`/`[Ljava.lang.String;`)、`componentType`(数组→组件镜像,否则 null)、
+  `primitive`(原语→true);`classLoader`/`module` 默认 null(Bootstrap,4.13a 才填 module)。
+  缓存双向:`class_mirrors: name→Reference`(既有)+ 新 `mirror_class: Reference→internal-name`
+  (供 native 反查镜像所表示的类)。
+- **分派路径清理**:移除 `invoke_virtual/interface` 的 `Oop::Class` 早分支(镜像成 Instance →
+  正常类链分派;真 Class 字节码运行,ACC_NATIVE 法经既有 native 表 keyed on `java/lang/Class`)。
+  移除 `getfield/putfield`(field.rs:181/221)、`type_check`、`array`、`heap`、`exception`、
+  `arraycopy`、`native/mod.rs:95`(Instance.class_name()=="java/lang/Class" 自洽)的 `Oop::Class` 臂。
+- **新增/调整 Class native**(java_lang.rs):
+  - `registerNatives()V` — 空操作(既有策略)。
+  - `initClassName()Ljava/lang/String;` — 防御:置并返 `name`(预置则 getName 不调;经
+    `mirror_class` 取内部名→外部形)。
+  - `isInstance(Ljava/lang/Object;)Z` — `registry.is_instance(镜像类, 实参类)`。
+  - `isAssignableFrom(Ljava/lang/Class;)Z` — `registry.is_instance(实参镜像类, 本镜像类)`。
+  - `getSuperclass()Ljava/lang/Class;` — 镜像类的 `super_class_name` → 镜像;接口/原语→null。
+  - `desiredAssertionStatus0(Ljava/lang/Class;)Z` — 0(替换原 `desiredAssertionStatus` 桩,
+    该法现由真字节码 `return desiredAssertionStatus0(this)` 进入)。
+  - 移除原 `getClassLoader0`/`getModule`/`desiredAssertionStatus` 桩——现由真字节码字段读覆盖
+    (`getClassLoader` 读 `classLoader`=null;`getModule` 读 `module`=null)。
+  - `getPrimitiveClass` 既有保留。
+- **ClassLoader 身份折入**:`getClassLoader()` 经真字节码读 `classLoader` 字段(null=Bootstrap)
+  即忠实;`LoaderId` 标签顺延(无委托链需求)。`findLoadedClass0`/`findBootstrapClass`/`defineClass1`
+  顺延到真有用户类加载器时。
+- **闸门**(javac + jmod):真 java.base 程序 `Integer.class.getName()`="java.lang.Integer"、
+  `.getSuperclass()`=Number、`Number.class.isAssignableFrom(Integer.class)`=true、
+  `int[].class.isArray()`=true、`int.class.isPrimitive()`=true、`.getClassLoader()`=null、
+  `.getModule()`=null;**既有 `class_mirror.rs` 身份相等(literalTwice/getClassEq/distinct)仍绿**。
 
 ### Layer 4.13a — Module 对象模型 + Class.getModule()
 

@@ -39,8 +39,8 @@ pub(super) fn dispatch(
 
         // Object.getClass()Ljava/lang/Class; —— Object.java:68 public final native
         // (HotSpot 为 intrinsic)。返接收者运行时类的 Class 镜像(intern:同类恒同引用,使
-        // `obj.getClass() == Foo.class` 成立)。Instance→类名;Array→数组描述符([I/…);
-        // Class 镜像自身→java.lang.Class。
+        // `obj.getClass() == Foo.class` 成立)。Instance→类名(Class 镜像自身为 java/lang/Class
+        // Instance → 其 getClass 返 java/lang/Class 镜像,自洽);Array→数组描述符([I/…)。
         ("java/lang/Object", "getClass", "()Ljava/lang/Class;") => {
             let Some(r) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
@@ -48,7 +48,6 @@ pub(super) fn dispatch(
             let name = match vm.heap().get(r) {
                 Some(Oop::Instance(i)) => i.class_name().to_string(),
                 Some(Oop::Array(a)) => a.class_name().to_string(),
-                Some(Oop::Class(_)) => "java/lang/Class".to_string(),
                 _ => return Err(throw_exception(vm, "java/lang/InternalError")),
             };
             Ok(Value::Reference(vm.intern_class_mirror(&name)))
@@ -133,25 +132,106 @@ pub(super) fn dispatch(
             Ok(Value::Reference(vm.intern_class_mirror(&text)))
         }
 
-        // Class.desiredAssertionStatus()Z —— javac 断言初始化(`!Foo.class.desiredAssertionStatus()`)
-        // 广见于 java.base 各 <clinit>。真 Class 类此法走 ClassLoader + desiredAssertionStatus0;
-        // rustj 无断言支持 → 恒 false(断言禁用,即 `$assertionsDisabled = true`)。Oop::Class 镜像
-        // 由 invoke 路径按 "java/lang/Class" 经本表分派(见 invoke_virtual/interface)。
-        ("java/lang/Class", "desiredAssertionStatus", "()Z") => Ok(Value::Int(0)),
+        // Class.desiredAssertionStatus0(Ljava/lang/Class;)Z —— Class.java:3341 真原生(由
+        // desiredAssertionStatus() 字节码 `return desiredAssertionStatus0(this)` 调)。rustj
+        // 无断言支持 → 恒 false(断言禁用,即 `$assertionsDisabled = true`)。
+        ("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z") => Ok(Value::Int(0)),
 
-        // Class.getClassLoader0()Ljava/lang/ClassLoader; —— Class.java:987(字段读字节码),
-        // 但 Oop::Class 镜像经本表分派(无真实 ClassLoader 字段)。rustj 视所有类为引导类
-        // → null。真 STE.computeFormat(STE.java:466)据此:`loader instanceof BuiltinClassLoader`
-        // 对 null 安全(instanceof null → 0),不走该分支。
-        ("java/lang/Class", "getClassLoader0", "()Ljava/lang/ClassLoader;") => {
-            Ok(Value::Reference(Reference::null()))
+        // Class.initClassName()Ljava/lang/String; —— Class.java:967 真原生;getName() 字节码
+        // 首次(`name == null`)调此。按镜像反查内部名→外部形(`/`→`.`),经 string::intern 造真
+        // String,回填 `name` 字段并返之;后续 getName 直接读字段(不再进 native)。
+        ("java/lang/Class", "initClassName", "()Ljava/lang/String;") => {
+            let Some(this) = this else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let Some(internal) = vm.mirror_internal_name(this).map(|s| s.to_string()) else {
+                return Err(throw_exception(vm, "java/lang/InternalError"));
+            };
+            let external = internal.replace('/', ".");
+            let s = super::super::string::intern(vm, &external)?;
+            vm.set_class_instance_field(this, "name", Slot::Reference(s));
+            Ok(Value::Reference(s))
         }
-        // Class.getModule()Ljava/lang/Module; —— Class.java:1005。镜像无 Module 字段 → null。
-        // computeFormat 传 m 给 isHashedInJavaBase(m)(STE.java:512):其首判
-        // `!VM.isModuleSystemInited()`(VM.java:92,字节码读 initLevel,默认 0 < MODULE_SYSTEM_INITED
-        // → 假;故 !假 = 真 → 返真,短路,不 deref m)→ format 取默认,无 NPE。
-        ("java/lang/Class", "getModule", "()Ljava/lang/Module;") => {
-            Ok(Value::Reference(Reference::null()))
+
+        // Class.isInstance(Ljava/lang/Object;)Z —— Class.java:768 真原生。obj 的运行时类是否
+        // 本镜像类的子类型 = is_instance(obj_class, this_internal)(registry 语义:子类型关系)。
+        ("java/lang/Class", "isInstance", "(Ljava/lang/Object;)Z") => {
+            let Some(this) = this else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let Some(this_internal) = vm.mirror_internal_name(this).map(|s| s.to_string()) else {
+                return Err(throw_exception(vm, "java/lang/InternalError"));
+            };
+            let Value::Reference(objref) = args.first().copied().unwrap_or(Value::Void) else {
+                return Ok(Value::Int(0));
+            };
+            if objref.is_null() {
+                return Ok(Value::Int(0));
+            }
+            let Some(reg) = vm.registry() else {
+                return Ok(Value::Int(0));
+            };
+            let arg_class = match vm.heap().get(objref) {
+                Some(Oop::Instance(i)) => i.class_name().to_string(),
+                Some(Oop::Array(a)) => a.class_name().to_string(),
+                _ => return Ok(Value::Int(0)),
+            };
+            // is_instance(X, Y) = "X 是 Y 的子类型";obj 是本类实例 ⇔ arg_class 是 this 的子类型
+            // ⇔ is_instance(arg_class, this_internal)。
+            Ok(Value::Int(if reg.is_instance(&arg_class, &this_internal) {
+                1
+            } else {
+                0
+            }))
+        }
+
+        // Class.isAssignableFrom(Ljava/lang/Class;)Z —— Class.java:795 真原生。arg 镜像类是否
+        // 本镜像类的子类型 = is_instance(arg_internal, this_internal)。
+        ("java/lang/Class", "isAssignableFrom", "(Ljava/lang/Class;)Z") => {
+            let Some(this) = this else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let Some(this_internal) = vm.mirror_internal_name(this).map(|s| s.to_string()) else {
+                return Err(throw_exception(vm, "java/lang/InternalError"));
+            };
+            let Value::Reference(arg_mirror) = args.first().copied().unwrap_or(Value::Void) else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let Some(arg_internal) = vm.mirror_internal_name(arg_mirror).map(|s| s.to_string()) else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let Some(reg) = vm.registry() else {
+                return Ok(Value::Int(0));
+            };
+            Ok(Value::Int(if reg.is_instance(&arg_internal, &this_internal) {
+                1
+            } else {
+                0
+            }))
+        }
+
+        // Class.getSuperclass()Ljava/lang/Class; —— Class.java:1066 真原生。镜像类的直接超类
+        // → 其镜像;数组→Object;原语/void(注册表无对应 LoadedClass)→ null。接口语义顺延
+        //(接口 classfile 的 super 为 Object,故接口暂返 Object 镜像;完整接口判定顺延)。
+        ("java/lang/Class", "getSuperclass", "()Ljava/lang/Class;") => {
+            let Some(this) = this else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let Some(internal) = vm.mirror_internal_name(this).map(|s| s.to_string()) else {
+                return Err(throw_exception(vm, "java/lang/InternalError"));
+            };
+            let super_name = if internal.starts_with('[') {
+                Some("java/lang/Object".to_string())
+            } else {
+                vm.registry()
+                    .and_then(|reg| reg.get(&internal))
+                    .and_then(|lc| lc.super_class_name().map(|s| s.to_string()))
+            };
+            let result = match super_name {
+                Some(s) => vm.intern_class_mirror(&s),
+                None => Reference::null(),
+            };
+            Ok(Value::Reference(result))
         }
 
         // Runtime.maxMemory()J —— jvm.cpp JVM_MaxMemory:堆上限。rustj 堆为无界 Vec → 取 i64::MAX

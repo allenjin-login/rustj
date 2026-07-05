@@ -85,16 +85,14 @@ fn is_primitive_name(name: &str) -> bool {
     )
 }
 
-/// 取第 0 参(Class 镜像)的内部名(如 `[B`);非 Class 实参 / 悬空 → `None`。
-/// 供 `Unsafe.arrayIndexScale(Class)` 按数组组件类型定刻度。
+/// 取第 0 参(Class 镜像)的内部名(如 `[B`);非 Class 镜像 / 悬空 → `None`。
+/// 供 `Unsafe.arrayIndexScale(Class)` 按数组组件类型定刻度。镜像现为 `java/lang/Class`
+/// Instance,所表示的类型经 `Vm::mirror_internal_name` 反查(4.12)。
 fn class_arg_name(vm: &Vm<'_>, args: &[Value]) -> Option<String> {
     let Value::Reference(r) = args.first().copied()? else {
         return None;
     };
-    match vm.heap().get(r)? {
-        crate::oops::Oop::Class(c) => Some(c.name().to_string()),
-        _ => None,
-    }
+    vm.mirror_internal_name(r).map(|s| s.to_string())
 }
 
 #[cfg(test)]

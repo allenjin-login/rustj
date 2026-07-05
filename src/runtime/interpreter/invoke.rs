@@ -862,23 +862,6 @@ pub(super) fn invoke_virtual(
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
 
-    // Class 镜像(Oop::Class)非注册表类,经 "java/lang/Class" 的 native 表分派
-    // (desiredAssertionStatus 等)。先于 runtime_class 解析(其按类链查表,镜像无类链)。
-    if matches!(vm.heap().get(objref), Some(Oop::Class(_))) {
-        return dispatch_native(
-            interp,
-            frame,
-            vm,
-            caller_pc,
-            "java/lang/Class",
-            &method_name,
-            &desc,
-            Some(objref),
-            args,
-            md.return_type,
-        );
-    }
-
     // 数组 receiver:仅 `Object.clone()` 浅拷贝(同描述符 + 复制元素槽),解锁
     // `Throwable.getOurStackTrace().clone()`(StackTraceElement[])等;其余数组方法顺延。
     if let Some(Oop::Array(a)) = vm.heap().get(objref) {
@@ -910,7 +893,6 @@ pub(super) fn invoke_virtual(
     let runtime_class = match runtime_class {
         Oop::Instance(i) => i.class_name().to_string(),
         Oop::Array(_) => unreachable!("数组 receiver 已先行 clone/顺延分派"),
-        Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
         Oop::Lambda(_) => unreachable!("闭包 receiver 已先行 SAM 派发"),
     };
 
@@ -981,22 +963,6 @@ pub(super) fn invoke_interface(
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
 
-    // Class 镜像经 "java/lang/Class" 的 native 表分派(同 invoke_virtual)。
-    if matches!(vm.heap().get(objref), Some(Oop::Class(_))) {
-        return dispatch_native(
-            interp,
-            frame,
-            vm,
-            caller_pc,
-            "java/lang/Class",
-            &method_name,
-            &desc,
-            Some(objref),
-            args,
-            md.return_type,
-        );
-    }
-
     // 数组 receiver:仅 `Object.clone()` 浅拷贝(同 invoke_virtual)。
     if let Some(Oop::Array(a)) = vm.heap().get(objref) {
         if method_name == "clone" {
@@ -1027,7 +993,6 @@ pub(super) fn invoke_interface(
     let runtime_class = match runtime_class {
         Oop::Instance(i) => i.class_name().to_string(),
         Oop::Array(_) => unreachable!("数组 receiver 已先行 clone/顺延分派"),
-        Oop::Class(_) => unreachable!("Class 镜像已先行 native 分派"),
         Oop::Lambda(_) => unreachable!("闭包 receiver 已先行 SAM 派发"),
     };
 

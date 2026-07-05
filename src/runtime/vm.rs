@@ -9,10 +9,10 @@
 
 use std::collections::HashMap;
 
-use crate::oops::ClassRegistry;
+use crate::oops::{ClassRegistry, Oop};
 use crate::runtime::heap::Heap;
 use crate::runtime::string_pool::StringPool;
-use crate::runtime::Reference;
+use crate::runtime::{Reference, Slot};
 
 /// 默认帧深度上限。高于 ackermann(3,3) 的递归深度(~120),正常小测试不会误触;
 /// 可经 [`Vm::with_stack_limit`] 调整(SOE 测试用小值快速触发)。
@@ -65,6 +65,10 @@ pub struct Vm<'a> {
     /// 镜像引用。对应 HotSpot 每个 `Klass` 持有单一 `_java_mirror`(Class 对象)。保证
     /// `Foo.class == Foo.class`、`obj.getClass() == Foo.class` 等 Class 对象身份相等。
     class_mirrors: HashMap<String, Reference>,
+    /// Class 镜像反查表(4.12):镜像引用 → 所表示类型的内部名。供 Class native
+    /// (`getSuperclass`/`isInstance`/`isAssignableFrom`/`initClassName`…)由镜像反查类。
+    /// 镜像现为真 `java/lang/Class` Instance,Instance 本身不记所表示的类 → 须此表。
+    mirror_class: HashMap<Reference, String>,
 }
 
 impl<'a> Vm<'a> {
@@ -79,6 +83,7 @@ impl<'a> Vm<'a> {
             call_stack: Vec::new(),
             exception_meta: HashMap::new(),
             class_mirrors: HashMap::new(),
+            mirror_class: HashMap::new(),
         }
     }
 
@@ -109,18 +114,71 @@ impl<'a> Vm<'a> {
         &mut self.string_pool
     }
 
-    /// Class 镜像 intern(4.10t):同一内部类名恒返回同一 Class 镜像引用(对应 HotSpot 每
-    /// `Klass` 的单一 `_java_mirror`)。首次分配 `Oop::Class` 并缓存;后续命中直接返。
-    /// 使 `Foo.class == Foo.class`、`obj.getClass() == Foo.class` 等 Class 身份相等成立。
+    /// Class 镜像 intern(4.10t 起;4.12 退役 `Oop::Class`):同一内部类名恒返回同一 Class
+    /// 镜像引用(对应 HotSpot 每 `Klass` 的单一 `_java_mirror`)。镜像现为**真 `java/lang/Class`
+    /// Instance**——首次 `new_instance` 分配,置 VM 字段(`componentType`/`primitive`),并登记
+    /// 反查表 `mirror_class`;后续命中直接返。使 `Foo.class == Foo.class`、
+    /// `obj.getClass() == Foo.class` 等 Class 身份相等成立。
+    ///
+    /// `name`/`classLoader`/`module` 字段保持默认 null(`classLoader`=null 即 Bootstrap;
+    /// `module` 由 4.13a 填)。`name` 由 `getName` 真字节码首次调用时经 `initClassName` 懒填。
     pub(crate) fn intern_class_mirror(&mut self, name: &str) -> Reference {
         if let Some(r) = self.class_mirrors.get(name) {
             return *r;
         }
-        let r = self.heap.alloc(crate::oops::Oop::Class(crate::oops::ClassOop::new(
-            name.to_string(),
-        )));
+        // 分配真 java/lang/Class Instance(须已加载:引导 Class 桩或经闭包预载的真 Class)。
+        let r = self.alloc_class_mirror_instance();
+        // 先缓存再填字段:数组组件互递归([LC→C、[[I→[I)经缓存命中终止。
         self.class_mirrors.insert(name.to_string(), r);
+        self.mirror_class.insert(r, name.to_string());
+        self.populate_class_mirror_fields(r, name);
         r
+    }
+
+    /// 镜像所表示类型的内部名(供 Class native 反查)。非镜像引用 → `None`。
+    pub(crate) fn mirror_internal_name(&self, r: Reference) -> Option<&str> {
+        self.mirror_class.get(&r).map(String::as_str)
+    }
+
+    /// 分配一个默认初始化的 `java/lang/Class` Instance。无注册表或 `java/lang/Class` 未加载
+    /// (非真实运行场景)→ 返 null 兜底(调用方多为 native,返 null 镜像不致 panic)。
+    fn alloc_class_mirror_instance(&mut self) -> Reference {
+        let Some(reg) = self.registry() else {
+            return Reference::null();
+        };
+        let Some(class_lc) = reg.get("java/lang/Class") else {
+            return Reference::null();
+        };
+        let inst = reg.new_instance(class_lc);
+        self.heap.alloc(Oop::Instance(inst))
+    }
+
+    /// 置 VM 管理的 Class 实例字段:`componentType`(数组→组件镜像)、`primitive`(原语→true)。
+    /// 字段经名查序号;`java/lang/Class` 未见该字段(桩精简)→ 静默跳过。
+    fn populate_class_mirror_fields(&mut self, mirror: Reference, internal: &str) {
+        if let Some(comp) = component_internal_of(internal) {
+            let comp_mirror = self.intern_class_mirror(&comp);
+            self.set_class_instance_field(mirror, "componentType", Slot::Reference(comp_mirror));
+        }
+        if is_primitive_keyword(internal) {
+            self.set_class_instance_field(mirror, "primitive", Slot::Int(1));
+        }
+    }
+
+    /// 按**字段名**(忽略描述符)在 `java/lang/Class` 扁平实例字段中查序号并写槽。
+    pub(crate) fn set_class_instance_field(&mut self, mirror: Reference, field_name: &str, slot: Slot) {
+        let Some(reg) = self.registry() else { return };
+        let Some(class_lc) = reg.get("java/lang/Class") else { return };
+        let Some(ord) = reg
+            .flattened_instance_fields(class_lc)
+            .iter()
+            .position(|f| f.name == field_name)
+        else {
+            return;
+        };
+        if let Some(Oop::Instance(i)) = self.heap_mut().get_mut(mirror) {
+            i.set_field(ord, slot);
+        }
     }
 
     /// 类注册表(若启用)。
@@ -248,7 +306,6 @@ impl<'a> Vm<'a> {
     /// `\nCaused by: <cause 类>[: message]` + cause 自身帧。深度上限 64(防环/失控链)。
     /// 无快照且无 cause/message → 空串(旧契约)。供测试/诊断;顶层未捕获时自动打印。
     pub fn format_trace(&self, exc: Reference) -> String {
-        use crate::oops::Oop;
         let Some(meta) = self.exception_meta.get(&exc) else {
             return String::new();
         };
@@ -315,6 +372,35 @@ impl Default for Vm<'_> {
             call_stack: Vec::new(),
             exception_meta: HashMap::new(),
             class_mirrors: HashMap::new(),
+            mirror_class: HashMap::new(),
         }
     }
 }
+
+/// 是否为原语关键字(`int`/`void`/…;非内部描述符 `I`)。原语 Class 镜像的 intern 名即关键字。
+fn is_primitive_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void"
+    )
+}
+
+/// 数组内部名(`[I`/`[Ljava/lang/String;`/`[[I`)的**组件类型内部名**。非数组 → `None`。
+/// 组件为原语时返关键字(`int`);为对象类时返内部名(`java/lang/String`);为嵌套数组返 `[I`。
+fn component_internal_of(name: &str) -> Option<String> {
+    let rest = name.strip_prefix('[')?;
+    match rest.chars().next()? {
+        'B' => Some("byte".into()),
+        'C' => Some("char".into()),
+        'D' => Some("double".into()),
+        'F' => Some("float".into()),
+        'I' => Some("int".into()),
+        'J' => Some("long".into()),
+        'S' => Some("short".into()),
+        'Z' => Some("boolean".into()),
+        'L' => Some(rest.strip_prefix('L')?.strip_suffix(';')?.to_string()),
+        '[' => Some(rest.to_string()),
+        _ => None,
+    }
+}
+

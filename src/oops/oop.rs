@@ -7,7 +7,6 @@
 //! 4.10aa:lambda 闭包(经 `LambdaMetafactory.metafactory` 综合的 SAM 实例),见 [`LambdaOop`]。
 
 use super::array::ArrayOop;
-use super::class_oop::ClassOop;
 use super::instance::InstanceOop;
 use super::lambda::LambdaOop;
 
@@ -18,8 +17,6 @@ pub enum Oop {
     Instance(InstanceOop),
     /// 一维数组(基本类型或引用类型,统一表示)。
     Array(ArrayOop),
-    /// Class 镜像对象(4.10g:`Class.getPrimitiveClass` 等的返回值载体,见 [`ClassOop`])。
-    Class(ClassOop),
     /// Lambda 闭包(4.10aa:`LambdaMetafactory.metafactory` 综合的函数式接口实例,见 [`LambdaOop`])。
     Lambda(LambdaOop),
 }

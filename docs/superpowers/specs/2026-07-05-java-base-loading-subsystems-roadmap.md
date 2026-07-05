@@ -1,30 +1,38 @@
 # 加载完整 java.base 的五大子系统 —— 路线图设计
 
 > 北极星:**完整加载 java.base**。本路线图覆盖五大子系统(模块系统 / 类加载器 /
-> 层加载器 / 反射 / 动态 dll 加载),按依赖顺序拆成 7 个递增层。每层独立走
-> brainstorm→spec→TDD(红→绿)→javac 闸门→commit。
+> 层加载器 / 反射 / 动态 dll 加载)+ **VM 运行时初始化**,按依赖顺序拆成 8 个递增层。每层
+> 独立走 brainstorm→spec→TDD(红→绿)→javac 闸门→commit。
 
 ## 0. 现状(2026-07-05 快照)
 
 rustj 已能:`ClassPath`(jmod/jar)+ `load_closure`(急切预载引用闭包)+ 真 `Integer`/
-`String`/`ArrayList`/`HashMap`/完整 invokedynamic 端到端运行。`ClassRegistry` 为不可变借用,
-`Vm` 构造前急切灌入整个闭包。`Class.getClassLoader0()` native 返 null(把所有类当引导类);
-`Class.getModule()` 返 null;`VM.isModuleSystemInited()` 返 false;反射几乎为零;native 全为编译期表。
+`String`/`ArrayList`/`HashMap`/完整 invokedynamic 端到端运行;Layer 4.12 起 `Class` 镜像为真
+`java/lang/Class` Instance,`getName`/`getSuperclass`/`isInstance`/`isAssignableFrom` 等真字节码
++ native 全通。`ClassRegistry` 为不可变借用,`Vm` 构造前急切灌入整个闭包。`Class.getClassLoader0()`
+native 返 null(把所有类当引导类);`Class.getModule()` 返 null;`VM.isModuleSystemInited()` 返 false;
+反射几乎为零;native 全为编译期表。
+
+**待补缺口(本路线图起点)**:`VM.savedProps` 仍由测试用 `RustjBootstrap` Java 辅助类手动引导
+(`VM.saveProperties(new HashMap<>())`);真 JVM 由 native launcher 在 `Threads::create_vm` 后调
+`System.initPhase1-3` 自动完成。Layer 4.13 把这套引导收编为 VM 原生能力。
 
 ## 1. 五大子系统的依赖序与层次分解
 
 | 层 | 子系统 | 交付 | 边界度 |
 |---|---|---|---|
 | **4.11** | 模块系统(解析) | `module-info.class` 的 Module 属性 → `ModuleDescriptor` | 小(纯解析) |
-| **4.12** | 类加载器(身份) | `LoadedClass.loader: LoaderId` + `getClassLoader0` native | 小 |
-| **4.13a** | 模块系统(集成) | `java/lang/Module` 对象 + `Class.getModule()` native | 中 |
-| **4.13b** | 层加载器 | `ModuleLayer.boot()` + `VM.initLevel=2` | 中 |
-| **4.14a** | 反射(类元数据) | `Class.forName0` + `getDeclared*0` native | 中 |
-| **4.14b** | 反射(调用) | `Method.invoke0` / `Constructor.newInstance` 复用解释器 | 中 |
-| **4.15** | 动态库加载 | `JVM_LoadLibrary`/`FindLibraryEntry` + `NativeLibraries.load` + `JNI_OnLoad` | 大 |
+| **4.12** | 类(镜像) | 退役 `Oop::Class` → 真 `java/lang/Class` Instance + 核心 Class native | 中 |
+| **4.13** | **VM 运行时初始化(Phase 1)** | `System.initPhase1` 等价:VM 原生引导 `savedProps` → `initLevel(1)` | 小-中 |
+| **4.14a** | 模块系统(集成) | `java/lang/Module` 对象 + `Class.getModule()` native | 中 |
+| **4.14b** | 层加载器(Phase 2) | `ModuleLayer.boot()` + `VM.initLevel=2` | 中 |
+| **4.15a** | 反射(类元数据) | `Class.forName0` + `getDeclared*0` native | 中 |
+| **4.15b** | 反射(调用) | `Method.invoke0` / `Constructor.newInstance` 复用解释器 | 中 |
+| **4.16** | 动态库加载 | `JVM_LoadLibrary`/`FindLibraryEntry` + `NativeLibraries.load` + `JNI_OnLoad` | 大 |
 
-依赖:`4.11 → 4.12 → 4.13a → 4.13b`(模块/层);`4.14*` 依赖 `4.13b`(反射访问检查需模块);
-`4.15` 独立。反射与 DLL 可与 4.13 并行,但本路线图按用户列举顺序串行推进。
+依赖:`4.11 → 4.12 → 4.13 → 4.14a → 4.14b`(Phase1 先于 Phase2 模块引导,真 JVM 同序);
+`4.15*` 依赖 `4.14b`(反射访问检查需模块);`4.16` 独立。反射与 DLL 可与 4.14 并行,但本路线图按
+用户列举顺序 + JVM Phase 序串行推进。
 
 ## 2. 架构决策(贯穿全五子系统)
 
@@ -108,7 +116,43 @@ java.base 不依赖完整 JNIEnv。
   `int[].class.isArray()`=true、`int.class.isPrimitive()`=true、`.getClassLoader()`=null、
   `.getModule()`=null;**既有 `class_mirror.rs` 身份相等(literalTwice/getClassEq/distinct)仍绿**。
 
-### Layer 4.13a — Module 对象模型 + Class.getModule()
+### Layer 4.13 — VM 运行时初始化(Phase 1:系统属性引导)
+
+**动机**:真 JVM 由 native launcher(`prims/threads.cpp` `Threads::create_vm` 后)依次调
+`System.initPhase1/2/3`(`System.java:1724/1929/1952`)完成运行时初始化。Phase 1 的核心是
+`VM.saveProperties(tempProps)`(`VM.java:237`)—— 把 launcher 收集的系统属性存进 `savedProps`,
+此后 `VM.getSavedProperty`(`VM.java:209`)才不抛 `IllegalStateException("Not yet initialized")`。
+凡 `<clinit>` 读 savedProps 的 java.base 类(Integer/Long/Boolean/Double/Float/Character 的缓存、
+`Charset.defaultCharset`、`System.console` 等)都**依赖 Phase 1 先跑**。rustj 现由测试用
+`RustjBootstrap` Java 辅助类手动调 `VM.saveProperties(new HashMap<>())` 充数——本层把它收编为
+**VM 原生能力**,使任何用户程序开跑前 `savedProps` 已就绪。
+
+**设计**(`System.initPhase1` 的等价最小子集,`System.java:1720-1836`):
+- 新增 VM 入口 `Vm::initialize_system_class(&mut self)`(或 `runtime::launch::bootstrap`),
+  在 `Vm::new` 后、用户代码前调用(等价 launcher 把 phase1-3 排进启动序列)。Phase 1 范围:
+  1. 构造初始系统属性表(rustj 原生侧提供:`java.version`/`java.home`/`line.separator`/
+     `file.encoding`/`path.separator`/`file.separator` 等 launcher 属性;最小实现可先放空表,
+     与现 `RustjBootstrap` 等价,再逐项补真值)。表为真 `java/util/HashMap` 实例(闭包预载)。
+  2. 经解释器 `invokestatic jdk/internal/misc/VM.saveProperties(Ljava/util/Map;)V`
+     (`VM.java:237` 真字节码):置 `savedProps`、算 `directMemory=Runtime.maxMemory()`(native
+     已支持,返 `i64::MAX`)、`pageAlignDirectMemory`。
+  3. 经 `invokestatic VM.initLevel(I)V`(`VM.java:61`)置 1(允许后续单调上行:2/3/4)。
+- Phase 1 的其余步骤(`SystemProps` native 注册、`OSEnvironment`、`setOut/Err` 等)按需顺延;
+  本层只保 `savedProps` + `initLevel(1)`,因为这是阻塞 `<clinit>` 的唯一硬缺口。
+- **移除测试桩**:`real_integer.rs` 等不再编译/运行 `RustjBootstrap.init()`——改为 `Vm::new` 后
+  调 `initialize_system_class()`,验证 `Integer.valueOf` 不再需手动引导。
+
+**依赖**:需闭包预载 `java/util/HashMap` + `java/util/Map` + `java/lang/Runtime`(saveProperties
+字节码引用;真类覆盖桩)。已在 `real_integer.rs` 验证此闭包可加载。
+
+**为何排在 4.14a(Module)前**:真 JVM 同序(Phase1 → Phase2 模块引导),且 Phase1 是更基础的
+`<clinit>` 前置;先收编 savedProps 让后续模块/反射层的真 java.base 测试不必各带 `RustjBootstrap`。
+
+**闸门**(javac + jmod):无 `RustjBootstrap` 辅助,直接跑 `Integer.valueOf(42).intValue()` = 42
+(此前需手动引导,本层后 `Vm::new` + `initialize_system_class` 即就绪);`VM.getSavedProperty("x")`
+返 null 而非抛 `IllegalStateException`;`VM.initLevel()` = 1。
+
+### Layer 4.14a — Module 对象模型 + Class.getModule()
 
 - `Module` 表:`module_name → { descriptor, packages, loader }`。从 `module-info.class` 构建
   (4.11)+ 从模块的 `exports` 推导包集合。
@@ -119,7 +163,7 @@ java.base 不依赖完整 JNIEnv。
 - Native `Module.defineModule0`/`addReads0`/`addExports0` 等作注册桥(经 (类,名) 特判收集,
   形同 LambdaMetafactory 决策)。
 
-### Layer 4.13b — ModuleLayer.boot + 模块系统初始化
+### Layer 4.14b — ModuleLayer.boot + 模块系统初始化(Phase 2)
 
 - `VM.initLevel = MODULE_SYSTEM_INITED(2)`(VM.java:43-48):引导阶段置 2,使
   `isModuleSystemInited()`(VM.java:92 `initLevel >= 2`)→ true。修 4.10r 的 `initLevel` 默认 0 假。
@@ -127,7 +171,7 @@ java.base 不依赖完整 JNIEnv。
 - 引导层:`Configuration` 仅 java.base(解析后单模块)、bootstrap loader、modules=[java.base Module]。
 - `ModuleLayer`/`Configuration` 真类预载 + 桥 native(`defineModulesWithOneLoader` 等)。
 
-### Layer 4.14a — 反射类元数据 native
+### Layer 4.15a — 反射类元数据 native
 
 - `Class.forName0(LString;ZLjava/lang/ClassLoader;)Ljava/lang/Class;`(jvm.cpp):按名查注册表,
   `init=true` 触发 `ensure_class_initialized`,返类镜像;未找到→`ClassNotFoundException`。
@@ -137,7 +181,7 @@ java.base 不依赖完整 JNIEnv。
 - `getSuperclass`/`getInterfaces0`/`getModifiers`/`isAssignableFrom` 多为字节码(java.base 自实现);
   仅 native 桥缺失者补。
 
-### Layer 4.14b — 反射调用
+### Layer 4.15b — 反射调用
 
 - `jdk/internal/reflect/DirectMethodHandleAccessor.invoke0(LMethod;LObject;[LObject;)LObject;`
   → 经 `Method` 的 `clazz`+`slot` 取回 `MethodInfo` → 复用 `run_callee`(静态/实例分派)→ 回填。
@@ -145,7 +189,7 @@ java.base 不依赖完整 JNIEnv。
 - `Field.get/set` 经 `slot` 取字段序号 → getfield/putfield 通路(或 Unsafe 路径)。
 - 访问检查:publicOnly 参数过滤 + 顺延完整 module 访问。
 
-### Layer 4.15 — 动态库加载
+### Layer 4.16 — 动态库加载
 
 - `os::dll_load`/`dll_lookup` Rust 化:`LoadLibraryW`/`GetProcAddress`(win32)/
   `dlopen`/`dlsym`(posix),`#[allow(unsafe_code)]` 开窗,跨平台 `#[cfg]`。

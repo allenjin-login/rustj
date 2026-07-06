@@ -176,6 +176,23 @@ pub(super) fn dispatch(
         ("java/lang/Class", "getDeclaredFields0", "(Z)[Ljava/lang/reflect/Field;") => {
             get_declared_fields0(vm, this, args)
         }
+        // Class.getDeclaredMethods0(Z)[Ljava/lang/reflect/Method; —— Class.java:3247 私有 native,
+        // 经 `privateGetDeclaredMethods`→`Reflection.filterMethods`→`copyMethods` 包装。遍历声明类
+        // `cf.methods`,按 publicOnly(ACC_PUBLIC)过滤,逐方法构造真 `java/lang/reflect/Method`
+        // Instance 并置 `clazz`/`slot`/`name`/`returnType`/`parameterTypes`/`exceptionTypes`/`modifiers`
+        // (`parameterTypes`/`exceptionTypes` 为 Class[],经方法描述符解析)。返 `[Ljava/lang/reflect/Method;`。
+        ("java/lang/Class", "getDeclaredMethods0", "(Z)[Ljava/lang/reflect/Method;") => {
+            get_declared_methods0(vm, this, args)
+        }
+        // Class.getDeclaredConstructors0(Z)[Ljava/lang/reflect/Constructor; —— Class.java:3248 私有
+        // native,经 `privateGetDeclaredConstructors`→`Reflection.filterConstructors`→`copyConstructors`
+        // 包装。构造器无 name/returnType,字段为 `clazz`/`slot`/`parameterTypes`/`exceptionTypes`/
+        // `modifiers`。返 `[Ljava/lang/reflect/Constructor;`。
+        (
+            "java/lang/Class",
+            "getDeclaredConstructors0",
+            "(Z)[Ljava/lang/reflect/Constructor;",
+        ) => get_declared_constructors0(vm, this, args),
         // desiredAssertionStatus() 字节码 `return desiredAssertionStatus0(this)` 调)。rustj
         // 无断言支持 → 恒 false(断言禁用,即 `$assertionsDisabled = true`)。
         ("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z") => Ok(Value::Int(0)),
@@ -551,4 +568,274 @@ fn field_type_internal(desc: &str) -> String {
         _ => return desc.to_string(),
     };
     mapped.to_string()
+}
+
+/// `FieldType` → Class 镜像内部名:原语变体→关键字、Class→内部名、Array→描述符形式(数组类名)。
+/// 供 Method/Constructor 的 parameterTypes/returnType(Class[]/Class)构造。
+fn field_type_to_class_name(ft: &crate::metadata::descriptor::FieldType) -> String {
+    use crate::metadata::descriptor::FieldType;
+    match ft {
+        FieldType::Byte => "byte",
+        FieldType::Char => "char",
+        FieldType::Double => "double",
+        FieldType::Float => "float",
+        FieldType::Int => "int",
+        FieldType::Long => "long",
+        FieldType::Short => "short",
+        FieldType::Boolean => "boolean",
+        FieldType::Class(name) => return name.clone(),
+        FieldType::Array(_) => return ft.to_string(),
+    }
+    .to_string()
+}
+
+/// 构造 `[Ljava/lang/Class;` 数组,元素为各 `FieldType` 的 Class 镜像(供 parameterTypes/
+/// exceptionTypes)。空切片 → 长度 0 的 Class[](getParameterCount 返 0)。
+fn class_array_of(vm: &mut Vm<'_>, types: &[crate::metadata::descriptor::FieldType]) -> Reference {
+    use crate::oops::ArrayOop;
+    let elements: Vec<Slot> = types
+        .iter()
+        .map(|t| Slot::Reference(vm.intern_class_mirror(&field_type_to_class_name(t))))
+        .collect();
+    vm.heap_mut()
+        .alloc(Oop::Array(ArrayOop::new("[Ljava/lang/Class;".to_string(), elements)))
+}
+
+/// 解析方法描述符的**返回类型**为 Class 镜像(V→void 镜像;否则字段类型→镜像)。供 Method.returnType。
+fn return_type_mirror(
+    vm: &mut Vm<'_>,
+    ret: &crate::metadata::descriptor::ReturnDescriptor,
+) -> Reference {
+    use crate::metadata::descriptor::ReturnDescriptor;
+    match ret {
+        ReturnDescriptor::Void => vm.intern_class_mirror("void"),
+        ReturnDescriptor::FieldType(ft) => {
+            vm.intern_class_mirror(&field_type_to_class_name(ft))
+        }
+    }
+}
+
+/// `Class.getDeclaredMethods0(Z)[Ljava/lang/reflect/Method;` 实现(见分派臂注释)。
+fn get_declared_methods0(
+    vm: &mut Vm<'_>,
+    this: Option<Reference>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    use crate::constant_pool::ConstantPoolEntry;
+    use crate::metadata::access_flags::ACC_PUBLIC;
+    use crate::metadata::descriptor::parse_method_descriptor;
+    use crate::oops::ArrayOop;
+
+    let Some(this) = this else {
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
+    };
+    super::super::clinit::ensure_class_initialized(vm, "java/lang/reflect/AccessibleObject")?;
+    let public_only = matches!(args.first(), Some(Value::Int(n)) if *n != 0);
+
+    // 阶段 1:借注册表收 (name,desc,access) + Method 类字段序号。
+    let (md, ords): (Vec<(String, String, u16)>, ExecutableOrds) = {
+        let internal = vm
+            .mirror_internal_name(this)
+            .ok_or(VmError::BadConstant("getDeclaredMethods0:非 Class 镜像"))?
+            .to_string();
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("getDeclaredMethods0 需注册表"))?;
+        let lc = reg
+            .get(&internal)
+            .ok_or(VmError::BadConstant("getDeclaredMethods0:声明类未加载"))?;
+        let md: Vec<(String, String, u16)> = lc
+            .cf
+            .methods
+            .iter()
+            .filter(|m| !public_only || m.access_flags.bits() & ACC_PUBLIC != 0)
+            .filter_map(|m| {
+                let name = match lc.cf.constant_pool.get(m.name_index) {
+                    Ok(ConstantPoolEntry::Utf8(s)) => s.clone(),
+                    _ => return None,
+                };
+                let desc = match lc.cf.constant_pool.get(m.descriptor_index) {
+                    Ok(ConstantPoolEntry::Utf8(s)) => s.clone(),
+                    _ => return None,
+                };
+                Some((name, desc, m.access_flags.bits()))
+            })
+            .collect();
+        let m_lc = reg
+            .get("java/lang/reflect/Method")
+            .ok_or(VmError::BadConstant("java/lang/reflect/Method 未预载"))?;
+        let flat = reg.flattened_instance_fields(m_lc);
+        let find = |n: &str| {
+            flat.iter().position(|f| f.name == n).ok_or(VmError::BadConstant(
+                "java/lang/reflect/Method 缺 clazz/slot/name/returnType/parameterTypes/exceptionTypes/modifiers 之一",
+            ))
+        };
+        (
+            md,
+            ExecutableOrds {
+                clazz: find("clazz")?,
+                slot: find("slot")?,
+                name: find("name")?,
+                parameter_types: find("parameterTypes")?,
+                exception_types: find("exceptionTypes")?,
+                modifiers: find("modifiers")?,
+                extra: find("returnType")?,
+            },
+        )
+    };
+
+    // 阶段 2:分配 Method[] + 逐方法 Instance 填字段入数组。
+    let arr = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(
+        "[Ljava/lang/reflect/Method;".to_string(),
+        vec![Slot::Reference(Reference::null()); md.len()],
+    )));
+    for (i, (name, desc, access)) in md.into_iter().enumerate() {
+        let parsed = parse_method_descriptor(&desc)
+            .map_err(|_| VmError::BadConstant("getDeclaredMethods0:方法描述符解析失败"))?;
+        let param_arr = class_array_of(vm, &parsed.parameters);
+        let return_mirror = return_type_mirror(vm, &parsed.return_type);
+        let exc_arr = class_array_of(vm, &[]);
+        let name_ref = super::super::string::intern(vm, &name)?;
+        let inst_ref = {
+            let reg = vm
+                .registry()
+                .ok_or(VmError::BadConstant("getDeclaredMethods0 需注册表"))?;
+            let m_lc = reg
+                .get("java/lang/reflect/Method")
+                .ok_or(VmError::BadConstant("java/lang/reflect/Method 未预载"))?;
+            vm.heap_mut()
+                .alloc(Oop::Instance(reg.new_instance(m_lc)))
+        };
+        if let Some(Oop::Instance(inst)) = vm.heap_mut().get_mut(inst_ref) {
+            inst.set_field(ords.clazz, Slot::Reference(this));
+            inst.set_field(ords.slot, Slot::Int(i as i32));
+            inst.set_field(ords.name, Slot::Reference(name_ref));
+            inst.set_field(ords.extra, Slot::Reference(return_mirror));
+            inst.set_field(ords.parameter_types, Slot::Reference(param_arr));
+            inst.set_field(ords.exception_types, Slot::Reference(exc_arr));
+            inst.set_field(ords.modifiers, Slot::Int(access as i32));
+        }
+        if let Some(Oop::Array(a)) = vm.heap_mut().get_mut(arr) {
+            a.set_element(i, Slot::Reference(inst_ref));
+        }
+    }
+    Ok(Value::Reference(arr))
+}
+
+/// `Class.getDeclaredConstructors0(Z)[Ljava/lang/reflect/Constructor;` 实现(见分派臂注释)。
+fn get_declared_constructors0(
+    vm: &mut Vm<'_>,
+    this: Option<Reference>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    use crate::constant_pool::ConstantPoolEntry;
+    use crate::metadata::access_flags::ACC_PUBLIC;
+    use crate::metadata::descriptor::parse_method_descriptor;
+    use crate::oops::ArrayOop;
+
+    let Some(this) = this else {
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
+    };
+    super::super::clinit::ensure_class_initialized(vm, "java/lang/reflect/AccessibleObject")?;
+    let public_only = matches!(args.first(), Some(Value::Int(n)) if *n != 0);
+
+    // 阶段 1:仅收 `<init>` 构造器(name=="<init>")的 (desc,access) + Constructor 字段序号。
+    let (md, ords): (Vec<(String, u16)>, ExecutableOrds) = {
+        let internal = vm
+            .mirror_internal_name(this)
+            .ok_or(VmError::BadConstant("getDeclaredConstructors0:非 Class 镜像"))?
+            .to_string();
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("getDeclaredConstructors0 需注册表"))?;
+        let lc = reg
+            .get(&internal)
+            .ok_or(VmError::BadConstant("getDeclaredConstructors0:声明类未加载"))?;
+        let md: Vec<(String, u16)> = lc
+            .cf
+            .methods
+            .iter()
+            .filter(|m| !public_only || m.access_flags.bits() & ACC_PUBLIC != 0)
+            .filter_map(|m| {
+                let name = match lc.cf.constant_pool.get(m.name_index) {
+                    Ok(ConstantPoolEntry::Utf8(s)) => s.clone(),
+                    _ => return None,
+                };
+                if name != "<init>" {
+                    return None;
+                }
+                let desc = match lc.cf.constant_pool.get(m.descriptor_index) {
+                    Ok(ConstantPoolEntry::Utf8(s)) => s.clone(),
+                    _ => return None,
+                };
+                Some((desc, m.access_flags.bits()))
+            })
+            .collect();
+        let c_lc = reg
+            .get("java/lang/reflect/Constructor")
+            .ok_or(VmError::BadConstant("java/lang/reflect/Constructor 未预载"))?;
+        let flat = reg.flattened_instance_fields(c_lc);
+        let find = |n: &str| {
+            flat.iter().position(|f| f.name == n).ok_or(VmError::BadConstant(
+                "java/lang/reflect/Constructor 缺 clazz/slot/parameterTypes/exceptionTypes/modifiers 之一",
+            ))
+        };
+        (
+            md,
+            ExecutableOrds {
+                clazz: find("clazz")?,
+                slot: find("slot")?,
+                parameter_types: find("parameterTypes")?,
+                exception_types: find("exceptionTypes")?,
+                modifiers: find("modifiers")?,
+                name: 0,
+                extra: 0,
+            },
+        )
+    };
+
+    // 阶段 2:分配 Constructor[] + 逐构造器 Instance 填字段入数组。
+    let arr = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(
+        "[Ljava/lang/reflect/Constructor;".to_string(),
+        vec![Slot::Reference(Reference::null()); md.len()],
+    )));
+    for (i, (desc, access)) in md.into_iter().enumerate() {
+        let parsed = parse_method_descriptor(&desc)
+            .map_err(|_| VmError::BadConstant("getDeclaredConstructors0:方法描述符解析失败"))?;
+        let param_arr = class_array_of(vm, &parsed.parameters);
+        let exc_arr = class_array_of(vm, &[]);
+        let inst_ref = {
+            let reg = vm
+                .registry()
+                .ok_or(VmError::BadConstant("getDeclaredConstructors0 需注册表"))?;
+            let c_lc = reg
+                .get("java/lang/reflect/Constructor")
+                .ok_or(VmError::BadConstant("java/lang/reflect/Constructor 未预载"))?;
+            vm.heap_mut()
+                .alloc(Oop::Instance(reg.new_instance(c_lc)))
+        };
+        if let Some(Oop::Instance(inst)) = vm.heap_mut().get_mut(inst_ref) {
+            inst.set_field(ords.clazz, Slot::Reference(this));
+            inst.set_field(ords.slot, Slot::Int(i as i32));
+            inst.set_field(ords.parameter_types, Slot::Reference(param_arr));
+            inst.set_field(ords.exception_types, Slot::Reference(exc_arr));
+            inst.set_field(ords.modifiers, Slot::Int(access as i32));
+        }
+        if let Some(Oop::Array(a)) = vm.heap_mut().get_mut(arr) {
+            a.set_element(i, Slot::Reference(inst_ref));
+        }
+    }
+    Ok(Value::Reference(arr))
+}
+
+/// `java/lang/reflect/Method`/`Constructor` 共有字段序号;`extra` = Method 的 `returnType`
+/// (Constructor 不用,name/extra 置 0 占位)。`name` 仅 Method 用(Constructor 无 name 字段)。
+struct ExecutableOrds {
+    clazz: usize,
+    slot: usize,
+    name: usize,
+    parameter_types: usize,
+    exception_types: usize,
+    modifiers: usize,
+    extra: usize,
 }

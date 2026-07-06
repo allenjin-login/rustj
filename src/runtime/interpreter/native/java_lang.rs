@@ -141,7 +141,31 @@ pub(super) fn dispatch(
             Ok(Value::Reference(vm.intern_class_mirror(&text)))
         }
 
-        // Class.desiredAssertionStatus0(Ljava/lang/Class;)Z —— Class.java:3341 真原生(由
+        // Class.forName0(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;
+        // —— Class.java 私有 static native,经 `forName(name, init, loader)` 调。第 4 参 `caller`
+        // (Class,安全/类加载器上下文)在 rustj 恒 Bootstrap——忽略。移植 jvm.cpp
+        // `JVM_FindClassFromCaller` 语义:按名(点形 "java.lang.Integer")查注册表 →
+        // `initialize=true` 触发 `ensure_class_initialized` → 返类镜像;未找到 →
+        // `ClassNotFoundException`(jvm.cpp THROW_MSG_NULL)。loader 在 rustj 恒 Bootstrap
+        // (Class.classLoader=null),故不查 ClassPath——反射仅解析已加载的类。
+        ("java/lang/Class", "forName0", "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;") => {
+            let Value::Reference(r) = args.first().copied().unwrap_or(Value::Void) else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let Some(text) = super::super::string::read_text(vm, r)? else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            let initialize = matches!(args.get(1), Some(Value::Int(n)) if *n != 0);
+            let internal = text.replace('.', "/");
+            let found = vm.registry().is_some_and(|reg| reg.get(&internal).is_some());
+            if !found {
+                return Err(throw_exception(vm, "java/lang/ClassNotFoundException"));
+            }
+            if initialize {
+                super::super::clinit::ensure_class_initialized(vm, &internal)?;
+            }
+            Ok(Value::Reference(vm.intern_class_mirror(&internal)))
+        }
         // desiredAssertionStatus() 字节码 `return desiredAssertionStatus0(this)` 调)。rustj
         // 无断言支持 → 恒 false(断言禁用,即 `$assertionsDisabled = true`)。
         ("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z") => Ok(Value::Int(0)),

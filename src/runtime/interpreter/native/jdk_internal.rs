@@ -38,6 +38,12 @@ pub(super) fn dispatch(
         // 即 isUsingArchive()/isDumpingArchive()/… 均假——规范的非 CDS 运行。
         ("jdk/internal/misc/CDS", "getCDSConfigStatus", "()I") => Ok(Value::Int(0)),
 
+        // jdk.internal.misc.CDS.getRandomSeedForDumping()J —— CDS.java:143 public static native。
+        // HotSpot 仅在 `-Xshare:dump` 时返回派生自 JVM 版本的非零种子(可重复生成 CDS 归档);
+        // 非 dump 运行(rustj 永不 dump)→ 恒 0。调用方 `ImmutableCollections.<clinit>`(line 89)
+        // 得 0 后回退 `System.nanoTime()`(已绑定)算 SALT——即规范的运行时随机路径。
+        ("jdk/internal/misc/CDS", "getRandomSeedForDumping", "()J") => Ok(Value::Long(0)),
+
         // jdk.internal.misc.Unsafe 的数组布局 native —— Unsafe.<clinit> 经
         // `theUnsafe.arrayBaseOffset(X[].class)` / `arrayIndexScale(X[].class)`(皆为**非 native**
         // 字节码包装器)转调私有 native `arrayBaseOffset0` / `arrayIndexScale0`,初始化各

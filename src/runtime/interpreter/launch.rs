@@ -51,6 +51,58 @@ pub fn initialize_system_class(vm: &mut Vm<'_>) -> Result<(), VmError> {
     Ok(())
 }
 
+/// **VM 运行时初始化 Phase 2**(模块系统引导,`System.initPhase2` 等价,`System.java:1929`)。
+///
+/// 在 Phase 1 之后、用户代码前调用,对应真 JVM 的:
+/// 1. `bootLayer = ModuleBootstrap.boot();`(`System.java:1932`)—— 分配真 `java/lang/ModuleLayer`
+///    Instance 并置 `System.bootLayer` 静态字段(引导层单例对象)。
+/// 2. `VM.initLevel(2);`(`System.java:1941`)—— `MODULE_SYSTEM_INITED`(`VM.java:45`),
+///    使 `isModuleSystemInited()`(`initLevel >= 2`)→ true。
+///
+/// ModuleLayer Instance 的内部字段(`cf`/`parents`/`nameToModule`)当前不填——本层门
+/// 仅依赖 `ModuleLayer.boot()`(= `getstatic System.bootLayer`)非 null + `Module.getLayer()`
+/// 对 java.base 的特判(返 `boot()`,Module.java:239);完整 `Configuration`/`modules()` 顺延。
+///
+/// **前置**:注册表须已闭包预载 `java/lang/ModuleLayer`、`java/lang/System`、
+/// `jdk/internal/misc/VM`。Phase 1(`initialize_system_class`)须已跑(`initLevel` 单调 1→2)。
+pub fn bootstrap_module_system(vm: &mut Vm<'_>) -> Result<(), VmError> {
+    use crate::metadata::descriptor::FieldType;
+    use crate::runtime::Slot;
+
+    // 1) 分配真 java/lang/ModuleLayer Instance(boot layer 单例对象)。
+    //    &'a 引用(reg/ml_lc)不绑 &self(§6)→ 出块即释放,vm.heap_mut() 可独占。
+    let layer_ref = {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("Phase 2 引导需要类注册表"))?;
+        let ml_lc = reg
+            .get("java/lang/ModuleLayer")
+            .ok_or(VmError::BadConstant("Phase 2 须预载 java/lang/ModuleLayer"))?;
+        vm.heap_mut()
+            .alloc(Oop::Instance(reg.new_instance(ml_lc)))
+    };
+
+    // 2) System.bootLayer = layer(对应 `bootLayer = ModuleBootstrap.boot();`)。沿超类链
+    //    解析(声明类,序号)——bootLayer 声明于 System 本身;经 RefCell 写其 static_storage。
+    let ft = FieldType::Class("java/lang/ModuleLayer".to_string());
+    let (sys_lc, boot_layer_ord) = {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("Phase 2 引导需要类注册表"))?;
+        reg.resolve_static_field("java/lang/System", "bootLayer", &ft)
+            .ok_or(VmError::BadConstant("Phase 2:System.bootLayer 静态字段未找到"))?
+    };
+    sys_lc.static_storage.borrow_mut()[boot_layer_ord] = Slot::Reference(layer_ref);
+
+    // 3) invokestatic VM.initLevel(I)V —— 置 2(MODULE_SYSTEM_INITED)。Phase 1 已置 1,
+    //    单调上行校验(1 < 2 ≤ SYSTEM_SHUTDOWN)通过。
+    invoke_static_void(vm, "jdk/internal/misc/VM", "initLevel", |frame| {
+        frame.locals.set_int(0, 2)
+    })?;
+
+    Ok(())
+}
+
 /// 在 `vm` 上解释执行一个**单参静态方法**(用 `setup` 把唯一形参写入 `frame.locals[0]`)。
 /// 供 Phase 1 的 `saveProperties(Map)`/`initLevel(I)` 调用——复用解释器执行真字节码,而非旁路 native。
 /// 返回类型须为 void(忽略返回值)。

@@ -69,6 +69,12 @@ pub struct Vm<'a> {
     /// (`getSuperclass`/`isInstance`/`isAssignableFrom`/`initClassName`…)由镜像反查类。
     /// 镜像现为真 `java/lang/Class` Instance,Instance 本身不记所表示的类 → 须此表。
     mirror_class: HashMap<Reference, String>,
+    /// 命名 Module 镜像表(4.14a):模块名(`java.base`)→ 真 `java/lang/Module` Instance 引用。
+    /// 同名模块恒同引用(对应 HotSpot 每个 `Module` 类实例单例)。`name` 字段填模块名;
+    /// 无名模块走 [`Self::unnamed_module`](单例,`name` 字段 null)。
+    module_mirrors: HashMap<String, Reference>,
+    /// 无名模块单例引用(惰性分配,4.14a)。`Module.getName()` 返 null → `isNamed()`=false。
+    unnamed_module: Option<Reference>,
 }
 
 impl<'a> Vm<'a> {
@@ -84,6 +90,8 @@ impl<'a> Vm<'a> {
             exception_meta: HashMap::new(),
             class_mirrors: HashMap::new(),
             mirror_class: HashMap::new(),
+            module_mirrors: HashMap::new(),
+            unnamed_module: None,
         }
     }
 
@@ -119,9 +127,9 @@ impl<'a> Vm<'a> {
     /// Instance**——首次 `new_instance` 分配,置 VM 字段(`componentType`/`primitive`),并登记
     /// 反查表 `mirror_class`;后续命中直接返。使 `Foo.class == Foo.class`、
     /// `obj.getClass() == Foo.class` 等 Class 身份相等成立。
-    ///
-    /// `name`/`classLoader`/`module` 字段保持默认 null(`classLoader`=null 即 Bootstrap;
-    /// `module` 由 4.13a 填)。`name` 由 `getName` 真字节码首次调用时经 `initClassName` 懒填。
+    /// `name`/`classLoader` 字段保持默认 null(`classLoader`=null 即 Bootstrap)。
+    /// `module` 由 [`Self::populate_class_mirror_fields`](4.14a)按类所属模块填。
+    /// `name` 由 `getName` 真字节码首次调用时经 `initClassName` 懒填。
     pub(crate) fn intern_class_mirror(&mut self, name: &str) -> Reference {
         if let Some(r) = self.class_mirrors.get(name) {
             return *r;
@@ -153,8 +161,9 @@ impl<'a> Vm<'a> {
         self.heap.alloc(Oop::Instance(inst))
     }
 
-    /// 置 VM 管理的 Class 实例字段:`componentType`(数组→组件镜像)、`primitive`(原语→true)。
-    /// 字段经名查序号;`java/lang/Class` 未见该字段(桩精简)→ 静默跳过。
+    /// 置 VM 管理的 Class 实例字段:`componentType`(数组→组件镜像)、`primitive`(原语→true)、
+    /// `module`(4.14a:按类所属命名模块填 Module 镜像,未标记→无名模块)。字段经名查序号;
+    /// `java/lang/Class` 未见该字段(桩精简)→ 静默跳过。
     fn populate_class_mirror_fields(&mut self, mirror: Reference, internal: &str) {
         if let Some(comp) = component_internal_of(internal) {
             let comp_mirror = self.intern_class_mirror(&comp);
@@ -163,22 +172,98 @@ impl<'a> Vm<'a> {
         if is_primitive_keyword(internal) {
             self.set_class_instance_field(mirror, "primitive", Slot::Int(1));
         }
+        // Class.module = 所属模块的 Module 镜像(命名模块按类→模块表;否则无名模块)。
+        // 对应 Class.java:1011 `private transient Module module;`,getModule() 仅 `return module`。
+        let module = self.module_for_class(internal);
+        self.set_class_instance_field(mirror, "module", Slot::Reference(module));
     }
 
     /// 按**字段名**(忽略描述符)在 `java/lang/Class` 扁平实例字段中查序号并写槽。
     pub(crate) fn set_class_instance_field(&mut self, mirror: Reference, field_name: &str, slot: Slot) {
+        self.set_instance_field_by_name(mirror, "java/lang/Class", field_name, slot);
+    }
+
+    /// 按**字段名**在指定声明类的扁平实例字段中查序号并写槽。类未加载或无此字段 → 静默跳过
+    /// (供 Class 镜像字段 + Module 镜像 `name` 字段等 VM 管理实例共用)。
+    fn set_instance_field_by_name(
+        &mut self,
+        obj: Reference,
+        declaring_class: &str,
+        field_name: &str,
+        slot: Slot,
+    ) {
         let Some(reg) = self.registry() else { return };
-        let Some(class_lc) = reg.get("java/lang/Class") else { return };
+        let Some(lc) = reg.get(declaring_class) else { return };
         let Some(ord) = reg
-            .flattened_instance_fields(class_lc)
+            .flattened_instance_fields(lc)
             .iter()
             .position(|f| f.name == field_name)
         else {
             return;
         };
-        if let Some(Oop::Instance(i)) = self.heap_mut().get_mut(mirror) {
+        if let Some(Oop::Instance(i)) = self.heap_mut().get_mut(obj) {
             i.set_field(ord, slot);
         }
+    }
+
+    /// 分配一个默认初始化的 `java/lang/Module` Instance(须已闭包预载)。无注册表或 Module
+    /// 未加载 → 返 null 兜底。**不跑 `<init>`**(named/unnamed 两构造器分别调 defineModule0/
+    /// 仅置字段;rustj 直接置 `name` 字段,绕过 native 注册)。
+    fn alloc_module_instance(&mut self) -> Reference {
+        let Some(reg) = self.registry() else {
+            return Reference::null();
+        };
+        let Some(lc) = reg.get("java/lang/Module") else {
+            return Reference::null();
+        };
+        let inst = reg.new_instance(lc);
+        self.heap.alloc(Oop::Instance(inst))
+    }
+
+    /// 命名 Module 镜像(intern:同名恒同引用)。分配真 `java/lang/Module` Instance,置 `name`
+    /// 字段 = intern(模块名)。对应 HotSpot 每个 `Module` 单例(JVM 侧 `java_lang_Module`)。
+    /// `Module.getName()` 真字节码读 `name` 字段即得模块名;`isNamed()` = `name != null`。
+    fn intern_named_module(&mut self, name: &str) -> Reference {
+        if let Some(&r) = self.module_mirrors.get(name) {
+            return r;
+        }
+        let r = self.alloc_module_instance();
+        if r.is_null() {
+            return r;
+        }
+        self.module_mirrors.insert(name.to_string(), r);
+        // 置 Module.name = intern(模块名)(真 String 实例,供 getName/equals 用)。
+        if let Ok(name_ref) = crate::runtime::interpreter::string::intern(self, name) {
+            self.set_instance_field_by_name(r, "java/lang/Module", "name", Slot::Reference(name_ref));
+        }
+        r
+    }
+
+    /// 无名模块单例(惰性)。`Module(loader)` 未名构造器语义:`name`=null(默认)、`descriptor`=null。
+    /// `getName()` 返 null、`isNamed()`=false。用户类(非模块源)经 [`Self::module_for_class`] 归此。
+    fn unnamed_module(&mut self) -> Reference {
+        if let Some(r) = self.unnamed_module {
+            return r;
+        }
+        let r = self.alloc_module_instance();
+        if !r.is_null() {
+            self.unnamed_module = Some(r);
+        }
+        r
+    }
+
+    /// 类内部名 → 所属模块的 Module 镜像(供 Class.module 字段填充):
+    /// (1) `class_module` 命中 → 命名模块镜(load_closure 据「源容器模块」标记);
+    /// (2) 数组(`[...`)→ 组件类的模块(递归剥维);
+    /// (3) 未标记(用户类 / 原语 / 默认包)→ 无名模块。
+    fn module_for_class(&mut self, internal: &str) -> Reference {
+        if let Some(m) = self.registry().and_then(|r| r.class_module(internal)) {
+            return self.intern_named_module(&m);
+        }
+        if let Some(comp) = component_internal_of(internal) {
+            return self.module_for_class(&comp);
+        }
+        self.unnamed_module()
     }
 
     /// 类注册表(若启用)。
@@ -373,6 +458,8 @@ impl Default for Vm<'_> {
             exception_meta: HashMap::new(),
             class_mirrors: HashMap::new(),
             mirror_class: HashMap::new(),
+            module_mirrors: HashMap::new(),
+            unnamed_module: None,
         }
     }
 }

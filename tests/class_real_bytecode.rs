@@ -104,9 +104,10 @@ public class Cb {
     public static int loaderNull() {
         return Integer.class.getClassLoader() == null ? 2 : -2;
     }
-    // getModule():真字节码字段读(module=null,4.13a 前无模块系统)→ null。
-    public static int moduleNull() {
-        return Integer.class.getModule() == null ? 3 : -3;
+    // getModule():真字节码字段读(4.14a:module=java.base Module 镜像)→ 非 null 且名 "java.base"。
+    public static int moduleBase() {
+        java.lang.Module m = Integer.class.getModule();
+        return (m != null && m.getName().equals("java.base")) ? 3 : -3;
     }
     // getSuperclass():新增 native → Number 镜像;== Number.class(同 intern)。
     public static int superIsNumber() {
@@ -175,7 +176,7 @@ fn real_class_bytecode_on_real_mirror() {
     // 3) 每法断言:正数=成功。
     assert_eq!(run_static_in(&mut vm, "nameOk"), Ok(Value::Int(1)), "getName 真字节码");
     assert_eq!(run_static_in(&mut vm, "loaderNull"), Ok(Value::Int(2)), "getClassLoader 真字节码→null");
-    assert_eq!(run_static_in(&mut vm, "moduleNull"), Ok(Value::Int(3)), "getModule 真字节码→null");
+    assert_eq!(run_static_in(&mut vm, "moduleBase"), Ok(Value::Int(3)), "getModule 真字节码→java.base");
     assert_eq!(run_static_in(&mut vm, "superIsNumber"), Ok(Value::Int(4)), "getSuperclass native");
     assert_eq!(run_static_in(&mut vm, "assignable"), Ok(Value::Int(5)), "isAssignableFrom native");
     assert_eq!(run_static_in(&mut vm, "isInstanceOk"), Ok(Value::Int(6)), "isInstance native");

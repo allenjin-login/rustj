@@ -89,7 +89,12 @@ pub fn load_closure(
         // 桩或缺失 → 从 ClassPath 取真类覆盖(load_or_replace 末胜,真类覆盖桩);
         // ClassPath 无但注册表已有(桩)→ 用桩的 cf 抽其引用(桩的边仅为 Object,无害);
         // 两处皆无(其他模块未含的引用)→ 跳过。
-        let cf: &ClassFile = if let Some(real) = class_path.load_class(&name)? {
+        let cf: &ClassFile = if let Some((real, module)) = class_path.load_class(&name)? {
+            // 源容器为命名模块 → 标记类属该模块(Class.getModule 用)。None = 无名模块,不标记。
+            // 须先于 load_or_replace(&mut) 调用,免与后续 &lc.cf 不可变借用冲突。
+            if let Some(m) = module {
+                registry.set_class_module(&name, &m);
+            }
             let lc = registry.load_or_replace(real)?;
             loaded += 1;
             &lc.cf
@@ -212,7 +217,11 @@ mod tests {
                 return;
             }
         };
-        let obj = cp.load_class("java/lang/Object").unwrap().expect("Object 须在 jmod 内");
+        let obj = cp
+            .load_class("java/lang/Object")
+            .unwrap()
+            .expect("Object 须在 jmod 内")
+            .0;
         let names = referenced_names(&obj);
         assert!(
             names.contains(&"java/lang/Class".to_string()),

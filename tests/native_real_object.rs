@@ -114,7 +114,11 @@ fn real_object_hashcode_runs_via_native_dispatch() {
     let bytes = std::fs::read(&jmod).unwrap();
     let mut cp = ClassPath::new();
     cp.add("java.base.jmod", &bytes).unwrap();
-    let real_obj = cp.load_class("java/lang/Object").unwrap().expect("Object 须在 jmod 内");
+    let real_obj = cp
+        .load_class("java/lang/Object")
+        .unwrap()
+        .expect("Object 须在 jmod 内")
+        .0;
     registry.load_or_replace(real_obj).unwrap();
 
     // 3) 真 Object.hashCode 须为 ACC_NATIVE(桩无 hashCode → 证覆盖成功)。

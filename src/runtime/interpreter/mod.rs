@@ -13,7 +13,7 @@ mod field;
 mod invoke;
 pub mod launch;
 mod native;
-mod string;
+pub(crate) mod string;
 mod type_check;
 
 use crate::bytecode::opcode::{BytecodeError, Opcode};

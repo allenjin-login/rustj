@@ -20,7 +20,10 @@ const STRING: &str = "java/lang/String";
 
 /// 返回 `text` 的 intern 引用(同文本恒同引用)。池命中则复用;否则构造真 String 实例
 /// 并登记。`ldc`/`ldc_w` 与 `String.intern()` native 经此。
-pub(super) fn intern(vm: &mut Vm<'_>, text: &str) -> Result<Reference, VmError> {
+///
+/// `pub(crate)`:供 `Vm` 在模块镜像(`Vm::intern_named_module` 置 `Module.name`)等场景
+/// 构造真 String 实例(同 native 字符串 native 的复用)。
+pub(crate) fn intern(vm: &mut Vm<'_>, text: &str) -> Result<Reference, VmError> {
     if let Some(&r) = vm.string_pool().get(text) {
         return Ok(r);
     }

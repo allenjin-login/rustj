@@ -147,12 +147,17 @@ struct FieldLayout {
 /// 类注册表:按内部名索引的已加载类。
 pub struct ClassRegistry {
     classes: HashMap<String, LoadedClass>,
+    /// 类内部名 → 所属模块名(由 `load_closure` 据「源容器模块」标记;`Class.getModule()` 用)。
+    /// `None`(未标记)= 无名模块。RefCell 内部可变:注册表以不可变借用暴露,经此写回
+    /// (CLAUDE.md §6 类级可变状态惯例,同 `static_storage`)。
+    class_modules: RefCell<HashMap<String, String>>,
 }
 
 impl ClassRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             classes: HashMap::new(),
+            class_modules: RefCell::new(HashMap::new()),
         };
         // 预装标准 java.lang.* 异常层次(合成桩),使 catch(Throwable/Exception/NPE …)
         // 与运行时异常抛出无需额外加载即可解析。Vm 以不可变借用持注册表,故须在构造期装好。
@@ -199,6 +204,20 @@ impl ClassRegistry {
     /// 按内部名取已加载类。
     pub fn get(&self, name: &str) -> Option<&LoadedClass> {
         self.classes.get(name)
+    }
+
+    /// 标记一个类所属的**命名模块**(由 `load_closure` 据源容器的 `module-info` 推导)。
+    /// 未标记的类视为无名模块(`Class.getModule()` 返无名 Module)。RefCell 内部可变:
+    /// 注册表经不可变借用暴露,经此写回(§6 惯例)。
+    pub fn set_class_module(&self, class_name: &str, module_name: &str) {
+        self.class_modules
+            .borrow_mut()
+            .insert(class_name.to_string(), module_name.to_string());
+    }
+
+    /// 类所属命名模块名(`None` = 未标记 → 无名模块)。供 `Vm::module_for_class` 查模块镜像。
+    pub fn class_module(&self, class_name: &str) -> Option<String> {
+        self.class_modules.borrow().get(class_name).cloned()
     }
 
     /// 扁平化实例字段(超类链 ++ 本类),惰性缓存于 `flat_cache`。

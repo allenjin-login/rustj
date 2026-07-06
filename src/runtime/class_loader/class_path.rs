@@ -11,7 +11,7 @@
 //! `classfile::parse`。
 
 use crate::classfile::{self, ClassFileError};
-use crate::metadata::ClassFile;
+use crate::metadata::{ClassFile, ModuleDescriptor};
 
 use super::zip::{ZipError, ZipReader};
 
@@ -35,11 +35,16 @@ impl From<ClassFileError> for ClassPathError {
     }
 }
 
-/// 一个已打开的容器(jar/jmod):显示名(诊断用)+ 已解析的 zip 视图。
+/// 一个已打开的容器(jar/jmod):显示名(诊断用)+ 已解析的 zip 视图 + 模块名(若有)。
+///
+/// `module_name`:`module-info.class`(`classes/module-info.class`)经 [`ModuleDescriptor`]
+/// 解析得的模块名(jmod 布局);非模块容器(jar/裸 .class)为 `None`。供 `load_class` 把源
+/// 容器的模块名带回 `load_closure`,使每个加载的类与所属模块关联(`Class.getModule()` 用)。
 struct Container {
     #[allow(dead_code)] // 仅诊断/调试用,当前未读
     name: String,
     zip: ZipReader,
+    module_name: Option<String>,
 }
 
 /// 类路径:容器列表。`load_class` 按内部名逐容器查条目并解析为 [`ClassFile`]。
@@ -54,9 +59,30 @@ impl ClassPath {
     }
 
     /// 追加一个容器(原始 zip 字节;显示名仅诊断用)。内部解析中心目录一次,持有副本。
+    ///
+    /// 若容器含 `classes/module-info.class`(jmod 布局)或 `module-info.class`(jar 布局),
+    /// 解析其 `Module` 属性得模块名,存于容器(供 [`Self::load_class`] 回带源模块)。
     pub fn add(&mut self, name: impl Into<String>, bytes: &[u8]) -> Result<(), ClassPathError> {
         let zip = ZipReader::new(bytes)?;
-        self.containers.push(Container { name: name.into(), zip });
+        // 尝试两种布局取 module-info.class;解析其 Module 属性(4.11 ModuleDescriptor)。
+        let module_name = (|| -> Result<Option<String>, ClassPathError> {
+            let raw = zip
+                .read("classes/module-info.class")
+                .ok()
+                .flatten()
+                .or_else(|| zip.read("module-info.class").ok().flatten());
+            let Some(raw) = raw else {
+                return Ok(None);
+            };
+            let cf = classfile::parse(&raw)?;
+            Ok(ModuleDescriptor::from_class_file(&cf)?
+                .map(|d| d.name().to_string()))
+        })()?;
+        self.containers.push(Container {
+            name: name.into(),
+            zip,
+            module_name,
+        });
         Ok(())
     }
 
@@ -72,16 +98,20 @@ impl ClassPath {
 
     /// 按内部名加载类:逐容器查 `name.class`(jar 布局)与 `classes/name.class`(jmod 布局)。
     ///
-    /// 返回 `Ok(Some)` = 找到且解析成功;`Ok(None)` = 所有容器均无此条目;
+    /// 返回 `Ok(Some((cf, module_name)))` = 找到且解析成功(`module_name` = 源容器的模块名,
+    /// `None` 表示该容器非模块容器,类属无名模块);`Ok(None)` = 所有容器均无此条目;
     /// `Err` = 容器损坏或 `.class` 解析失败。
-    pub fn load_class(&self, internal_name: &str) -> Result<Option<ClassFile>, ClassPathError> {
+    pub fn load_class(
+        &self,
+        internal_name: &str,
+    ) -> Result<Option<(ClassFile, Option<String>)>, ClassPathError> {
         let bare = format!("{internal_name}.class");
         let under_classes = format!("classes/{internal_name}.class");
         for c in &self.containers {
             for candidate in [bare.as_str(), under_classes.as_str()] {
                 if let Some(raw) = c.zip.read(candidate)? {
                     let cf = classfile::parse(&raw)?;
-                    return Ok(Some(cf));
+                    return Ok(Some((cf, c.module_name.clone())));
                 }
             }
         }
@@ -163,7 +193,7 @@ mod tests {
             &bytes,
         )
         .unwrap();
-        let cf = cp
+        let (cf, _module) = cp
             .load_class("java/lang/Object")
             .expect("jmod 读取/解析不应失败")
             .expect("Object.class 须在 java.base.jmod 内");

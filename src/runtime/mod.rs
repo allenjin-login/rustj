@@ -8,6 +8,7 @@ pub mod heap;
 pub mod interpreter;
 pub mod local_vars;
 pub mod operand_stack;
+pub mod os;
 pub mod slot;
 pub mod string_pool;
 pub mod vm;

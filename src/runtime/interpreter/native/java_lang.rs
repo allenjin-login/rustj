@@ -166,6 +166,16 @@ pub(super) fn dispatch(
             }
             Ok(Value::Reference(vm.intern_class_mirror(&internal)))
         }
+        // Class.getDeclaredFields0(Z)[Ljava/lang/reflect/Field; —— Class.java:3246 私有 native,
+        // 经 `privateGetDeclaredFields`→`Reflection.filterFields`(透传)后由 `copyFields` 包装。
+        // 移植 HotSpot semantics:遍历声明类 `cf.fields`,按 `publicOnly`(ACC_PUBLIC)过滤,逐字段
+        // 构造真 `java/lang/reflect/Field` Instance 并置 `clazz`/`slot`/`name`/`type`/`modifiers`
+        // 字段(`trustedFinal` 默认 false),返回 `[Ljava/lang/reflect/Field;`。`slot` = 字段在**本类
+        // 声明序**(`copyField` 经 `Field.copy()` 透传;getName/getModifiers 不读 slot,4.15b get/set
+        // 用到时再定语义)。`type` = 字段描述符→内部名→Class 镜像(原语 "I"→"int" 原语镜像)。
+        ("java/lang/Class", "getDeclaredFields0", "(Z)[Ljava/lang/reflect/Field;") => {
+            get_declared_fields0(vm, this, args)
+        }
         // desiredAssertionStatus() 字节码 `return desiredAssertionStatus0(this)` 调)。rustj
         // 无断言支持 → 恒 false(断言禁用,即 `$assertionsDisabled = true`)。
         ("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z") => Ok(Value::Int(0)),
@@ -406,4 +416,139 @@ fn init_stack_trace_elements(
         }
     }
     Ok(())
+}
+
+/// `Class.getDeclaredFields0(Z)[Ljava/lang/reflect/Field;` 实现(见分派臂注释)。
+///
+/// 两阶段(避开 registry 不可变借与 heap `&mut` 冲突):
+/// 1. 借注册表(§6:'a 不绑 &self)收字段元数据 + 解析 Field 类字段序号,出块为 owned;
+/// 2. 独占 `&mut vm` 分配 Field[] + 逐字段 Instance 并填,无残余借用。
+fn get_declared_fields0(
+    vm: &mut Vm<'_>,
+    this: Option<Reference>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    use crate::constant_pool::ConstantPoolEntry;
+    use crate::metadata::access_flags::ACC_PUBLIC;
+    use crate::oops::ArrayOop;
+
+    let Some(this) = this else {
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
+    };
+    // 先确保 `java/lang/reflect/AccessibleObject` 已初始化:其 `<clinit>`(AccessibleObject.java:78)
+    // 调 `SharedSecrets.setJavaLangReflectAccess(new ReflectAccess())`。`ReflectionFactory` 构造时
+    // 一次性缓存该值(final 字段),若本 native 返回后 Java 侧 `copyFields` 才首次构造
+    // ReflectionFactory,须在此之前把 SharedSecrets 置好,否则 `langReflectAccess` 恒 null → NPE。
+    // Field extends AccessibleObject → 反射使用时 AccessibleObject 必已加载,故 ensure 安全。
+    super::super::clinit::ensure_class_initialized(vm, "java/lang/reflect/AccessibleObject")?;
+    let public_only = matches!(args.first(), Some(Value::Int(n)) if *n != 0);
+
+    // 阶段 1:借注册表收 (name,desc,access) 元组 + Field 类字段序号。
+    let (md, field_ords): (Vec<(String, String, u16)>, FieldOrds) = {
+        let internal = vm
+            .mirror_internal_name(this)
+            .ok_or(VmError::BadConstant("getDeclaredFields0:非 Class 镜像"))?
+            .to_string();
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("getDeclaredFields0 需注册表"))?;
+        let lc = reg
+            .get(&internal)
+            .ok_or(VmError::BadConstant("getDeclaredFields0:声明类未加载"))?;
+        let md: Vec<(String, String, u16)> = lc
+            .cf
+            .fields
+            .iter()
+            .filter(|f| !public_only || f.access_flags.bits() & ACC_PUBLIC != 0)
+            .filter_map(|f| {
+                let name = match lc.cf.constant_pool.get(f.name_index) {
+                    Ok(ConstantPoolEntry::Utf8(s)) => s.clone(),
+                    _ => return None,
+                };
+                let desc = match lc.cf.constant_pool.get(f.descriptor_index) {
+                    Ok(ConstantPoolEntry::Utf8(s)) => s.clone(),
+                    _ => return None,
+                };
+                Some((name, desc, f.access_flags.bits()))
+            })
+            .collect();
+        let field_lc = reg
+            .get("java/lang/reflect/Field")
+            .ok_or(VmError::BadConstant("java/lang/reflect/Field 未预载"))?;
+        let flat = reg.flattened_instance_fields(field_lc);
+        let find = |n: &str| {
+            flat.iter().position(|f| f.name == n).ok_or(VmError::BadConstant(
+                "java/lang/reflect/Field 缺 clazz/slot/name/type/modifiers 之一",
+            ))
+        };
+        (
+            md,
+            FieldOrds {
+                clazz: find("clazz")?,
+                slot: find("slot")?,
+                name: find("name")?,
+                r#type: find("type")?,
+                modifiers: find("modifiers")?,
+            },
+        )
+    };
+
+    // 阶段 2:分配 Field[](null 填充)+ 逐字段 Instance 填字段入数组。
+    let arr = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(
+        "[Ljava/lang/reflect/Field;".to_string(),
+        vec![Slot::Reference(Reference::null()); md.len()],
+    )));
+    for (i, (name, desc, access)) in md.into_iter().enumerate() {
+        let field_ref = {
+            let reg = vm
+                .registry()
+                .ok_or(VmError::BadConstant("getDeclaredFields0 需注册表"))?;
+            let field_lc = reg
+                .get("java/lang/reflect/Field")
+                .ok_or(VmError::BadConstant("java/lang/reflect/Field 未预载"))?;
+            vm.heap_mut()
+                .alloc(Oop::Instance(reg.new_instance(field_lc)))
+        };
+        let type_mirror = vm.intern_class_mirror(&field_type_internal(&desc));
+        let name_ref = super::super::string::intern(vm, &name)?;
+        if let Some(Oop::Instance(inst)) = vm.heap_mut().get_mut(field_ref) {
+            inst.set_field(field_ords.clazz, Slot::Reference(this));
+            inst.set_field(field_ords.slot, Slot::Int(i as i32));
+            inst.set_field(field_ords.name, Slot::Reference(name_ref));
+            inst.set_field(field_ords.r#type, Slot::Reference(type_mirror));
+            inst.set_field(field_ords.modifiers, Slot::Int(access as i32));
+        }
+        if let Some(Oop::Array(a)) = vm.heap_mut().get_mut(arr) {
+            a.set_element(i, Slot::Reference(field_ref));
+        }
+    }
+    Ok(Value::Reference(arr))
+}
+
+/// `java/lang/reflect/Field` 实例五字段在扁平布局中的序号(供 [`get_declared_fields0`] 填字段)。
+struct FieldOrds {
+    clazz: usize,
+    slot: usize,
+    name: usize,
+    r#type: usize,
+    modifiers: usize,
+}
+
+/// 字段描述符 → 其类型的 Class 镜像内部名(供 `Field.type` 字段):原语单字符→关键字
+/// (`I`→`int`、`J`→`long` …)、`Lx/y/Z;`→`x/y/Z`、数组描述符(`[…]`)原样保留(数组类名)。
+fn field_type_internal(desc: &str) -> String {
+    let mapped = match desc {
+        "B" => "byte",
+        "C" => "char",
+        "D" => "double",
+        "F" => "float",
+        "I" => "int",
+        "J" => "long",
+        "S" => "short",
+        "Z" => "boolean",
+        "V" => "void",
+        s if s.starts_with('L') && s.ends_with(';') && s.len() >= 3 => &s[1..s.len() - 1],
+        _ => return desc.to_string(),
+    };
+    mapped.to_string()
 }

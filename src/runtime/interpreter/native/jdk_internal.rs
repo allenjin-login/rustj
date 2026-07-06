@@ -72,6 +72,30 @@ pub(super) fn dispatch(
         ("jdk/internal/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V") => put_byte(vm, args),
         ("jdk/internal/misc/Unsafe", "getByte", "(Ljava/lang/Object;)B") => get_byte(vm, args),
 
+        // jdk.internal.misc.Unsafe.objectFieldOffset1(Ljava/lang/Class;Ljava/lang/String;)J
+        // —— Unsafe.java:1100 `objectFieldOffset(Class, String)`(jmod 内部转调 `objectFieldOffset1`,
+        // 注意 jdk-master 源码名为 `knownObjectFieldOffset0`,版本错位——以 jmod 为准)经
+        // `Class$Atomic.<clinit>` 调:`reflectionDataOffset = unsafe.objectFieldOffset(Class.class,
+        // "reflectionData")`。HotSpot 返字段在对象布局中的真实字节偏移;rustj **无真实内存偏移**,
+        // 改返字段在声明类扁平实例布局中的**序号**(ord)——后续 `compareAndSetReference` 用同一 ord
+        // 索引实例槽位,内部自洽。第 1 参 = 声明类的 Class 镜像(如 Class.class 镜像),第 2 参 =
+        // 字段名(真 String 实例)。未找到字段 → 返 -1(public 包装器据 `< 0` 抛 InternalError)。
+        ("jdk/internal/misc/Unsafe", "objectFieldOffset1", "(Ljava/lang/Class;Ljava/lang/String;)J") => {
+            object_field_offset(vm, args)
+        }
+
+        // jdk.internal.misc.Unsafe.compareAndSetReference(O,J,expected,x)Z —— Unsafe.java:1453
+        // native。`Class$Atomic.casReflectionData` 经 `reflectionData()`/`newReflectionData` 的
+        // `while(true)` 重试调之:单线程首 CAS **必须成功**否则死循环。HotSpot 做真实引用 CAS;
+        // rustj 用 ord(由 `objectFieldOffset1` 给出)读实例当前槽,与 expected 比较引用身份
+        // (同 id 或同 null)→ 相等则写新、返 true,否则 false。仅 Slot::Reference 字段
+        // (reflectionData/annotationType/annotationData 均引用字段);非引用槽 → false。
+        (
+            "jdk/internal/misc/Unsafe",
+            "compareAndSetReference",
+            "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+        ) => compare_and_set_reference(vm, args),
+
         // 注:addressSize()/pageSize()/isBigEndian()/unalignedAccess() 均为返回常量字段
         // (ADDRESS_SIZE / PAGE_SIZE / BIG_ENDIAN / UNALIGNED_ACCESS)的字节码方法;这些字段在
         // Unsafe.class 中已是字面量初始化(不经 native),故 <clinit> 无更多 native 依赖。
@@ -134,5 +158,64 @@ fn get_byte(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
             }
         }
         _ => Err(throw_exception(vm, "java/lang/InternalError")),
+    }
+}
+
+/// `Unsafe.objectFieldOffset1(Class c, String name)J` —— 返字段在声明类扁平实例布局中的
+/// **序号**(ord;rustj 无真实内存偏移,以 ord 代之,内部自洽)。未找到 → -1(public 包装器
+/// 据 `< 0` 抛 InternalError)。声明类由 Class 镜像反查;字段名读真 String。
+fn object_field_offset(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (class_mirror, name_ref) = match (args.first(), args.get(1)) {
+        (Some(Value::Reference(c)), Some(Value::Reference(n))) => (*c, *n),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    let internal = vm
+        .mirror_internal_name(class_mirror)
+        .ok_or(VmError::BadConstant("objectFieldOffset1:非 Class 镜像"))?
+        .to_string();
+    let field_name = match super::super::string::read_text(vm, name_ref)? {
+        Some(t) => t,
+        None => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    // 借注册表(§6:'a 不绑 &self)查扁平布局序号;不触堆,出块即释放。
+    let ord = vm.registry().and_then(|reg| {
+        reg.get(&internal).and_then(|lc| {
+            reg.flattened_instance_fields(lc)
+                .iter()
+                .position(|f| f.name == field_name)
+        })
+    });
+    Ok(Value::Long(ord.map(|o| o as i64).unwrap_or(-1)))
+}
+
+/// `Unsafe.compareAndSetReference(Object o, long offset, Object expected, Object x)Z` ——
+/// ord = offset;读 o 实例当前槽,与 expected 比引用身份(同 id 或同 null)→ 相等写 x 返 true,
+/// 否则 false。仅 Slot::Reference 字段;非引用槽/非 Instance → false(不抛)。
+fn compare_and_set_reference(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset, expected, x) = match (args.first(), args.get(1), args.get(2), args.get(3)) {
+        (
+            Some(Value::Reference(o)),
+            Some(Value::Long(off)),
+            Some(Value::Reference(e)),
+            Some(Value::Reference(x)),
+        ) => (*o, *off, *e, *x),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    let ord = offset as usize;
+    // 读当前槽(不可变借堆);匹配标志出块后释放,再 &mut 写。
+    let matches = match vm.heap().get(o) {
+        Some(Oop::Instance(i)) => matches!(
+            i.field(ord),
+            Slot::Reference(cur) if cur == expected
+        ),
+        _ => false,
+    };
+    if matches {
+        if let Some(Oop::Instance(i)) = vm.heap_mut().get_mut(o) {
+            i.set_field(ord, Slot::Reference(x));
+        }
+        Ok(Value::Int(1))
+    } else {
+        Ok(Value::Int(0))
     }
 }

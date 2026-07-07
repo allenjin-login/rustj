@@ -108,6 +108,61 @@ public class Boot {
 }
 "#;
 
+/// **Layer 4.20 探针**:经真 Java `System.getProperty("java.class.path")` 探测 `System.props` 是否就绪。
+/// 修前:initialize_system_class 仅置 VM.savedProps,未置 System.props(=null)→
+/// `ClassLoaders.<clinit>:85` 调 `System.getProperty` → `props.getProperty` → NPE(props=null)。
+/// 返 1 = null(期望:未设键返 null,非异常);返 0 = 非 null;抛异常 → Err(异常类名)。
+const PROPS_PROBE_SOURCE: &str = r#"
+public class PropsProbe {
+    public static int classPathNull() {
+        String cp = System.getProperty("java.class.path");
+        return (cp == null) ? 1 : 0;
+    }
+}
+"#;
+
+/// **集成闸门**(Layer 4.20):`initialize_system_class` 现构造真 `java.util.Properties` 实例并写
+/// `System.props` 静态字段 —— 使 `System.getProperty("java.class.path")` 返 null(非 NPE),
+/// 解锁 `ClassLoaders.<clinit>:85`(`getSystemClassLoader()` 链的下一缺口)。
+#[test]
+fn initialize_system_class_sets_system_props() {
+    if !javac_available() {
+        eprintln!("跳过:无 javac");
+        return;
+    }
+    let Some(jmod) = find_javabase_jmod() else {
+        eprintln!("跳过:无 java.base.jmod");
+        return;
+    };
+
+    // 1) javac 编 PropsProbe(无辅助类);载入注册表。
+    let dir = compile_dir(PROPS_PROBE_SOURCE, "PropsProbe");
+    let mut registry = ClassRegistry::new();
+    registry
+        .load(rustj::classfile::parse(&std::fs::read(dir.join("PropsProbe.class")).unwrap()).unwrap())
+        .unwrap();
+
+    // 2) 真 java.base.jmod 入 ClassPath;闭包预载 System(getProperty 所在 + <clinit>=registerNatives
+    //    noop)、Properties、HashMap(initialize_system_class 构造用)。
+    let bytes = std::fs::read(&jmod).unwrap();
+    let mut cp = ClassPath::new();
+    cp.add("java.base.jmod", &bytes).unwrap();
+    load_closure(&mut registry, &cp, "java/lang/System").unwrap();
+    load_closure(&mut registry, &cp, "java/util/Properties").unwrap();
+    load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
+
+    let mut vm = Vm::new(&registry);
+    // 3) VM 原生 Phase 1 引导 —— 现含 System.props 构造(本层新增)。
+    initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
+
+    // 4) System.getProperty("java.class.path") 返 null(=1),非 NPE。修前此处置抛 NPE。
+    assert_eq!(
+        run_static_int(&mut vm, "PropsProbe", "classPathNull"),
+        Ok(1),
+        "System.props 须已就绪:getProperty 未设键应返 null,非 NPE"
+    );
+}
+
 /// **集成闸门**:VM 原生 Phase 1 引导(`initialize_system_class`)→ 无 Java 辅助类即可跑真 java.base。
 #[test]
 fn initialize_system_class_bootstraps_saved_props() {

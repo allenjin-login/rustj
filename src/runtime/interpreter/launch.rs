@@ -48,7 +48,70 @@ pub fn initialize_system_class(vm: &mut Vm<'_>) -> Result<(), VmError> {
         frame.locals.set_int(0, 1)
     })?;
 
+    // System.props = 真 Properties 实例(对应 `System.initPhase1`:1798 `props = createProperties(...)`)。
+    // 真 `createProperties` 跑 `Properties.<init>` → `map = new ConcurrentHashMap<>(...)`,后者拉入
+    // CHM.<clinit> 的 `Unsafe.arrayIndexScale` 等并发原语(顺延:并发山)。rustj 单线程下,Properties
+    // 的 `get`/`put`/`remove` 全委派 `map` 字段(Properties.java:1336+),HashMap 是合法单线程后盾
+    //(HashMap.get 空 table 短路返 null、HashMap.put 首次 resize 分配 table),故置空 HashMap Instance
+    // 即功能等价 —— 使 `System.getProperty` 返 null(非 NPE),解锁 `ClassLoaders.<clinit>:85`。
+    // 条件:`java/util/Properties` + `java/lang/System` 均已预载(否则跳过,保旧测试兼容)。
+    install_system_props(vm);
+
     Ok(())
+}
+
+/// 构造真 `java.util.Properties` 实例并写 `System.props` 静态字段(Phase 1 收尾,Layer 4.20)。
+///
+/// `Properties` Instance 默认初始化(`map`=null)→ `getProperty` 会 `map.get(key)` NPE。故:
+/// 1. 分配空 `HashMap` Instance(table=null 默认;`HashMap.get` 短路返 null、`HashMap.put` 首次
+///    `resize` 分配 table —— 单线程下功能完整)。
+/// 2. 分配 `Properties` Instance,置其 `map` 字段 = 该 HashMap(Properties.put/get/remove 委派之)。
+/// 3. `System.props` 静态字段 ← 该 Properties Instance(沿超类链解析声明类 + 序号,RefCell 写)。
+///
+/// `java/util/Properties` 或 `java/lang/System` 未预载 → 静默跳过(保 `vm_system_bootstrap` 旧闸门:
+/// 仅预载 Integer/HashMap/String,无 Properties/System 时仍绿)。
+fn install_system_props(vm: &mut Vm<'_>) {
+    use crate::metadata::descriptor::FieldType;
+    use crate::runtime::Slot;
+
+    let reg = match vm.registry() {
+        Some(r) => r,
+        None => return,
+    };
+    let props_lc = match reg.get("java/util/Properties") {
+        Some(lc) => lc,
+        None => return,
+    };
+
+    // 1) 空 HashMap Instance(Properties.map 后盾)。&'a 引用不绑 &self(§6)→ 出块后 heap_mut 独占。
+    let map_ref = {
+        let Some(hm_lc) = reg.get("java/util/HashMap") else {
+            return;
+        };
+        vm.heap_mut()
+            .alloc(Oop::Instance(reg.new_instance(hm_lc)))
+    };
+
+    // 2) Properties Instance,置 map 字段 = HashMap。flattened_instance_fields 含继承字段;按名查
+    //    `map`(Properties 自身声明的 CHM 字段)序号。字段未见(桩精简)→ 跳过置入但仍写 System.props。
+    let props_ref = {
+        let mut inst = reg.new_instance(props_lc);
+        if let Some(ord) = reg
+            .flattened_instance_fields(props_lc)
+            .iter()
+            .position(|f| f.name == "map")
+        {
+            inst.set_field(ord, Slot::Reference(map_ref));
+        }
+        vm.heap_mut().alloc(Oop::Instance(inst))
+    };
+
+    // 3) System.props = props_ref(对应 `props = createProperties(tempProps)`)。resolve_static_field
+    //    沿超类链解析声明类(System 本身)+ 序号;System 未加载 → 返 None 静默跳过。经 RefCell 写。
+    let ft = FieldType::Class("java/util/Properties".to_string());
+    if let Some((sys_lc, props_ord)) = reg.resolve_static_field("java/lang/System", "props", &ft) {
+        sys_lc.static_storage.borrow_mut()[props_ord] = Slot::Reference(props_ref);
+    }
 }
 
 /// **VM 运行时初始化 Phase 2**(模块系统引导,`System.initPhase2` 等价,`System.java:1929`)。

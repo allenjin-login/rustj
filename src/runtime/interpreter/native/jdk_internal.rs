@@ -107,6 +107,45 @@ pub(super) fn dispatch(
             "(Ljava/lang/Object;JII)Z",
         ) => compare_and_set_int(vm, args),
 
+        // jdk.internal.misc.Unsafe volatile 读写原语族(Layer 4.22)——并发山正式入场。CHM 的
+        // `Node[] table` 经 `tabAt`(CHM.java:771)→ `getReferenceAcquire`(非 native 委派)→
+        // `getReferenceVolatile`(Unsafe.java:2117 native)按 byte 偏移读引用槽;`initTable` 的 sizeCtl
+        // 经 `compareAndSetInt`(已绑),`transfer` 的 transferIndex(volatile long)经 `compareAndSetLong`
+        // (Unsafe.java:2061)。acquire/release/weak/getAndAddInt 均为**非 native 字节码委派**(转调下列
+        // native),故仅需绑这 6 个 native。**单线程下 volatile=plain**(无重排/内存屏障):read/write/CAS
+        // 退化为普通槽访问。共用 offset→slot 模型:Instance=ord(同 compareAndSetInt),Array=(offset-ABASE)/scale
+        // 索引(对象数组 scale=1,故 index=offset-16;CHM.tabAt 的 offset=(i<<ASHIFT)+ABASE,ASHIFT=0)。
+        (
+            "jdk/internal/misc/Unsafe",
+            "getReferenceVolatile",
+            "(Ljava/lang/Object;J)Ljava/lang/Object;",
+        ) => get_reference_volatile(vm, args),
+        (
+            "jdk/internal/misc/Unsafe",
+            "putReferenceVolatile",
+            "(Ljava/lang/Object;JLjava/lang/Object;)V",
+        ) => put_reference_volatile(vm, args),
+        (
+            "jdk/internal/misc/Unsafe",
+            "getIntVolatile",
+            "(Ljava/lang/Object;J)I",
+        ) => get_int_volatile(vm, args),
+        (
+            "jdk/internal/misc/Unsafe",
+            "putIntVolatile",
+            "(Ljava/lang/Object;JI)V",
+        ) => put_int_volatile(vm, args),
+        (
+            "jdk/internal/misc/Unsafe",
+            "compareAndSetLong",
+            "(Ljava/lang/Object;JJJ)Z",
+        ) => compare_and_set_long(vm, args),
+        (
+            "jdk/internal/misc/Unsafe",
+            "compareAndExchangeInt",
+            "(Ljava/lang/Object;JII)I",
+        ) => compare_and_exchange_int(vm, args),
+
         // 注:addressSize()/pageSize()/isBigEndian()/unalignedAccess() 均为返回常量字段
         // (ADDRESS_SIZE / PAGE_SIZE / BIG_ENDIAN / UNALIGNED_ACCESS)的字节码方法;这些字段在
         // Unsafe.class 中已是字面量初始化(不经 native),故 <clinit> 无更多 native 依赖。
@@ -200,8 +239,10 @@ fn object_field_offset(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError
 }
 
 /// `Unsafe.compareAndSetReference(Object o, long offset, Object expected, Object x)Z` ——
-/// ord = offset;读 o 实例当前槽,与 expected 比引用身份(同 id 或同 null)→ 相等写 x 返 true,
-/// 否则 false。仅 Slot::Reference 字段;非引用槽/非 Instance → false(不抛)。
+/// Unsafe.java:1453 native。经共用 offset→slot 模型读当前槽(Instance=ord / Array=(offset-ABASE)/scale
+/// 索引),与 expected 比引用身份(同 id 或同 null)→ 相等则 [`write_slot`] 写新、返 true,否则 false。
+/// 仅 Slot::Reference 字段/元素;非引用槽 → false。**Array 路径**(Layer 4.22 收尾)解锁 CHM `casTabAt`
+/// (Node[] 上的 CAS)——修前仅 Instance,致 `putIfAbsent` 的 `while(true) casTabAt` 死循环。
 fn compare_and_set_reference(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
     let (o, offset, expected, x) = match (args.first(), args.get(1), args.get(2), args.get(3)) {
         (
@@ -212,19 +253,10 @@ fn compare_and_set_reference(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, V
         ) => (*o, *off, *e, *x),
         _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
     };
-    let ord = offset as usize;
-    // 读当前槽(不可变借堆);匹配标志出块后释放,再 &mut 写。
-    let matches = match vm.heap().get(o) {
-        Some(Oop::Instance(i)) => matches!(
-            i.field(ord),
-            Slot::Reference(cur) if cur == expected
-        ),
-        _ => false,
-    };
+    // 经共用模型读当前槽(单线程 volatile=plain);匹配 → write_slot 写新(同模型,出块后 &mut 独占)。
+    let matches = matches!(read_slot(vm, o, offset), Some(Slot::Reference(cur)) if cur == expected);
     if matches {
-        if let Some(Oop::Instance(i)) = vm.heap_mut().get_mut(o) {
-            i.set_field(ord, Slot::Reference(x));
-        }
+        write_slot(vm, o, offset, Slot::Reference(x))?;
         Ok(Value::Int(1))
     } else {
         Ok(Value::Int(0))
@@ -232,9 +264,10 @@ fn compare_and_set_reference(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, V
 }
 
 /// `Unsafe.compareAndSetInt(Object o, long offset, int expected, int x)Z` ——
-/// ord = offset;读 o 实例当前 int 槽,与 expected 比较相等 → 写 x 返 true,否则 false。
-/// 仅 Slot::Int 字段;非 int 槽/非 Instance → false(不抛)。镜像 compareAndSetReference 的 int 版
-/// (Unsafe.java:1514;CHM.initTable 的 sizeCtl CAS 走此)。单线程下当 expected 匹配恒成功。
+/// 经共用 offset→slot 模型读当前 int 槽(Instance=ord / Array=(offset-ABASE)/scale 索引),
+/// 与 expected 比较相等 → [`write_slot`] 写 x 返 true,否则 false。镜像 `compare_and_set_reference`
+/// 的 int 版(Unsafe.java:1514;CHM.initTable 的 sizeCtl CAS 走此)。仅 Slot::Int;非 int 槽 → false
+/// (不抛)。单线程下当 expected 匹配恒成功。
 fn compare_and_set_int(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
     let (o, offset, expected, x) = match (args.first(), args.get(1), args.get(2), args.get(3)) {
         (
@@ -245,19 +278,169 @@ fn compare_and_set_int(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError
         ) => (*o, *off, *e, *x),
         _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
     };
-    let ord = offset as usize;
-    // 读当前槽(不可变借堆);匹配标志出块后释放,再 &mut 写。
-    let matches = match vm.heap().get(o) {
-        Some(Oop::Instance(i)) => matches!(i.field(ord), Slot::Int(cur) if cur == expected),
-        _ => false,
-    };
+    // 经共用模型读当前槽(单线程 volatile=plain);匹配 → write_slot 写新。
+    let matches = matches!(read_slot(vm, o, offset), Some(Slot::Int(cur)) if cur == expected);
     if matches {
-        if let Some(Oop::Instance(i)) = vm.heap_mut().get_mut(o) {
-            i.set_field(ord, Slot::Int(x));
-        }
+        write_slot(vm, o, offset, Slot::Int(x))?;
         Ok(Value::Int(1))
     } else {
         Ok(Value::Int(0))
+    }
+}
+
+/// 数组组件 → 元素刻度(同 `arrayIndexScale0`):`[B`/`[Z`→1,`[C`/`[S`→2,`[I`/`[F`→4,
+/// `[J`/`[D`→8,引用数组(`[L…`/`[[…`)→1。volatile 数组访问按此把 byte 偏移换算为元素索引。
+fn array_scale(desc: &str) -> i64 {
+    let rest = desc.strip_prefix('[').unwrap_or(desc);
+    match rest.chars().next() {
+        Some('B') | Some('Z') => 1,
+        Some('C') | Some('S') => 2,
+        Some('I') | Some('F') => 4,
+        Some('J') | Some('D') => 8,
+        _ => 1, // 引用数组 / 未知 → 1
+    }
+}
+
+/// Array 偏移 → 元素索引:`(offset - ARRAY_BYTE_BASE_OFFSET) / scale`。CHM.tabAt 的 offset =
+/// `(i << ASHIFT) + ABASE`;对象数组 scale=1 → ASHIFT=0 → offset = i+16,故 index = offset-16。
+/// 与 [`byte_index`] 同构但按刻度泛化(供 volatile 引用/long/int 数组访问)。
+fn array_index_from_offset(desc: &str, offset: i64) -> usize {
+    ((offset - ARRAY_BYTE_BASE_OFFSET) / array_scale(desc)) as usize
+}
+
+/// offset → 槽位读(共用模型,单线程 volatile=plain):Instance = ord(`offset as usize`);
+/// Array = `(offset-ABASE)/scale` 索引。越界 / 非堆对象 → None。供 getReferenceVolatile/
+/// getIntVolatile 与 CAS/exchange 的"读当前"步共用(返回 owned Slot,借即释)。
+fn read_slot(vm: &Vm<'_>, o: Reference, offset: i64) -> Option<Slot> {
+    match vm.heap().get(o) {
+        Some(Oop::Instance(i)) => Some(i.field(offset as usize)),
+        Some(Oop::Array(a)) => {
+            let idx = array_index_from_offset(a.class_name(), offset);
+            (idx < a.length()).then(|| a.element(idx))
+        }
+        _ => None,
+    }
+}
+
+/// offset → 槽位写(共用模型,单线程 volatile=plain):Instance = ord;Array = `(offset-ABASE)/scale`
+/// 索引。越界 → `ArrayIndexOutOfBoundsException`(HotSpot Unsafe 越界语义);非堆对象 → `InternalError`。
+/// 供 putReferenceVolatile/putIntVolatile 与 CAS/exchange 的"写新"步共用。借用模式同 `put_byte`:
+/// `heap_mut().get_mut` 借出 `&mut Oop`,越界分支内 `a` 已无后续使用,NLL 释放借后可再 `&mut vm` 抛异常。
+fn write_slot(vm: &mut Vm<'_>, o: Reference, offset: i64, slot: Slot) -> Result<(), VmError> {
+    match vm.heap_mut().get_mut(o) {
+        Some(Oop::Instance(i)) => {
+            i.set_field(offset as usize, slot);
+            Ok(())
+        }
+        Some(Oop::Array(a)) => {
+            let idx = array_index_from_offset(a.class_name(), offset);
+            if idx >= a.length() {
+                return Err(throw_exception(
+                    vm,
+                    "java/lang/ArrayIndexOutOfBoundsException",
+                ));
+            }
+            a.set_element(idx, slot);
+            Ok(())
+        }
+        _ => Err(throw_exception(vm, "java/lang/InternalError")),
+    }
+}
+
+/// `Unsafe.getReferenceVolatile(Object o, long offset)Object` —— Unsafe.java:2117 native。
+/// 单线程 volatile=plain:经 [`read_slot`] 取槽;`Slot::Reference` → 返该引用;其余(越界/非引用槽)→
+/// null。CHM.tabAt 经 `getReferenceAcquire`(非 native 委派)转调此读 `Node[] table` 槽。
+fn get_reference_volatile(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset) = match (args.first(), args.get(1)) {
+        (Some(Value::Reference(o)), Some(Value::Long(off))) => (*o, *off),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    Ok(match read_slot(vm, o, offset) {
+        Some(Slot::Reference(r)) => Value::Reference(r),
+        _ => Value::Reference(Reference::null()),
+    })
+}
+
+/// `Unsafe.putReferenceVolatile(Object o, long offset, Object x)V` —— Unsafe.java:2124 native。
+/// 单线程 volatile=plain:经 [`write_slot`] 写 `Slot::Reference`(Instance=ord,Array=(offset-ABASE)/scale)。
+fn put_reference_volatile(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset, x) = match (args.first(), args.get(1), args.get(2)) {
+        (Some(Value::Reference(o)), Some(Value::Long(off)), Some(Value::Reference(x))) => {
+            (*o, *off, *x)
+        }
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    write_slot(vm, o, offset, Slot::Reference(x))?;
+    Ok(Value::Void)
+}
+
+/// `Unsafe.getIntVolatile(Object o, long offset)I` —— Unsafe.java:2128 native。
+/// 单线程 volatile=plain:经 [`read_slot`] 取槽;`Slot::Int` → 返;其余 → 0。
+fn get_int_volatile(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset) = match (args.first(), args.get(1)) {
+        (Some(Value::Reference(o)), Some(Value::Long(off))) => (*o, *off),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    Ok(match read_slot(vm, o, offset) {
+        Some(Slot::Int(i)) => Value::Int(i),
+        _ => Value::Int(0),
+    })
+}
+
+/// `Unsafe.putIntVolatile(Object o, long offset, int x)V` —— Unsafe.java:2132 native。
+/// 单线程 volatile=plain:经 [`write_slot`] 写 `Slot::Int`。
+fn put_int_volatile(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset, x) = match (args.first(), args.get(1), args.get(2)) {
+        (Some(Value::Reference(o)), Some(Value::Long(off)), Some(Value::Int(x))) => (*o, *off, *x),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    write_slot(vm, o, offset, Slot::Int(x))?;
+    Ok(Value::Void)
+}
+
+/// `Unsafe.compareAndSetLong(Object o, long offset, long expected, long x)Z` —— Unsafe.java:2061
+/// native。经 [`read_slot`] 读 long 槽 == expected → [`write_slot`] 写 x 返 true,否则 false。
+/// 镜像 `compare_and_set_int` 的 long 版(CHM.transfer 的 transferIndex CAS 走此)。仅 `Slot::Long`;
+/// 非 long 槽 → false(不抛)。
+fn compare_and_set_long(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset, expected, x) = match (args.first(), args.get(1), args.get(2), args.get(3)) {
+        (
+            Some(Value::Reference(o)),
+            Some(Value::Long(off)),
+            Some(Value::Long(e)),
+            Some(Value::Long(x)),
+        ) => (*o, *off, *e, *x),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    let matches = matches!(read_slot(vm, o, offset), Some(Slot::Long(cur)) if cur == expected);
+    if matches {
+        write_slot(vm, o, offset, Slot::Long(x))?;
+        Ok(Value::Int(1))
+    } else {
+        Ok(Value::Int(0))
+    }
+}
+
+/// `Unsafe.compareAndExchangeInt(Object o, long offset, int expected, int x)I` —— Unsafe.java:1519
+/// native。语义:读当前;== expected → 写 x 返**旧值**(=expected);否则不写返当前值。区别于
+/// `compare_and_set_int`(返 Z):exchange 返旧值。经 [`read_slot`]/[`write_slot`](单线程 volatile=plain)。
+fn compare_and_exchange_int(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset, expected, x) = match (args.first(), args.get(1), args.get(2), args.get(3)) {
+        (
+            Some(Value::Reference(o)),
+            Some(Value::Long(off)),
+            Some(Value::Int(e)),
+            Some(Value::Int(x)),
+        ) => (*o, *off, *e, *x),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    match read_slot(vm, o, offset) {
+        Some(Slot::Int(cur)) if cur == expected => {
+            write_slot(vm, o, offset, Slot::Int(x))?;
+            Ok(Value::Int(cur))
+        }
+        Some(Slot::Int(cur)) => Ok(Value::Int(cur)),
+        _ => Ok(Value::Int(0)),
     }
 }
 
@@ -367,6 +550,398 @@ mod tests {
         assert!(
             matches!(v2, Slot::Int(42)),
             "失败 CAS 不得改字段,须仍 42,得 {v2:?}"
+        );
+    }
+
+    /// **RED→GREEN**(Layer 4.22):`Unsafe.getReferenceVolatile`/`putReferenceVolatile` 的**对象数组**
+    /// 路径——CHM.tabAt(CHM.java:771)经 `getReferenceAcquire`(非 native 委派)→
+    /// `getReferenceVolatile`(Unsafe.java:2117 native)按 byte 偏移读 `Node[] table` 槽。
+    /// rustj 单线程下 volatile=plain;offset→slot:对象数组 scale=1,故 index = offset - ABASE(16)。
+    ///
+    /// `[Ljava/lang/Object;` 4 元素(默认 null):putReferenceVolatile(arr,18,x) 写元素 2;
+    /// getReferenceVolatile(arr,18) 读回 x;getReferenceVolatile(arr,16) 读元素 0 = null。
+    /// **无 jmod 依赖**(数组直接 ArrayOop::new 构造;非空引用用空数组的 alloc 句柄)。
+    #[test]
+    fn get_put_reference_volatile_object_array() {
+        let registry = ClassRegistry::new();
+        let mut vm = Vm::new(&registry);
+
+        // 对象数组 [Ljava/lang/Object;(CHM Node[] table 同型),4 元素默认 null。
+        let arr = vm.heap_mut().alloc(crate::oops::Oop::Array(
+            crate::oops::ArrayOop::new(
+                "[Ljava/lang/Object;".to_string(),
+                vec![Slot::Reference(crate::runtime::Reference::null()); 4],
+            ),
+        ));
+        // 非空引用:alloc 句柄恒非 0(用空对象数组充当一个非空 Object,避免拉入 String 等)。
+        let x = vm.heap_mut().alloc(crate::oops::Oop::Array(
+            crate::oops::ArrayOop::new(
+                "[Ljava/lang/Object;".to_string(),
+                Vec::new(),
+            ),
+        ));
+        assert!(!x.is_null(), "alloc 句柄须非 null");
+
+        // putReferenceVolatile(arr, 16+2, x) → 写元素 2(offset = ABASE + i*scale = 16 + 2*1)。
+        super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "putReferenceVolatile",
+            "(Ljava/lang/Object;JLjava/lang/Object;)V",
+            None,
+            &[Value::Reference(arr), Value::Long(18), Value::Reference(x)],
+        )
+        .expect("putReferenceVolatile 须返 Void");
+
+        // getReferenceVolatile(arr, 18) → 读元素 2 == x。
+        let r = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "getReferenceVolatile",
+            "(Ljava/lang/Object;J)Ljava/lang/Object;",
+            None,
+            &[Value::Reference(arr), Value::Long(18)],
+        )
+        .expect("getReferenceVolatile 须返 ref");
+        assert_eq!(r, Value::Reference(x), "offset 18(元素 2)须读回写入的 x");
+
+        // getReferenceVolatile(arr, 16) → 元素 0 仍 null(默认)。
+        let r0 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "getReferenceVolatile",
+            "(Ljava/lang/Object;J)Ljava/lang/Object;",
+            None,
+            &[Value::Reference(arr), Value::Long(16)],
+        )
+        .expect("getReferenceVolatile 须返 ref");
+        assert_eq!(
+            r0,
+            Value::Reference(crate::runtime::Reference::null()),
+            "offset 16(元素 0)须为 null"
+        );
+    }
+
+    /// **RED→GREEN**(Layer 4.22 收尾):`Unsafe.compareAndSetReference` 的**对象数组**路径
+    /// (casTabAt,CHM.java `casTabAt(tab,i,c,v)` 同型)。修前仅 Instance 路径(4.18),casTabAt 在
+    /// `Node[]` 上恒 false → CHM `putIfAbsent` 的 `while(true) casTabAt` 死循环(探针证实)。
+    /// 对象数组 4 元素(默认 null):
+    /// CAS(arr,18,null,x) → 元素 2 当前 null==expected → 写 x 返 true;
+    /// CAS(arr,18,null,y) → 当前 x≠null → 失败返 0,不变。
+    #[test]
+    fn compare_and_set_reference_object_array() {
+        let registry = ClassRegistry::new();
+        let mut vm = Vm::new(&registry);
+
+        let arr = vm.heap_mut().alloc(crate::oops::Oop::Array(
+            crate::oops::ArrayOop::new(
+                "[Ljava/lang/Object;".to_string(),
+                vec![Slot::Reference(crate::runtime::Reference::null()); 4],
+            ),
+        ));
+        let x = vm.heap_mut().alloc(crate::oops::Oop::Array(
+            crate::oops::ArrayOop::new(
+                "[Ljava/lang/Object;".to_string(),
+                Vec::new(),
+            ),
+        ));
+
+        // CAS(arr, 18, null, x):元素 2 当前 null==expected → 写 x 返 true(单线程首 CAS 必成功)。
+        let r1 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "compareAndSetReference",
+            "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+            None,
+            &[
+                Value::Reference(arr),
+                Value::Long(18),
+                Value::Reference(crate::runtime::Reference::null()),
+                Value::Reference(x),
+            ],
+        )
+        .expect("CAS 须返 Z");
+        assert_eq!(r1, Value::Int(1), "CAS(null→x) 须成功(元素 2 默认 null)");
+
+        // 读回元素 2 = x(经 getReferenceVolatile,已支持数组)。
+        let r = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "getReferenceVolatile",
+            "(Ljava/lang/Object;J)Ljava/lang/Object;",
+            None,
+            &[Value::Reference(arr), Value::Long(18)],
+        )
+        .expect("getReferenceVolatile 须返 ref");
+        assert_eq!(r, Value::Reference(x), "CAS 后元素 2 须为 x");
+
+        // CAS(arr, 18, null, x):元素 2 当前 x≠null(expected) → 失败返 0,不变。
+        let r2 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "compareAndSetReference",
+            "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+            None,
+            &[
+                Value::Reference(arr),
+                Value::Long(18),
+                Value::Reference(crate::runtime::Reference::null()),
+                Value::Reference(x),
+            ],
+        )
+        .expect("CAS 须返 Z");
+        assert_eq!(r2, Value::Int(0), "CAS(null→x) 须失败(当前 x≠expected null)");
+    }
+
+    /// **RED→GREEN**(Layer 4.22):`Unsafe.getIntVolatile`/`putIntVolatile` 的**实例字段**路径
+    /// (Unsafe.java:2128/2132 native)。offset = ord(objectFieldOffset1 给出);读/写实例 int 槽。
+    /// Integer.value(默认 0):写前 getIntVolatile=0;putIntVolatile(o,ord,42) → 读回 42。
+    #[test]
+    fn get_put_int_volatile_instance() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
+
+        let mut vm = Vm::new(&registry);
+
+        // Integer 实例(default-init,value=0)。§6 块模式:new_instance 出块后 heap_mut 独占。
+        let inst_ref = {
+            let reg = vm.registry().expect("须注册表");
+            let lc = reg.get("java/lang/Integer").expect("Integer 须加载");
+            let inst = reg.new_instance(lc);
+            vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
+        };
+
+        // objectFieldOffset1(Integer.class, "value") → ord(已绑定 native)。
+        let int_mirror = vm.intern_class_mirror("java/lang/Integer");
+        let name_ref =
+            crate::runtime::interpreter::string::intern(&mut vm, "value").expect("intern value");
+        let Value::Long(ord) = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "objectFieldOffset1",
+            "(Ljava/lang/Class;Ljava/lang/String;)J",
+            None,
+            &[Value::Reference(int_mirror), Value::Reference(name_ref)],
+        )
+        .expect("objectFieldOffset1 须返 ord")
+        else {
+            unreachable!()
+        };
+        assert!(ord >= 0, "value 字段须找到");
+
+        // 写前:getIntVolatile(o,ord) = 0(默认)。
+        let v0 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "getIntVolatile",
+            "(Ljava/lang/Object;J)I",
+            None,
+            &[Value::Reference(inst_ref), Value::Long(ord)],
+        )
+        .expect("getIntVolatile 须返 I");
+        assert_eq!(v0, Value::Int(0), "写前 value 须为 0");
+
+        // putIntVolatile(o,ord,42)。
+        super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "putIntVolatile",
+            "(Ljava/lang/Object;JI)V",
+            None,
+            &[Value::Reference(inst_ref), Value::Long(ord), Value::Int(42)],
+        )
+        .expect("putIntVolatile 须返 Void");
+
+        // 读回 = 42。
+        let v1 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "getIntVolatile",
+            "(Ljava/lang/Object;J)I",
+            None,
+            &[Value::Reference(inst_ref), Value::Long(ord)],
+        )
+        .expect("getIntVolatile 须返 I");
+        assert_eq!(v1, Value::Int(42), "写后 value 须为 42");
+    }
+
+    /// **RED→GREEN**(Layer 4.22):`Unsafe.compareAndSetLong` 的实例 long 字段路径(Unsafe.java:2061
+    /// native)。offset = ord;读实例 long 槽 == expected → 写 x 返 true。Long.value(long,默认 0L):
+    /// CAS(0L→42L) 成功 + 字段变 42L;CAS(0L→99L) 失败(当前 42L≠0)+ 字段不变。
+    #[test]
+    fn compare_and_set_long_instance() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Long").unwrap();
+
+        let mut vm = Vm::new(&registry);
+
+        // Long 实例(default-init,value=0L)。
+        let inst_ref = {
+            let reg = vm.registry().expect("须注册表");
+            let lc = reg.get("java/lang/Long").expect("Long 须加载");
+            let inst = reg.new_instance(lc);
+            vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
+        };
+
+        // objectFieldOffset1(Long.class, "value") → ord。
+        let long_mirror = vm.intern_class_mirror("java/lang/Long");
+        let name_ref =
+            crate::runtime::interpreter::string::intern(&mut vm, "value").expect("intern value");
+        let Value::Long(ord) = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "objectFieldOffset1",
+            "(Ljava/lang/Class;Ljava/lang/String;)J",
+            None,
+            &[Value::Reference(long_mirror), Value::Reference(name_ref)],
+        )
+        .expect("objectFieldOffset1 须返 ord")
+        else {
+            unreachable!()
+        };
+        assert!(ord >= 0, "Long.value 字段须找到");
+
+        // CAS(0L→42L):当前 0L==expected → 成功返 1。
+        let r1 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "compareAndSetLong",
+            "(Ljava/lang/Object;JJJ)Z",
+            None,
+            &[
+                Value::Reference(inst_ref),
+                Value::Long(ord),
+                Value::Long(0),
+                Value::Long(42),
+            ],
+        )
+        .expect("compareAndSetLong 须返 Z");
+        assert_eq!(r1, Value::Int(1), "CAS(0L→42L) 须成功");
+
+        // 字段现为 42L。
+        let v = match vm.heap().get(inst_ref) {
+            Some(crate::oops::Oop::Instance(i)) => i.field(ord as usize),
+            _ => panic!("须 Instance"),
+        };
+        assert!(matches!(v, Slot::Long(42)), "CAS 后字段须为 42L,得 {v:?}");
+
+        // CAS(0L→99L):当前 42L≠0 → 失败返 0,字段不变。
+        let r2 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "compareAndSetLong",
+            "(Ljava/lang/Object;JJJ)Z",
+            None,
+            &[
+                Value::Reference(inst_ref),
+                Value::Long(ord),
+                Value::Long(0),
+                Value::Long(99),
+            ],
+        )
+        .expect("compareAndSetLong 须返 Z");
+        assert_eq!(r2, Value::Int(0), "CAS(0L→99L) 须失败(当前 42L≠expected 0)");
+    }
+
+    /// **RED→GREEN**(Layer 4.22):`Unsafe.compareAndExchangeInt` 的实例 int 字段路径(Unsafe.java:1519
+    /// native)。语义:读当前值;若 == expected 则写 x 并返**旧值**(=expected);否则不写,返当前值。
+    /// 区别于 compareAndSetInt(返布尔):exchange 返旧值。Integer.value(默认 0):
+    /// exchange(o,ord,0,42) → 当前 0==expected → 写 42,返旧值 0;
+    /// exchange(o,ord,0,99) → 当前 42≠0 → 不写,返当前 42。
+    #[test]
+    fn compare_and_exchange_int_instance() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
+
+        let mut vm = Vm::new(&registry);
+        let inst_ref = {
+            let reg = vm.registry().expect("须注册表");
+            let lc = reg.get("java/lang/Integer").expect("Integer 须加载");
+            let inst = reg.new_instance(lc);
+            vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
+        };
+        let int_mirror = vm.intern_class_mirror("java/lang/Integer");
+        let name_ref =
+            crate::runtime::interpreter::string::intern(&mut vm, "value").expect("intern value");
+        let Value::Long(ord) = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "objectFieldOffset1",
+            "(Ljava/lang/Class;Ljava/lang/String;)J",
+            None,
+            &[Value::Reference(int_mirror), Value::Reference(name_ref)],
+        )
+        .expect("objectFieldOffset1 须返 ord")
+        else {
+            unreachable!()
+        };
+
+        // exchange(o,ord,0,42):当前 0==expected → 写 42,返旧值 0。
+        let r1 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "compareAndExchangeInt",
+            "(Ljava/lang/Object;JII)I",
+            None,
+            &[
+                Value::Reference(inst_ref),
+                Value::Long(ord),
+                Value::Int(0),
+                Value::Int(42),
+            ],
+        )
+        .expect("compareAndExchangeInt 须返 I");
+        assert_eq!(r1, Value::Int(0), "exchange(0→42) 须返旧值 0");
+        let v1 = match vm.heap().get(inst_ref) {
+            Some(crate::oops::Oop::Instance(i)) => i.field(ord as usize),
+            _ => panic!("须 Instance"),
+        };
+        assert!(matches!(v1, Slot::Int(42)), "exchange 后字段须为 42,得 {v1:?}");
+
+        // exchange(o,ord,0,99):当前 42≠0 → 不写,返当前 42。
+        let r2 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "compareAndExchangeInt",
+            "(Ljava/lang/Object;JII)I",
+            None,
+            &[
+                Value::Reference(inst_ref),
+                Value::Long(ord),
+                Value::Int(0),
+                Value::Int(99),
+            ],
+        )
+        .expect("compareAndExchangeInt 须返 I");
+        assert_eq!(r2, Value::Int(42), "exchange(0→99) 须返当前 42(不匹配,不写)");
+        let v2 = match vm.heap().get(inst_ref) {
+            Some(crate::oops::Oop::Instance(i)) => i.field(ord as usize),
+            _ => panic!("须 Instance"),
+        };
+        assert!(
+            matches!(v2, Slot::Int(42)),
+            "不匹配 exchange 不得改字段,得 {v2:?}"
         );
     }
 

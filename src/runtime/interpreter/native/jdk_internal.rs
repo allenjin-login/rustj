@@ -146,6 +146,18 @@ pub(super) fn dispatch(
             "(Ljava/lang/Object;JII)I",
         ) => compare_and_exchange_int(vm, args),
 
+        // jdk.internal.misc.Unsafe.ensureClassInitialized0(Ljava/lang/Class;)V —— Unsafe.java:3878
+        // `private native`(jmod javap 实测确认;Unsafe.java:1190 字节码 `ensureClassInitialized`
+        // null-check 后委派本 native)。强制目标类跑 <clinit>(JVMS-5.5;等价
+        // `JVM_EnsureClassInitialization`)。取 Class 镜像内部名转调既有 `ensure_class_initialized`
+        //(clinit.rs:幂等 Done/InProgress→返、Failed→NoClassDefFoundError、NotStarted→超类先+本类
+        // clinit,异常包 ExceptionInInitializerError)。null 参 → NPE(契约同 ensureClassInitialized)。
+        // 解锁 URLClassPath.<clinit> → SharedSecrets.getJavaNetURLAccess → ensureClassInitialized(URL)
+        // → MethodHandles$Lookup.ensureInitialized 链。
+        ("jdk/internal/misc/Unsafe", "ensureClassInitialized0", "(Ljava/lang/Class;)V") => {
+            ensure_class_initialized_0(vm, args)
+        }
+
         // 注:addressSize()/pageSize()/isBigEndian()/unalignedAccess() 均为返回常量字段
         // (ADDRESS_SIZE / PAGE_SIZE / BIG_ENDIAN / UNALIGNED_ACCESS)的字节码方法;这些字段在
         // Unsafe.class 中已是字面量初始化(不经 native),故 <clinit> 无更多 native 依赖。
@@ -442,6 +454,19 @@ fn compare_and_exchange_int(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, Vm
         Some(Slot::Int(cur)) => Ok(Value::Int(cur)),
         _ => Ok(Value::Int(0)),
     }
+}
+
+/// `Unsafe.ensureClassInitialized0(Class)V` native 实现(Unsafe.java:3878 `private native`)。
+/// 强制目标类跑 `<clinit>`(JVMS-5.5)。取 Class 镜像内部名 → 转调 `ensure_class_initialized`
+/// (clinit.rs)。`class_arg_name` 借 `&vm` 返 owned String,出 match 即释放 → 后续
+/// `throw_exception(&mut vm)` / `ensure_class_initialized(&mut vm, ..)` 无借用冲突。null/非镜像 → NPE。
+fn ensure_class_initialized_0(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let internal = match super::class_arg_name(vm, args) {
+        Some(n) => n,
+        None => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    crate::runtime::interpreter::clinit::ensure_class_initialized(vm, &internal)?;
+    Ok(Value::Void)
 }
 
 #[cfg(test)]
@@ -943,6 +968,85 @@ mod tests {
             matches!(v2, Slot::Int(42)),
             "不匹配 exchange 不得改字段,得 {v2:?}"
         );
+    }
+
+    /// **RED→GREEN**(Layer 4.24):`Unsafe.ensureClassInitialized0(Class)V` native 强制目标类跑
+    /// `<clinit>`(JVMS-5.5;等价 `JVM_EnsureClassInitialization`)。`Unsafe.ensureClassInitialized`
+    /// (Unsafe.java:1190,字节码)null-check 后委派本 native(jmod javap 确认 `private native ...
+    /// (Ljava/lang/Class;)V`)。rustj 既有 `ensure_class_initialized`(clinit.rs)幂等实现,本 native
+    /// 取 Class 镜像内部名转调之。验证:`load_closure` 不跑 `<clinit>`(Integer=NotStarted)→
+    /// 调本 native → Integer=Done(IntegerCache 已建)。
+    #[test]
+    fn ensure_class_initialized_0_runs_clinit() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
+
+        let mut vm = Vm::new(&registry);
+        // 前置:<clinit> 须未跑(NotStarted)——证明后续 Done 是本 native 的功劳。
+        let pre = vm
+            .registry()
+            .and_then(|r| r.get("java/lang/Integer"))
+            .map(|lc| lc.init_state())
+            .expect("Integer 须已加载");
+        assert!(
+            matches!(pre, crate::oops::InitState::NotStarted),
+            "前置 Integer 须 NotStarted,得 {pre:?}"
+        );
+
+        let mirror = vm.intern_class_mirror("java/lang/Integer");
+        let r = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "ensureClassInitialized0",
+            "(Ljava/lang/Class;)V",
+            None,
+            &[Value::Reference(mirror)],
+        )
+        .expect("ensureClassInitialized0 应返 void,非抛异常");
+        assert!(matches!(r, Value::Void), "须返 void,得 {r:?}");
+
+        let post = vm
+            .registry()
+            .and_then(|r| r.get("java/lang/Integer"))
+            .map(|lc| lc.init_state())
+            .expect("Integer 须已加载");
+        assert!(
+            matches!(post, crate::oops::InitState::Done),
+            "ensureClassInitialized0 后 Integer 须 Done,得 {post:?}"
+        );
+    }
+
+    /// **RED→GREEN**(Layer 4.24):null 参 → NullPointerException(对应 `Unsafe.ensureClassInitialized`
+    /// Unsafe.java:1192 `if (c == null) throw new NullPointerException()` 契约;native 防御性同)。
+    #[test]
+    fn ensure_class_initialized_0_null_arg_throws_npe() {
+        let registry = ClassRegistry::new();
+        let mut vm = Vm::new(&registry);
+        let err = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "ensureClassInitialized0",
+            "(Ljava/lang/Class;)V",
+            None,
+            &[Value::Reference(crate::runtime::Reference::null())],
+        )
+        .unwrap_err();
+        match err {
+            crate::runtime::VmError::ThrownException(r) => match vm.heap().get(r) {
+                Some(crate::oops::Oop::Instance(i)) => {
+                    assert_eq!(i.class_name(), "java/lang/NullPointerException")
+                }
+                o => panic!("须 Instance,得 {o:?}"),
+            },
+            e => panic!("须 ThrownException,得 {e:?}"),
+        }
     }
 
     /// 收尾:确使未登记路径仍抛 ULE(防 dispatch 误吞)。

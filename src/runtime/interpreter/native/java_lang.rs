@@ -333,6 +333,39 @@ pub(super) fn dispatch(
             Ok(Value::Void)
         }
 
+        // Reference.refersTo0(Object)Z —— Reference.java:373 native。this.referent 与 o 比
+        // 引用身份(JVM_ReferenceRefersTo)。referent 由 Reference.<init>(T) 置(Reference.java:532,
+        // 普通实例字段——rustj 无 GC,不特殊处理)。子类(WeakReference 等)扁平布局 referent 同序,
+        // 故按**实例声明类**查 ord。
+        ("java/lang/ref/Reference", "refersTo0", "(Ljava/lang/Object;)Z") => {
+            let (this_ref, o) = match (this, args.first()) {
+                (Some(t), Some(Value::Reference(o))) => (t, *o),
+                _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+            };
+            // 取实例声明类 → 扁平布局查 "referent" ord(§6:'a 不绑 &self,出块 owned)。
+            let cn = vm
+                .heap()
+                .get(this_ref)
+                .and_then(|obj| match obj {
+                    Oop::Instance(i) => Some(i.class_name().to_string()),
+                    _ => None,
+                });
+            let ord = cn.as_ref().and_then(|cn| {
+                vm.registry().and_then(|reg| {
+                    reg.get(cn).and_then(|lc| {
+                        reg.flattened_instance_fields(lc)
+                            .iter()
+                            .position(|f| f.name == "referent")
+                    })
+                })
+            });
+            let refers = matches!(
+                (ord, vm.heap().get(this_ref)),
+                (Some(ord), Some(Oop::Instance(i))) if matches!(i.field(ord), Slot::Reference(r) if r == o)
+            );
+            Ok(Value::Int(if refers { 1 } else { 0 }))
+        }
+
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }
@@ -838,4 +871,134 @@ struct ExecutableOrds {
     exception_types: usize,
     modifiers: usize,
     extra: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::oops::ClassRegistry;
+    use crate::runtime::class_loader::class_path::ClassPath;
+    use crate::runtime::class_loader::loader::load_closure;
+    use crate::runtime::{Reference, Slot, Value, Vm, VmError};
+
+    use std::path::{Path, PathBuf};
+
+    fn find_javabase_jmod() -> Option<PathBuf> {
+        for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
+            let p = Path::new("C:/Program Files/Java")
+                .join(ver)
+                .join("jmods/java.base.jmod");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        std::env::var("JAVA_HOME")
+            .ok()
+            .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
+            .filter(|p| p.exists())
+    }
+
+    /// 取实例 `referent` 字段序号(声明于 Reference;子类扁平布局同序)。
+    fn referent_ord(vm: &Vm<'_>, r: Reference) -> Option<usize> {
+        let cn = match vm.heap().get(r)? {
+            crate::oops::Oop::Instance(i) => i.class_name().to_string(),
+            _ => return None,
+        };
+        vm.registry().and_then(|reg| {
+            reg.get(&cn).and_then(|lc| {
+                reg.flattened_instance_fields(lc)
+                    .iter()
+                    .position(|f| f.name == "referent")
+            })
+        })
+    }
+
+    /// **RED→GREEN**:`Reference.refersTo0(Object)Z` = `this.referent` 与 `o` 引用身份比较
+    ///(JVM_ReferenceRefersTo;Reference.java:373)。referent 由 `Reference.<init>(T)` 置
+    ///(Reference.java:532,普通实例字段——rustj 无 GC,不特殊处理)。
+    #[test]
+    fn refers_to0_compares_referent_identity() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/ref/Reference").unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
+
+        let mut vm = Vm::new(&registry);
+        // 两个不同 Object 实例 A、B(身份不同)。§6:'a 不绑 &self → inst 先算出(owned),
+        // 再 heap_mut().alloc,免 &mut vm 与 &vm 并发。
+        let new_obj = |vm: &mut Vm<'_>| -> Reference {
+            let reg = vm.registry().expect("须有注册表");
+            let lc = reg.get("java/lang/Object").expect("Object 须已加载");
+            let inst = reg.new_instance(lc);
+            vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
+        };
+        let a = new_obj(&mut vm);
+        let b = new_obj(&mut vm);
+        // Reference 实例,直置 referent=A(等价 Reference.<init>(A) 的字段写)。
+        let r = {
+            let reg = vm.registry().expect("须有注册表");
+            let lc = reg
+                .get("java/lang/ref/Reference")
+                .expect("Reference 须已加载");
+            let inst = reg.new_instance(lc);
+            vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
+        };
+        let ord = referent_ord(&vm, r).expect("Reference 须有 referent 字段");
+        if let Some(crate::oops::Oop::Instance(i)) = vm.heap_mut().get_mut(r) {
+            i.set_field(ord, Slot::Reference(a));
+        }
+
+        // refersTo0(A) → true(referent 身份 == A)。
+        let yes = super::super::invoke(
+            &mut vm,
+            "java/lang/ref/Reference",
+            "refersTo0",
+            "(Ljava/lang/Object;)Z",
+            Some(r),
+            &[Value::Reference(a)],
+        )
+        .expect("refersTo0(A) 应返布尔,非抛");
+        assert_eq!(yes, Value::Int(1), "referent==A 时 refersTo0 须返 true");
+        // refersTo0(B) → false(B 与 referent A 身份不同)。
+        let no = super::super::invoke(
+            &mut vm,
+            "java/lang/ref/Reference",
+            "refersTo0",
+            "(Ljava/lang/Object;)Z",
+            Some(r),
+            &[Value::Reference(b)],
+        )
+        .expect("refersTo0(B) 应返布尔,非抛");
+        assert_eq!(no, Value::Int(0), "referent=A 时 refersTo0(B) 须返 false");
+    }
+
+    /// 收尾:未登记的 Reference native 仍抛 ULE。
+    #[test]
+    fn unbound_reference_native_throws_ule() {
+        let registry = ClassRegistry::new();
+        let mut vm = Vm::new(&registry);
+        let err = super::super::invoke(
+            &mut vm,
+            "java/lang/ref/Reference",
+            "unknownNative",
+            "()V",
+            None,
+            &[],
+        )
+        .unwrap_err();
+        match err {
+            VmError::ThrownException(r) => match vm.heap().get(r) {
+                Some(crate::oops::Oop::Instance(i)) => {
+                    assert_eq!(i.class_name(), "java/lang/UnsatisfiedLinkError")
+                }
+                o => panic!("须 Instance,得 {o:?}"),
+            },
+            e => panic!("须 ThrownException,得 {e:?}"),
+        }
+    }
 }

@@ -96,6 +96,17 @@ pub(super) fn dispatch(
             "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
         ) => compare_and_set_reference(vm, args),
 
+        // jdk.internal.misc.Unsafe.compareAndSetInt(O,J,expected,x)Z —— Unsafe.java:1514 native,
+        // @IntrinsicCandidate(C11 atomic_compare_exchange_strong)。并发山起手:CHM 的 sizeCtl/
+        // cellsBusy/lockState 等 volatile int 字段经之 CAS(initTable/transfer/counterCells)。
+        // rustj 单线程:ord = offset;读实例当前 int 槽 == expected → 写 x 返 true,否则 false。
+        // 仅 Slot::Int 字段;非 int 槽/非 Instance → false(不抛)。镜像 compareAndSetReference 之 int 版。
+        (
+            "jdk/internal/misc/Unsafe",
+            "compareAndSetInt",
+            "(Ljava/lang/Object;JII)Z",
+        ) => compare_and_set_int(vm, args),
+
         // 注:addressSize()/pageSize()/isBigEndian()/unalignedAccess() 均为返回常量字段
         // (ADDRESS_SIZE / PAGE_SIZE / BIG_ENDIAN / UNALIGNED_ACCESS)的字节码方法;这些字段在
         // Unsafe.class 中已是字面量初始化(不经 native),故 <clinit> 无更多 native 依赖。
@@ -217,5 +228,170 @@ fn compare_and_set_reference(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, V
         Ok(Value::Int(1))
     } else {
         Ok(Value::Int(0))
+    }
+}
+
+/// `Unsafe.compareAndSetInt(Object o, long offset, int expected, int x)Z` ——
+/// ord = offset;读 o 实例当前 int 槽,与 expected 比较相等 → 写 x 返 true,否则 false。
+/// 仅 Slot::Int 字段;非 int 槽/非 Instance → false(不抛)。镜像 compareAndSetReference 的 int 版
+/// (Unsafe.java:1514;CHM.initTable 的 sizeCtl CAS 走此)。单线程下当 expected 匹配恒成功。
+fn compare_and_set_int(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset, expected, x) = match (args.first(), args.get(1), args.get(2), args.get(3)) {
+        (
+            Some(Value::Reference(o)),
+            Some(Value::Long(off)),
+            Some(Value::Int(e)),
+            Some(Value::Int(x)),
+        ) => (*o, *off, *e, *x),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    let ord = offset as usize;
+    // 读当前槽(不可变借堆);匹配标志出块后释放,再 &mut 写。
+    let matches = match vm.heap().get(o) {
+        Some(Oop::Instance(i)) => matches!(i.field(ord), Slot::Int(cur) if cur == expected),
+        _ => false,
+    };
+    if matches {
+        if let Some(Oop::Instance(i)) = vm.heap_mut().get_mut(o) {
+            i.set_field(ord, Slot::Int(x));
+        }
+        Ok(Value::Int(1))
+    } else {
+        Ok(Value::Int(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::oops::ClassRegistry;
+    use crate::runtime::class_loader::class_path::ClassPath;
+    use crate::runtime::class_loader::loader::load_closure;
+    use crate::runtime::{Slot, Value, Vm};
+
+    use std::path::{Path, PathBuf};
+
+    fn find_javabase_jmod() -> Option<PathBuf> {
+        for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
+            let p = Path::new("C:/Program Files/Java")
+                .join(ver)
+                .join("jmods/java.base.jmod");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        std::env::var("JAVA_HOME")
+            .ok()
+            .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
+            .filter(|p| p.exists())
+    }
+
+    /// **RED→GREEN**:`Unsafe.compareAndSetInt` 单线程 CAS 语义(Unsafe.java:1514 native)。
+    ///
+    /// `objectFieldOffset1`(已绑定)返字段 ord;`compareAndSetInt(o, ord, expected, x)` 读 ord 槽,
+    /// 当前==expected → 写 x 返 true(1),否则返 false(0)。Integer 实例 `value` 字段(默认 0):
+    /// CAS(0→42) 成功 + 字段变 42;CAS(0→99) 失败(当前 42≠0)+ 字段不变。
+    #[test]
+    fn compare_and_set_int_cas_semantics() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
+
+        let mut vm = Vm::new(&registry);
+
+        // Integer 实例(default-init,value=0)。§6 块模式:new_instance 出块后 heap_mut 独占。
+        let inst_ref = {
+            let reg = vm.registry().expect("须注册表");
+            let lc = reg.get("java/lang/Integer").expect("Integer 须加载");
+            let inst = reg.new_instance(lc);
+            vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
+        };
+
+        // objectFieldOffset1(Integer.class, "value") → ord(已绑定 native)。
+        let int_mirror = vm.intern_class_mirror("java/lang/Integer");
+        let name_ref =
+            crate::runtime::interpreter::string::intern(&mut vm, "value").expect("intern value");
+        let ord_val = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "objectFieldOffset1",
+            "(Ljava/lang/Class;Ljava/lang/String;)J",
+            None,
+            &[Value::Reference(int_mirror), Value::Reference(name_ref)],
+        )
+        .expect("objectFieldOffset1 须返 ord");
+        let Value::Long(ord) = ord_val else {
+            panic!("objectFieldOffset1 须返 Long,得 {ord_val:?}");
+        };
+        assert!(ord >= 0, "value 字段须找到,得 ord={ord}");
+
+        // CAS(0→42):当前 value=0==expected → 成功返 1。
+        let r1 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "compareAndSetInt",
+            "(Ljava/lang/Object;JII)Z",
+            None,
+            &[Value::Reference(inst_ref), Value::Long(ord), Value::Int(0), Value::Int(42)],
+        )
+        .expect("compareAndSetInt 须返 Z,非抛异常");
+        assert_eq!(r1, Value::Int(1), "CAS(0→42) 须成功返 1(当前 0==expected)");
+
+        // 字段现为 42。
+        let v = match vm.heap().get(inst_ref) {
+            Some(crate::oops::Oop::Instance(i)) => i.field(ord as usize),
+            _ => panic!("须 Instance"),
+        };
+        assert!(matches!(v, Slot::Int(42)), "CAS 后字段须为 42,得 {v:?}");
+
+        // CAS(0→99):当前 42≠0 → 失败返 0,字段不变。
+        let r2 = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "compareAndSetInt",
+            "(Ljava/lang/Object;JII)Z",
+            None,
+            &[Value::Reference(inst_ref), Value::Long(ord), Value::Int(0), Value::Int(99)],
+        )
+        .expect("compareAndSetInt 须返 Z,非抛异常");
+        assert_eq!(r2, Value::Int(0), "CAS(0→99) 须失败返 0(当前 42≠expected 0)");
+        let v2 = match vm.heap().get(inst_ref) {
+            Some(crate::oops::Oop::Instance(i)) => i.field(ord as usize),
+            _ => panic!("须 Instance"),
+        };
+        assert!(
+            matches!(v2, Slot::Int(42)),
+            "失败 CAS 不得改字段,须仍 42,得 {v2:?}"
+        );
+    }
+
+    /// 收尾:确使未登记路径仍抛 ULE(防 dispatch 误吞)。
+    #[test]
+    fn unbound_unsafe_native_throws_ule() {
+        let registry = ClassRegistry::new();
+        let mut vm = Vm::new(&registry);
+        let err = super::super::invoke(
+            &mut vm,
+            "jdk/internal/misc/Unsafe",
+            "unknownNative",
+            "()V",
+            None,
+            &[],
+        )
+        .unwrap_err();
+        match err {
+            crate::runtime::VmError::ThrownException(r) => match vm.heap().get(r) {
+                Some(crate::oops::Oop::Instance(i)) => {
+                    assert_eq!(i.class_name(), "java/lang/UnsatisfiedLinkError")
+                }
+                o => panic!("须 Instance,得 {o:?}"),
+            },
+            e => panic!("须 ThrownException,得 {e:?}"),
+        }
     }
 }

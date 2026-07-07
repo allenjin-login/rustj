@@ -292,6 +292,19 @@ impl<'a> Vm<'a> {
         self.call_stack.pop();
     }
 
+    /// 自栈顶(最新帧)向下第 `depth_from_top` 层帧的声明类内部名(0 = 栈顶)。
+    ///
+    /// 供 `Reflection.getCallerClass`(@CallerSensitive 基础设施)等栈帧回溯 native 用。
+    /// 栈深不足(无对应层)→ `None`。`native::invoke` 已为本 native 推入自身帧(即栈顶),
+    /// 故 `depth_from_top=2` = "调用 getCallerClass 的方法"的**调用者**。
+    pub(crate) fn frame_class_at(&self, depth_from_top: usize) -> Option<&str> {
+        let n = self.call_stack.len();
+        n.checked_sub(1)
+            .and_then(|last| last.checked_sub(depth_from_top))
+            .and_then(|i| self.call_stack.get(i))
+            .map(|f| f.class.as_str())
+    }
+
     /// 刷新**栈顶**帧的 bci(`run()` 分派前调,记当前指令起始)。抛出时即抛点 bci;
     /// 调用者陷入被调用者后,其顶帧 pc 冻结于 invoke 点(其 run loop 挂起前最后写入)。
     /// 栈为空(匿名纯算术帧)时无操作。

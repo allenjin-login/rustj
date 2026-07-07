@@ -26,6 +26,7 @@ use super::{throw_exception, Value, VmError};
 mod java_lang;
 mod jdk_internal;
 mod jdk_internal_loader;
+mod jdk_internal_reflect;
 
 /// native 方法分派入口(对应 HotSpot `prims/jvm.cpp` 的 `JVM_*` 桥 + `nativeLookup.cpp`
 /// 解析到的 JDK 侧 `Java_*` 桥)。
@@ -75,6 +76,9 @@ fn dispatch(
         }
         "jdk/internal/loader/NativeLibraries" | "jdk/internal/loader/NativeLibrary" => {
             jdk_internal_loader::dispatch(vm, class, name, desc, this, args)
+        }
+        "jdk/internal/reflect/Reflection" => {
+            jdk_internal_reflect::dispatch(vm, class, name, desc, this, args)
         }
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }

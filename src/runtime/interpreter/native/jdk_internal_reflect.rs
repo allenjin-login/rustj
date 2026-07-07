@@ -28,7 +28,7 @@ pub(super) fn dispatch(
     name: &str,
     desc: &str,
     _this: Option<Reference>,
-    _args: &[Value],
+    args: &[Value],
 ) -> Result<Value, VmError> {
     match (class, name, desc) {
         // Reflection.getCallerClass()Ljava/lang/Class; —— Reflection.java:73 native,
@@ -42,8 +42,45 @@ pub(super) fn dispatch(
                 None => Ok(Value::Reference(Reference::null())),
             }
         }
+        // Reflection.getClassAccessFlags(Ljava/lang/Class;)I —— jmod(jdk-25.0.2)javap 确认
+        // 为 `public static native`(jdk-master 源码已改字节码委派 Class.getClassFileAccessFlags,
+        // 版本错位,以本机 jmod 实测为准)。返回 Class 的 class-file access flags 低 13 位。
+        ("jdk/internal/reflect/Reflection", "getClassAccessFlags", "(Ljava/lang/Class;)I") => {
+            Ok(Value::Int(get_class_access_flags(vm, args)?))
+        }
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }
+}
+
+/// `Reflection.getClassAccessFlags(Class)I` native 语义移植(对应 `Class.getClassFileAccessFlags`,
+/// `Class.java:4141` javadoc;`Reflection.java:78-82` 注释保证仅低 13 位 `0x1FFF` 有效):
+/// - **普通类** → `cf.access_flags.bits() & 0x1FFF`(class 文件 access_flags 低 13 位);
+/// - **数组**(`[...`)→ 0(javadoc:数组 → 0;`VerifyAccess.getClassModifiers` 对数组走
+///   `c.getModifiers()` 不调本 native,此分支防御性);
+/// - **原语**(`int`/`long`/…)→ `ACC_PUBLIC|ACC_ABSTRACT|ACC_FINAL` = 0x0411(javadoc:原语 → 此组合)。
+///
+/// null 参 / 非 Class 镜像 → `NullPointerException`(`JVM_GetClassAccessFlags` 对 null Class 的处置)。
+fn get_class_access_flags(vm: &mut Vm<'_>, args: &[Value]) -> Result<i32, VmError> {
+    // class_arg_name 借 &vm 返 owned String,出 match 即释放 → 后续 throw_exception(&mut vm)/
+    // registry() 无借用冲突。
+    let internal = match super::class_arg_name(vm, args) {
+        Some(n) => n,
+        None => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    if internal.starts_with('[') {
+        return Ok(0);
+    }
+    if super::is_primitive_name(&internal) {
+        // ACC_PUBLIC(0x0001)|ACC_FINAL(0x0010)|ACC_ABSTRACT(0x0400) = 0x0411。
+        return Ok(0x0411);
+    }
+    // 普通类:读 class-file access_flags 低 13 位。类未加载(异常态)→ 0 兜底。
+    let bits = vm
+        .registry()
+        .and_then(|r| r.get(&internal))
+        .map(|lc| lc.cf.access_flags.bits() as i32 & 0x1FFF)
+        .unwrap_or(0);
+    Ok(bits)
 }
 
 #[cfg(test)]
@@ -51,7 +88,7 @@ mod tests {
     use crate::oops::ClassRegistry;
     use crate::runtime::class_loader::class_path::ClassPath;
     use crate::runtime::class_loader::loader::load_closure;
-    use crate::runtime::{Value, Vm, VmError};
+    use crate::runtime::{Reference, Value, Vm, VmError};
 
     use std::path::{Path, PathBuf};
 
@@ -138,6 +175,142 @@ mod tests {
         match r {
             Value::Reference(r) => assert!(r.is_null(), "栈深不足须返 null Class"),
             other => panic!("须 null 引用,得 {other:?}"),
+        }
+    }
+
+    /// **RED→GREEN**(Layer 4.23):`Reflection.getClassAccessFlags(Class)I` native 返回 Class 的
+    /// class-file access flags(低 13 位 `0x1FFF` 有效,`Reflection.java:78-82` 注释)。jmod
+    /// (jdk-25.0.2)javap 确认此法为 `public static native`(jdk-master 源码已改字节码委派
+    /// `Class.getClassFileAccessFlags`——版本错位,以本机 jmod 实测为准)。`Integer` =
+    /// `public final class` → ACC_PUBLIC|ACC_FINAL|ACC_SUPER;返回须 = `cf.access_flags.bits() & 0x1FFF`。
+    #[test]
+    fn get_class_access_flags_regular_class() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
+
+        let mut vm = Vm::new(&registry);
+        let mirror = vm.intern_class_mirror("java/lang/Integer");
+        let r = super::super::invoke(
+            &mut vm,
+            "jdk/internal/reflect/Reflection",
+            "getClassAccessFlags",
+            "(Ljava/lang/Class;)I",
+            None,
+            &[Value::Reference(mirror)],
+        )
+        .expect("getClassAccessFlags 应返 int,非抛异常");
+        let Value::Int(flags) = r else {
+            panic!("getClassAccessFlags 须返 int,得 {r:?}");
+        };
+        let expected = vm
+            .registry()
+            .and_then(|r| r.get("java/lang/Integer"))
+            .expect("Integer 须已加载")
+            .cf
+            .access_flags
+            .bits() as i32
+            & 0x1FFF;
+        assert_eq!(
+            flags, expected,
+            "getClassAccessFlags 须 = cf.access_flags.bits() & 0x1FFF"
+        );
+        // 卫生:Integer 为 public → ACC_PUBLIC(0x0001)位须置(防实现偷返 0)。
+        assert_eq!(flags & 0x0001, 1, "Integer 须 ACC_PUBLIC");
+    }
+
+    /// **RED→GREEN**(Layer 4.23):数组 Class → 0(`Class.getClassFileAccessFlags` javadoc:
+    /// 数组 → 0;`VerifyAccess.getClassModifiers` 对数组走 `c.getModifiers()` 不调本 native,
+    /// 此分支为防御性正确)。
+    #[test]
+    fn get_class_access_flags_array_returns_zero() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
+
+        let mut vm = Vm::new(&registry);
+        let mirror = vm.intern_class_mirror("[B");
+        let r = super::super::invoke(
+            &mut vm,
+            "jdk/internal/reflect/Reflection",
+            "getClassAccessFlags",
+            "(Ljava/lang/Class;)I",
+            None,
+            &[Value::Reference(mirror)],
+        )
+        .expect("数组 Class 须返 0,非抛异常");
+        let Value::Int(flags) = r else {
+            panic!("getClassAccessFlags 须返 int,得 {r:?}");
+        };
+        assert_eq!(flags, 0, "数组 Class 的 access flags 须为 0");
+    }
+
+    /// **RED→GREEN**(Layer 4.23):原语 Class → PUBLIC|ABSTRACT|FINAL = 0x0411
+    ///(`Class.getClassFileAccessFlags` javadoc:原语 → PUBLIC|ABSTRACT|FINAL;防御性)。
+    #[test]
+    fn get_class_access_flags_primitive_returns_modifiers() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
+
+        let mut vm = Vm::new(&registry);
+        let mirror = vm.intern_class_mirror("int");
+        let r = super::super::invoke(
+            &mut vm,
+            "jdk/internal/reflect/Reflection",
+            "getClassAccessFlags",
+            "(Ljava/lang/Class;)I",
+            None,
+            &[Value::Reference(mirror)],
+        )
+        .expect("原语 Class 须返 0x0411,非抛异常");
+        let Value::Int(flags) = r else {
+            panic!("getClassAccessFlags 须返 int,得 {r:?}");
+        };
+        assert_eq!(flags, 0x0411, "原语 Class 须 PUBLIC|ABSTRACT|FINAL = 0x0411");
+    }
+
+    /// **RED→GREEN**(Layer 4.23):null 参 → NullPointerException(对应 HotSpot
+    /// `JVM_GetClassAccessFlags` 对 null Class 的处置)。
+    #[test]
+    fn get_class_access_flags_null_arg_throws_npe() {
+        let registry = ClassRegistry::new();
+        let mut vm = Vm::new(&registry);
+        let err = super::super::invoke(
+            &mut vm,
+            "jdk/internal/reflect/Reflection",
+            "getClassAccessFlags",
+            "(Ljava/lang/Class;)I",
+            None,
+            &[Value::Reference(Reference::null())],
+        )
+        .unwrap_err();
+        match err {
+            VmError::ThrownException(r) => match vm.heap().get(r) {
+                Some(crate::oops::Oop::Instance(i)) => {
+                    assert_eq!(i.class_name(), "java/lang/NullPointerException")
+                }
+                o => panic!("须 Instance,得 {o:?}"),
+            },
+            e => panic!("须 ThrownException,得 {e:?}"),
         }
     }
 

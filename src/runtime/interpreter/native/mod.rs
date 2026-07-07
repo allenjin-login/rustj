@@ -156,6 +156,18 @@ mod tests {
         ));
     }
 
+    // Runtime.availableProcessors()I —— jvm.cpp JVM_ActiveProcessorCount。返 CPU 核数(≥1)。
+    #[test]
+    fn runtime_available_processors_returns_positive() {
+        // 须注册表:未登记臂走 throw_exception 须有引导桩(RED 阶段);GREEN 后本臂不触之。
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::Vm::new(&reg);
+        match invoke(&mut vm, "java/lang/Runtime", "availableProcessors", "()I", None, &[]).unwrap() {
+            Value::Int(n) => assert!(n >= 1, "availableProcessors 须 ≥1,得 {n}"),
+            other => panic!("期望 Int,得 {other:?}"),
+        }
+    }
+
     // getPrimitiveClass 的 String 收参路径(返原语 Class 镜像 / 非原语抛 ClassNotFoundException)
     // 经集成闸门覆盖:`real_integer.rs` 的 `Integer.<clinit>` 调 `Class.getPrimitiveClass("int")`
     // 端到端(须先预载真 String)。单测层面仅覆盖缺参 → NPE 与 `is_primitive_name` 纯逻辑。

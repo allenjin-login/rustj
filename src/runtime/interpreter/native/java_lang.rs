@@ -298,6 +298,18 @@ pub(super) fn dispatch(
         // (VM.saveProperties 存进 directMemory,本场景不用;真值无意义)。
         ("java/lang/Runtime", "maxMemory", "()J") => Ok(Value::Long(i64::MAX)),
 
+        // Runtime.availableProcessors()I —— jvm.cpp JVM_ActiveProcessorCount:CPU 核数。
+        // 经 std::thread::available_parallelism;失败或 >i32::MAX → 1(规范下限 ≥1)。
+        // 解锁 ConcurrentHashMap.<clinit>(runtimeSetup 读 NCPU)等依赖核数的 <clinit>。
+        ("java/lang/Runtime", "availableProcessors", "()I") => {
+            let n = std::thread::available_parallelism()
+                .map(|nz| nz.get())
+                .unwrap_or(1)
+                .try_into()
+                .unwrap_or(1);
+            Ok(Value::Int(n))
+        }
+
         // String.intern()Ljava/lang/String; —— String.java:5086 native。读 this 文本 → 经
         // StringPool 规范化(同文本恒同引用),返规范引用。对应 jvm.cpp JVM_InternString / HotSpot
         // StringTable。String 的其余方法(equals/hashCode/length/…)退役 Oop::String 后跑真字节码

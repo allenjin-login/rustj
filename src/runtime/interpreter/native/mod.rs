@@ -23,6 +23,7 @@ use crate::runtime::{Reference, Vm};
 
 use super::{throw_exception, Value, VmError};
 
+mod java_io;
 mod java_lang;
 mod jdk_internal;
 mod jdk_internal_loader;
@@ -71,6 +72,7 @@ fn dispatch(
     }
     match class {
         c if c.starts_with("java/lang/") => java_lang::dispatch(vm, c, name, desc, this, args),
+        c if c.starts_with("java/io/") => java_io::dispatch(vm, c, name, desc, this, args),
         "jdk/internal/misc/VM" | "jdk/internal/misc/CDS" | "jdk/internal/misc/Unsafe" => {
             jdk_internal::dispatch(vm, class, name, desc, this, args)
         }

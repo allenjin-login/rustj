@@ -30,6 +30,9 @@ pub(super) fn dispatch(
     match (class, name, desc) {
         // WinNTFileSystem.initIDs()V —— <clinit> 缓存字段 ID;无 FS 访问 → 空操作返 void。
         ("java/io/WinNTFileSystem", "initIDs", "()V") => Ok(Value::Void),
+        // FileDescriptor.initIDs()V —— FileDescriptor.java:65 <clinit> 首调。HotSpot
+        // Java_java_io_FileDescriptor_initIDs 仅缓存字段 ID(IO_fd/handle/append),无 FS 访问 → 空操作。
+        ("java/io/FileDescriptor", "initIDs", "()V") => Ok(Value::Void),
         // WinNTFileSystem.canonicalize0(Ljava/lang/String;)Ljava/lang/String; —— 路径规范化(std::fs::canonicalize)。
         ("java/io/WinNTFileSystem", "canonicalize0", "(Ljava/lang/String;)Ljava/lang/String;") => {
             canonicalize0(vm, args)
@@ -209,6 +212,27 @@ mod tests {
             &[],
         )
         .expect("initIDs 应返 void,非抛异常");
+        assert!(matches!(r, Value::Void), "须返 void,得 {r:?}");
+    }
+
+    /// **RED→GREEN**(Layer 4.35):`FileDescriptor.initIDs()V` native 空操作返 void。
+    /// HotSpot `Java_java_io_FileDescriptor_initIDs`(`FileDescriptor_md.c`)仅缓存字段 ID
+    /// (`IO_fd`/`IO_handle`/`IO_append`),无 FS 访问。`FileDescriptor.<clinit>:65` 首调 →
+    /// 解锁 nio `WindowsChannelFactory.<clinit>`→`SharedSecrets.getJavaIOFileDescriptorAccess`
+    /// →`ensureClassInitialized(FileDescriptor)`→`FileDescriptor.<clinit>` 链。
+    #[test]
+    fn file_descriptor_init_ids_returns_void() {
+        let registry = ClassRegistry::new();
+        let mut vm = Vm::new(&registry);
+        let r = super::super::invoke(
+            &mut vm,
+            "java/io/FileDescriptor",
+            "initIDs",
+            "()V",
+            None,
+            &[],
+        )
+        .expect("FileDescriptor.initIDs 应返 void,非抛异常");
         assert!(matches!(r, Value::Void), "须返 void,得 {r:?}");
     }
 

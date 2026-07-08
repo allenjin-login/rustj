@@ -57,7 +57,37 @@ pub fn initialize_system_class(vm: &mut Vm<'_>) -> Result<(), VmError> {
     // 条件:`java/util/Properties` + `java/lang/System` 均已预载(否则跳过,保旧测试兼容)。
     install_system_props(vm)?;
 
+    // System.setJavaLangAccess()V —— 安装 SharedSecrets.javaLangAccess(Layer 4.30)。真 JDK 由
+    // `System.initPhase1`(`System.java:1778`)首步调之;rustj 抽为独立步。置 javaLangAccess 字段后,
+    // `AbstractClassLoaderValue.map` → `JLA.createOrGetClassLoaderValueMap` 不再 NPE,解锁
+    // `ClassLoaders.<clinit>` → `getSystemClassLoader()` 整链。须在 props 之后(安装可能触发 System.<clinit>)。
+    install_java_lang_access(vm)?;
+
     Ok(())
+}
+
+/// 安装 `SharedSecrets.javaLangAccess`(Layer 4.30)—— 经 `invokestatic
+/// java/lang/System.setJavaLangAccess()V`(`System.java:1995`,**私有静态**;rustj 不查访问控制,
+/// `find_static_method` 遍历全部方法不滤 access)。真 JDK 由 `System.initPhase1`(`System.java:1778`)
+/// 首步调之;rustj 的 `initialize_system_class` 是 initPhase1 最小子集,故单独抽出此步。
+///
+/// `setJavaLangAccess` 体 = `SharedSecrets.setJavaLangAccess(new JavaLangAccess(){...})`:分配
+/// `System$1` 匿名 `JavaLangAccess` 实例(**~80 方法体安装期不跑**,仅按需惰性调用)→ 置
+/// `SharedSecrets.javaLangAccess` 静态字段。置后 `AbstractClassLoaderValue.map`(AbstractClassLoaderValue.java:266)
+/// 的 `JLA.createOrGetClassLoaderValueMap(cl)` 不再 NPE → `ClassLoaders.<clinit>` →
+/// `ArchivedClassLoaders.archive` → `ServicesCatalog` 全链通 → `getSystemClassLoader()` 返非 null。
+///
+/// **前置**:`java/lang/System` 已预载(由 `install_system_props` 保证;其内已 `get("java/lang/System")`)。
+/// System 未预载 → 静默跳过(保旧测试兼容,同 `install_system_props` 防御)。
+fn install_java_lang_access(vm: &mut Vm<'_>) -> Result<(), VmError> {
+    let has_system = vm
+        .registry()
+        .map(|r| r.get("java/lang/System").is_some())
+        .unwrap_or(false);
+    if !has_system {
+        return Ok(());
+    }
+    invoke_static_void(vm, "java/lang/System", "setJavaLangAccess", |_| Ok(()))
 }
 
 /// 构造真 `java.util.Properties` 实例并写 `System.props` 静态字段(Phase 1 收尾,Layer 4.20),

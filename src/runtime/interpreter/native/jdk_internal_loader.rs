@@ -73,6 +73,16 @@ pub(super) fn dispatch(
             "(JLjava/lang/String;)J",
         ) => find_entry0(vm, args),
 
+        // BootLoader.setBootLoaderUnnamedModule0(Module)V —— BootLoader.java:334 private static
+        // native。<clinit>:71 调用。HotSpot JVM_SetBootLoaderUnnamedModule 把 boot loader 关联其
+        // unnamed module 到原生模块层;rustj 纯 Rust 模型无原生模块层 → 空操作(Module 已 Java 侧
+        // 经 jla.defineUnnamedModule 建)。解锁 WindowsNativeDispatcher.<clinit>→BootLoader.<clinit>。
+        (
+            "jdk/internal/loader/BootLoader",
+            "setBootLoaderUnnamedModule0",
+            "(Ljava/lang/Module;)V",
+        ) => Ok(Value::Void),
+
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }
 }
@@ -349,5 +359,26 @@ mod tests {
             },
             e => panic!("须 ThrownException(ULE),得 {e:?}"),
         }
+    }
+
+    /// **RED→GREEN**(Layer 4.37):`BootLoader.setBootLoaderUnnamedModule0(Module)V`
+    /// (BootLoader.java:334 `private static native`)——`<clinit>:71` 调用。HotSpot 把 boot loader
+    /// 关联其 unnamed module 到原生模块层(JVM_SetBootLoaderUnnamedModule);rustj 纯 Rust 模型
+    /// 无原生模块层 → 空操作(Module 已 Java 侧经 `jla.defineUnnamedModule` 建)。
+    /// 解锁 `WindowsNativeDispatcher.<clinit>`→`BootLoader.<clinit>:66` 链。
+    #[test]
+    fn bootloader_set_unnamed_module_returns_void() {
+        let registry = ClassRegistry::new();
+        let mut vm = Vm::new(&registry);
+        let r = super::super::invoke(
+            &mut vm,
+            "jdk/internal/loader/BootLoader",
+            "setBootLoaderUnnamedModule0",
+            "(Ljava/lang/Module;)V",
+            None,
+            &[Value::Reference(Reference::null())],
+        )
+        .expect("setBootLoaderUnnamedModule0 应返 void,非抛异常");
+        assert!(matches!(r, Value::Void), "须返 void,得 {r:?}");
     }
 }

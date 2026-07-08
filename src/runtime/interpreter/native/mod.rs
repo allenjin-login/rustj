@@ -76,7 +76,8 @@ fn dispatch(
         "jdk/internal/misc/VM" | "jdk/internal/misc/CDS" | "jdk/internal/misc/Unsafe" => {
             jdk_internal::dispatch(vm, class, name, desc, this, args)
         }
-        "jdk/internal/loader/NativeLibraries" | "jdk/internal/loader/NativeLibrary" => {
+        "jdk/internal/loader/NativeLibraries" | "jdk/internal/loader/NativeLibrary"
+        | "jdk/internal/loader/BootLoader" => {
             jdk_internal_loader::dispatch(vm, class, name, desc, this, args)
         }
         "jdk/internal/reflect/Reflection" => {

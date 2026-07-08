@@ -33,6 +33,20 @@ pub(super) fn dispatch(
         // FileDescriptor.initIDs()V —— FileDescriptor.java:65 <clinit> 首调。HotSpot
         // Java_java_io_FileDescriptor_initIDs 仅缓存字段 ID(IO_fd/handle/append),无 FS 访问 → 空操作。
         ("java/io/FileDescriptor", "initIDs", "()V") => Ok(Value::Void),
+        // FileDescriptor.getHandle(I)J —— FileDescriptor.java:227 private static native。私有
+        // FileDescriptor(int fd)<init>:129 调用(std 流 in=0/out=1/err=2)。HotSpot Windows 用
+        // GetStdHandle 取 OS HANDLE;rustj 不接 OS stdio handle → 返 fd 作 placeholder(0/1/2,
+        // 非 -1 即非 invalid handle,使 <clinit>:151 的 in/out/err 构造完成)。
+        ("java/io/FileDescriptor", "getHandle", "(I)J") => {
+            let fd = match args.first().copied() {
+                Some(Value::Int(n)) => n as i64,
+                _ => -1,
+            };
+            Ok(Value::Long(fd))
+        }
+        // FileDescriptor.getAppend(I)Z —— FileDescriptor.java:232 private static native。std 流
+        // 非 append → 返 false。HotSpot 读 fd 的 O_APPEND 标志;rustj std 流恒非 append。
+        ("java/io/FileDescriptor", "getAppend", "(I)Z") => Ok(Value::Int(0)),
         // WinNTFileSystem.canonicalize0(Ljava/lang/String;)Ljava/lang/String; —— 路径规范化(std::fs::canonicalize)。
         ("java/io/WinNTFileSystem", "canonicalize0", "(Ljava/lang/String;)Ljava/lang/String;") => {
             canonicalize0(vm, args)
@@ -234,6 +248,47 @@ mod tests {
         )
         .expect("FileDescriptor.initIDs 应返 void,非抛异常");
         assert!(matches!(r, Value::Void), "须返 void,得 {r:?}");
+    }
+
+    /// **RED→GREEN**(Layer 4.36):`FileDescriptor.getHandle(int)long`(FileDescriptor.java:227)
+    /// 与 `getAppend(int)boolean`(FileDescriptor.java:232)——`private static native`,由私有
+    /// `FileDescriptor(int fd)<init>:129` 调用以设置 std 流(in=0/out=1/err=2)的 OS handle/append。
+    /// `<clinit>:151` 创建 in/out/err 触发。HotSpot Windows 用 `GetStdHandle`/读 append 标志;
+    /// rustj 不接 OS stdio handle → `getHandle` 返 `fd` 作 placeholder(0/1/2,非 -1 即非 invalid),
+    /// `getAppend` 返 false(std 流非 append)。
+    #[test]
+    fn file_descriptor_get_handle_and_get_append_return_placeholders() {
+        let registry = ClassRegistry::new();
+        let mut vm = Vm::new(&registry);
+        // getHandle(0/1/2) → 0/1/2(placeholder;非 -1 即非 invalid handle)。
+        for fd in [0i32, 1, 2] {
+            let h = super::super::invoke(
+                &mut vm,
+                "java/io/FileDescriptor",
+                "getHandle",
+                "(I)J",
+                None,
+                &[Value::Int(fd)],
+            )
+            .expect("getHandle 应返 long,非抛异常");
+            match h {
+                Value::Long(v) => assert_eq!(v, fd as i64, "getHandle({fd}) placeholder 须 == fd"),
+                other => panic!("getHandle 须返 long,得 {other:?}"),
+            }
+        }
+        // getAppend(0/1/2) → false(std 流非 append)。
+        for fd in [0i32, 1, 2] {
+            let a = super::super::invoke(
+                &mut vm,
+                "java/io/FileDescriptor",
+                "getAppend",
+                "(I)Z",
+                None,
+                &[Value::Int(fd)],
+            )
+            .expect("getAppend 应返 boolean,非抛异常");
+            assert_eq!(a, Value::Int(0), "getAppend({fd}) 须返 false(0)");
+        }
     }
 
     /// **`strip_verbatim_prefix` 纯逻辑**(Layer 4.27):剥 Windows `\\?\` / `\\?\UNC\` 前缀。

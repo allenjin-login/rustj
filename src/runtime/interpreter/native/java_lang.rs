@@ -37,6 +37,20 @@ pub(super) fn dispatch(
             Ok(Value::Int(id))
         }
 
+        // System.identityHashCode(Object)I —— System.java:497 @IntrinsicCandidate public static
+        // native。jvm.cpp:629 JVM_IHashCode:`handle==nullptr ? 0 : FastHashCode(obj)`(jvm.cpp:631)。
+        // 与 Object.hashCode 共用 JVM_IHashCode(同 identity hash);rustj 句柄 id 即堆上唯一标识 →
+        // 直接 `id as i32`(null → 0)。静态法:receiver(None);args[0]=Object x。
+        // 解锁 Enum.hashCode:190→ImmutableCollections$SetN.probe→Set.of→FileSystemProvider.<clinit>
+        // →DefaultFileSystemProvider.<clinit>→FileSystems.getDefault→Path.of。
+        ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => {
+            let id = match args.first().copied() {
+                Some(Value::Reference(r)) => Reference::id(r).unwrap_or(0) as i32,
+                _ => 0,
+            };
+            Ok(Value::Int(id))
+        }
+
         // Object.notify()/notifyAll()/wait() —— jvm.cpp JVM_MonitorNotify/NotifyAll/Wait。
         // rustj 单线程:管程恒已满足、无 wait set → **空操作**(无并发线程可唤醒/等待)。
         // 解锁 `synchronized` 块尾的 `lock.notifyAll()`(如 VM.initLevel)等;真阻塞/调度顺延。
@@ -1018,6 +1032,85 @@ mod tests {
         )
         .expect("refersTo0(B) 应返布尔,非抛");
         assert_eq!(no, Value::Int(0), "referent=A 时 refersTo0(B) 须返 false");
+    }
+
+    /// **RED→GREEN(Layer 4.33)**:`System.identityHashCode(Object)I`(System.java:497
+    /// `@IntrinsicCandidate public static native`)移植 `JVM_IHashCode`(jvm.cpp:629):
+    /// `handle==nullptr ? 0 : FastHashCode(obj)`(jvm.cpp:631)。与 `Object.hashCode` 共用
+    /// `JVM_IHashCode` → 同一对象返同一值、`identityHashCode(x)==x.hashCode()`。解锁
+    /// `Enum.hashCode`→`Set.of`→`FileSystemProvider.<clinit>`→`Path.of` 链。
+    #[test]
+    fn identity_hash_code_matches_object_hashcode_and_handles_null() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/System").unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
+
+        let mut vm = Vm::new(&registry);
+        let new_obj = |vm: &mut Vm<'_>| -> Reference {
+            let reg = vm.registry().expect("须有注册表");
+            let lc = reg.get("java/lang/Object").expect("Object 须已加载");
+            let inst = reg.new_instance(lc);
+            vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
+        };
+        let a = new_obj(&mut vm);
+        let b = new_obj(&mut vm);
+
+        // null → 0(classic VM 行为;jvm.cpp:631 `handle==nullptr?0`)。
+        let null_hc = super::super::invoke(
+            &mut vm,
+            "java/lang/System",
+            "identityHashCode",
+            "(Ljava/lang/Object;)I",
+            None,
+            &[Value::Reference(Reference::null())],
+        )
+        .expect("identityHashCode(null) 应返 int,非抛");
+        assert_eq!(null_hc, Value::Int(0), "identityHashCode(null) 须返 0");
+
+        // 同一对象两次 → 同一值(稳定性)。
+        let ha1 = super::super::invoke(
+            &mut vm,
+            "java/lang/System",
+            "identityHashCode",
+            "(Ljava/lang/Object;)I",
+            None,
+            &[Value::Reference(a)],
+        )
+        .expect("identityHashCode(A) 应返 int");
+        let ha2 = super::super::invoke(
+            &mut vm,
+            "java/lang/System",
+            "identityHashCode",
+            "(Ljava/lang/Object;)I",
+            None,
+            &[Value::Reference(a)],
+        )
+        .expect("identityHashCode(A) 应返 int");
+        assert_eq!(ha1, ha2, "identityHashCode 须对同一对象稳定");
+
+        // identityHashCode(A) == A.hashCode()(两者均 JVM_IHashCode)。
+        let obj_hc = super::super::invoke(&mut vm, "java/lang/Object", "hashCode", "()I", Some(a), &[])
+            .expect("A.hashCode() 应返 int");
+        assert_eq!(ha1, obj_hc, "identityHashCode(x) 须 == x.hashCode()");
+
+        // A、B 不同句柄 → 不同 hashCode(rustj 句柄 id 唯一;a=slot0、b=slot1)。
+        let hb = super::super::invoke(
+            &mut vm,
+            "java/lang/System",
+            "identityHashCode",
+            "(Ljava/lang/Object;)I",
+            None,
+            &[Value::Reference(b)],
+        )
+        .expect("identityHashCode(B) 应返 int");
+        assert_ne!(ha1, hb, "不同对象 identityHashCode 须不同(rustj 句柄唯一)");
     }
 
     /// 收尾:未登记的 Reference native 仍抛 ULE。

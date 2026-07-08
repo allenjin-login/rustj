@@ -163,6 +163,61 @@ fn initialize_system_class_sets_system_props() {
     );
 }
 
+/// **Layer 4.26 探针**:经真 Java 读 `System.getProperty("file.separator")` 首字符 + `user.dir` 非空,
+/// 验证 Phase 1 现已装入真 launcher 系统属性。修前 `install_system_props` 仅置空 Properties →
+/// `getProperty` 返 null → `WinNTFileSystem.<init>:95` `.charAt(0)` NPE。返 -1 = null;非负 = 首字符/长度。
+const FS_PROBE_SOURCE: &str = r#"
+public class FsProbe {
+    public static int fileSepChar() {
+        String s = System.getProperty("file.separator");
+        return (s == null || s.isEmpty()) ? -1 : (int) s.charAt(0);
+    }
+    public static int userDirLen() {
+        String s = System.getProperty("user.dir");
+        return s == null ? -1 : s.length();
+    }
+}
+"#;
+
+/// **集成闸门**(Layer 4.26):`initialize_system_class` 现经 `Properties.put` 装入真 launcher 系统
+/// 属性(`file.separator`/`path.separator`/`user.dir`/…,值来自 OS)→ `WinNTFileSystem.<init>` 不再 NPE。
+#[test]
+fn initialize_system_class_populates_launcher_props() {
+    if !javac_available() {
+        eprintln!("跳过:无 javac");
+        return;
+    }
+    let Some(jmod) = find_javabase_jmod() else {
+        eprintln!("跳过:无 java.base.jmod");
+        return;
+    };
+    let dir = compile_dir(FS_PROBE_SOURCE, "FsProbe");
+    let mut registry = ClassRegistry::new();
+    registry
+        .load(rustj::classfile::parse(&std::fs::read(dir.join("FsProbe.class")).unwrap()).unwrap())
+        .unwrap();
+    let bytes = std::fs::read(&jmod).unwrap();
+    let mut cp = ClassPath::new();
+    cp.add("java.base.jmod", &bytes).unwrap();
+    load_closure(&mut registry, &cp, "java/lang/System").unwrap();
+    load_closure(&mut registry, &cp, "java/util/Properties").unwrap();
+    load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
+
+    let mut vm = Vm::new(&registry);
+    initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
+
+    // file.separator 首字符 = MAIN_SEPARATOR(Windows=\,Unix=/);修前返 -1(null→charAt NPE 前兆)。
+    assert_eq!(
+        run_static_int(&mut vm, "FsProbe", "fileSepChar"),
+        Ok(std::path::MAIN_SEPARATOR as i32),
+        "file.separator 须为 OS 主分隔符"
+    );
+    // user.dir 非空(来自 std::env::current_dir);修前返 -1(null)。
+    let user_dir_len =
+        run_static_int(&mut vm, "FsProbe", "userDirLen").expect("user.dir 读取不应抛异常");
+    assert!(user_dir_len >= 0, "user.dir 须非 null,得长度 {user_dir_len}");
+}
+
 /// **集成闸门**:VM 原生 Phase 1 引导(`initialize_system_class`)→ 无 Java 辅助类即可跑真 java.base。
 #[test]
 fn initialize_system_class_bootstraps_saved_props() {

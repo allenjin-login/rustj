@@ -10,7 +10,7 @@
 use crate::constant_pool::ConstantPoolEntry;
 use crate::metadata::MethodInfo;
 use crate::oops::{LoadedClass, Oop};
-use crate::runtime::{Frame, Interpreter, Vm, VmError};
+use crate::runtime::{Frame, Interpreter, Reference, Vm, VmError};
 
 /// **VM 运行时初始化 Phase 1**(`System.initPhase1` 的等价最小子集,`System.java:1720-1836`)。
 ///
@@ -55,38 +55,42 @@ pub fn initialize_system_class(vm: &mut Vm<'_>) -> Result<(), VmError> {
     //(HashMap.get 空 table 短路返 null、HashMap.put 首次 resize 分配 table),故置空 HashMap Instance
     // 即功能等价 —— 使 `System.getProperty` 返 null(非 NPE),解锁 `ClassLoaders.<clinit>:85`。
     // 条件:`java/util/Properties` + `java/lang/System` 均已预载(否则跳过,保旧测试兼容)。
-    install_system_props(vm);
+    install_system_props(vm)?;
 
     Ok(())
 }
 
-/// 构造真 `java.util.Properties` 实例并写 `System.props` 静态字段(Phase 1 收尾,Layer 4.20)。
+/// 构造真 `java.util.Properties` 实例并写 `System.props` 静态字段(Phase 1 收尾,Layer 4.20),
+/// 再装入真 launcher 系统属性(Layer 4.26)。
 ///
 /// `Properties` Instance 默认初始化(`map`=null)→ `getProperty` 会 `map.get(key)` NPE。故:
 /// 1. 分配空 `HashMap` Instance(table=null 默认;`HashMap.get` 短路返 null、`HashMap.put` 首次
 ///    `resize` 分配 table —— 单线程下功能完整)。
 /// 2. 分配 `Properties` Instance,置其 `map` 字段 = 该 HashMap(Properties.put/get/remove 委派之)。
 /// 3. `System.props` 静态字段 ← 该 Properties Instance(沿超类链解析声明类 + 序号,RefCell 写)。
+/// 4. 经 `Properties.put(Object,Object)Object` 真字节码逐项写入 OS 派生的 launcher 系统属性
+///    (Layer 4.26):`file.separator`/`path.separator`/`user.dir`/…—— 解锁 `WinNTFileSystem.<init>:95`
+///    等 `props.getProperty("file.separator").charAt(0)`(空 props → null → NPE)。
 ///
 /// `java/util/Properties` 或 `java/lang/System` 未预载 → 静默跳过(保 `vm_system_bootstrap` 旧闸门:
 /// 仅预载 Integer/HashMap/String,无 Properties/System 时仍绿)。
-fn install_system_props(vm: &mut Vm<'_>) {
+fn install_system_props(vm: &mut Vm<'_>) -> Result<(), VmError> {
     use crate::metadata::descriptor::FieldType;
     use crate::runtime::Slot;
 
     let reg = match vm.registry() {
         Some(r) => r,
-        None => return,
+        None => return Ok(()),
     };
     let props_lc = match reg.get("java/util/Properties") {
         Some(lc) => lc,
-        None => return,
+        None => return Ok(()),
     };
 
     // 1) 空 HashMap Instance(Properties.map 后盾)。&'a 引用不绑 &self(§6)→ 出块后 heap_mut 独占。
     let map_ref = {
         let Some(hm_lc) = reg.get("java/util/HashMap") else {
-            return;
+            return Ok(());
         };
         vm.heap_mut()
             .alloc(Oop::Instance(reg.new_instance(hm_lc)))
@@ -112,6 +116,129 @@ fn install_system_props(vm: &mut Vm<'_>) {
     if let Some((sys_lc, props_ord)) = reg.resolve_static_field("java/lang/System", "props", &ft) {
         sys_lc.static_storage.borrow_mut()[props_ord] = Slot::Reference(props_ref);
     }
+
+    // 4) Phase 1 launcher 系统属性(对应真 launcher 经 native 注入、`System.initPhase1` 装入 props)。
+    //    经 Properties.put 真字节码写入(map.put → HashMap.put;单线程后盾,首次 resize 分配 table)。
+    //    **不含 java.class.path**(保 4.20 闸门:getProperty("java.class.path") 仍 null)。
+    populate_launcher_props(vm, props_ref)?;
+    Ok(())
+}
+
+/// 向 `System.props` 写入 OS 派生的 launcher 系统属性(Phase 1,Layer 4.26)。
+///
+/// 对应真 JVM 的 native launcher(`System.c` / `java.c`)经 `getSystemProperty` 注入、
+/// `System.initPhase1`(`System.java:1720-1836`)装入 `props` 的标准属性集。rustj 不跑
+/// `initPhase1`,故在此直接 `Properties.put` 真字节码逐项写入(委派 `map.put` → HashMap.put)。
+/// 值从 OS 派生:`file.separator`=MAIN_SEPARATOR、`user.dir`=current_dir、… —— 解锁
+/// `WinNTFileSystem.<init>:95` 等读 `file.separator`/`path.separator`/`user.dir` 的代码。
+fn populate_launcher_props(vm: &mut Vm<'_>, props_ref: Reference) -> Result<(), VmError> {
+    let is_win = std::path::MAIN_SEPARATOR == '\\';
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+    let path_sep = if is_win { ";" } else { ":" }.to_string();
+    let line_sep = if is_win { "\r\n" } else { "\n" }.to_string();
+    let user_dir = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let user_home = std::env::var(if is_win { "USERPROFILE" } else { "HOME" })
+        .unwrap_or_else(|_| ".".to_string());
+    let user_name = std::env::var(if is_win { "USERNAME" } else { "USER" })
+        .unwrap_or_else(|_| "rustj".to_string());
+    let tmpdir = std::env::temp_dir().display().to_string();
+    let os_name = if is_win { "Windows" } else { "Linux" }.to_string();
+    let os_arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        a => a,
+    }
+    .to_string();
+    let java_home = std::env::var("JAVA_HOME")
+        .or_else(|_| std::env::var("java.home"))
+        .unwrap_or_else(|_| ".".to_string());
+
+    let props: &[(&str, &str)] = &[
+        ("file.separator", sep.as_str()),
+        ("path.separator", path_sep.as_str()),
+        ("line.separator", line_sep.as_str()),
+        ("user.dir", user_dir.as_str()),
+        ("user.home", user_home.as_str()),
+        ("user.name", user_name.as_str()),
+        ("java.io.tmpdir", tmpdir.as_str()),
+        ("os.name", os_name.as_str()),
+        ("os.arch", os_arch.as_str()),
+        ("os.version", "10.0"),
+        ("java.home", java_home.as_str()),
+        ("java.version", "25"),
+        ("java.specification.version", "25"),
+        ("java.vm.specification.version", "25"),
+        ("file.encoding", "UTF-8"),
+        ("sun.jnu.encoding", "UTF-8"),
+        ("stdout.encoding", "UTF-8"),
+        ("stderr.encoding", "UTF-8"),
+        ("sun.stdout.encoding", "UTF-8"),
+        ("sun.stderr.encoding", "UTF-8"),
+    ];
+    for (k, v) in props {
+        put_property(vm, props_ref, k, v)?;
+    }
+    Ok(())
+}
+
+/// 经解释器跑真字节码 `Properties.put(Object,Object)Object` 写入一个系统属性。
+/// 委派 `map.put` → HashMap.put(单线程后盾)。&'a 引用(reg/lc/m/code/CP)不绑 &self(§6)→
+/// 出块后 `interpret_with(&mut vm)` 可独占。
+fn put_property(
+    vm: &mut Vm<'_>,
+    props_ref: Reference,
+    key: &str,
+    value: &str,
+) -> Result<(), VmError> {
+    let key_ref = crate::runtime::interpreter::string::intern(vm, key)?;
+    let val_ref = crate::runtime::interpreter::string::intern(vm, value)?;
+    let reg = vm
+        .registry()
+        .ok_or(VmError::BadConstant("put_property 需要类注册表"))?;
+    let lc = reg
+        .get("java/util/Properties")
+        .ok_or(VmError::BadConstant("put_property:Properties 须预载"))?;
+    let m = find_method_by_sig(
+        lc,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    )
+    .ok_or(VmError::BadConstant(
+        "Properties.put(Object,Object)Object 未找到",
+    ))?;
+    let code = m
+        .code
+        .as_ref()
+        .ok_or(VmError::BadConstant("Properties.put 须为真字节码"))?;
+    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table);
+    let mut frame = Frame::new(code.max_locals, code.max_stack);
+    frame.locals.set_reference(0, props_ref)?;
+    frame.locals.set_reference(1, key_ref)?;
+    frame.locals.set_reference(2, val_ref)?;
+    interp.interpret_with(&mut frame, vm)?;
+    Ok(())
+}
+
+/// 按名 + 描述符查方法(launch 引导用 `Properties.put`,与 `find_static_method` 的仅按名查区分)。
+fn find_method_by_sig<'a>(
+    lc: &'a LoadedClass,
+    name: &str,
+    desc: &str,
+) -> Option<&'a MethodInfo> {
+    for m in &lc.cf.methods {
+        let Ok(ConstantPoolEntry::Utf8(n)) = lc.cf.constant_pool.get(m.name_index) else {
+            continue;
+        };
+        let Ok(ConstantPoolEntry::Utf8(d)) = lc.cf.constant_pool.get(m.descriptor_index) else {
+            continue;
+        };
+        if n.as_str() == name && d.as_str() == desc {
+            return Some(m);
+        }
+    }
+    None
 }
 
 /// **VM 运行时初始化 Phase 2**(模块系统引导,`System.initPhase2` 等价,`System.java:1929`)。

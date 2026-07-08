@@ -39,6 +39,10 @@ pub(super) fn dispatch(
         ("java/io/WinNTFileSystem", "getFinalPath0", "(Ljava/lang/String;)Ljava/lang/String;") => {
             get_final_path_0(vm, args)
         }
+        // WinNTFileSystem.getBooleanAttributes0(Ljava/io/File;)I —— 文件属性位掩码(std::fs::metadata)。
+        ("java/io/WinNTFileSystem", "getBooleanAttributes0", "(Ljava/io/File;)I") => {
+            get_boolean_attributes_0(vm, args)
+        }
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }
 }
@@ -98,6 +102,90 @@ fn get_final_path_0(_vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> 
         Some(v @ Value::Reference(_)) => v,
         _ => Value::Reference(Reference::null()),
     })
+}
+
+/// `WinNTFileSystem.getBooleanAttributes0(File)I`(WinNTFileSystem_md.c:356):读 File 实例 `path` 字段 →
+/// `std::fs::metadata`(=HotSpot `getFinalAttributes`/`GetFileAttributesEx`)→ 返位掩码:
+/// `BA_EXISTS=0x01`(存在)/`BA_REGULAR=0x02`(普通文件)/`BA_DIRECTORY=0x04`(目录)/`BA_HIDDEN=0x08`;
+/// 不存在(Err,=INVALID_FILE_ATTRIBUTES)→ 0。File 类名常量 `FileSystem.java:123-126`。
+fn get_boolean_attributes_0(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    const BA_EXISTS: i32 = 0x01;
+    const BA_REGULAR: i32 = 0x02;
+    const BA_DIRECTORY: i32 = 0x04;
+    const BA_HIDDEN: i32 = 0x08;
+    // 取 File 实参;null / 非 File → 返 0(C 层 fileToNTPath 返 NULL → rv=0)。
+    let Some(Value::Reference(file_ref)) = args.first().copied() else {
+        return Ok(Value::Int(0));
+    };
+    if file_ref.is_null() {
+        return Ok(Value::Int(0));
+    }
+    let path = match file_path_text(vm, file_ref)? {
+        Some(p) => p,
+        None => return Ok(Value::Int(0)),
+    };
+    // getFinalAttributes(path):INVALID → rv=0;否则 EXIST + (DIR ? DIRECTORY : REGULAR) + HIDDEN。
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Ok(Value::Int(0));
+    };
+    let mut rv = BA_EXISTS;
+    rv |= if meta.is_dir() { BA_DIRECTORY } else { BA_REGULAR };
+    if is_hidden(&meta, &path) {
+        rv |= BA_HIDDEN;
+    }
+    Ok(Value::Int(rv))
+}
+
+/// 读 `java/io/File` 实例 `path` 字段(String)的文本。非 File 实例 / 字段缺失 / null path → `None`。
+/// 沿用 `install_system_props` 的 `flattened_instance_fields().position(name)` 模式定位字段全局序号。
+fn file_path_text(vm: &Vm<'_>, file_ref: Reference) -> Result<Option<String>, VmError> {
+    use crate::oops::Oop;
+    use crate::runtime::Slot;
+
+    let inst = match vm.heap().get(file_ref) {
+        Some(Oop::Instance(i)) if i.class_name() == "java/io/File" => i,
+        _ => return Ok(None),
+    };
+    let Some(reg) = vm.registry() else {
+        return Err(VmError::BadConstant("file_path_text 需类注册表"));
+    };
+    let Some(lc) = reg.get("java/io/File") else {
+        return Err(VmError::BadConstant("file_path_text:java/io/File 须预载"));
+    };
+    let Some(ord) = reg
+        .flattened_instance_fields(lc)
+        .iter()
+        .position(|f| f.name == "path")
+ else {
+        return Ok(None);
+    };
+    let path_ref = match inst.field(ord) {
+        Slot::Reference(r) => r,
+        _ => return Ok(None),
+    };
+    if path_ref.is_null() {
+        return Ok(None);
+    }
+    crate::runtime::interpreter::string::read_text(vm, path_ref)
+}
+
+/// 文件是否隐藏(`BA_HIDDEN`)。Windows:FILE_ATTRIBUTE_HIDDEN 位(`std::os::windows::fs::MetadataExt`,
+/// 安全 trait,`#![deny(unsafe_code)]` 不约束);Unix:文件名首字符 `.`。两参均下划线前缀——
+/// 各 cfg 分支只用其一,下划线允许"可能未用"。
+fn is_hidden(_meta: &std::fs::Metadata, _path: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        _meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::Path::new(_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with('.'))
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

@@ -63,14 +63,25 @@ pub(super) fn dispatch(
             Ok(Value::Int(scale))
         }
 
-        // jdk.internal.misc.Unsafe 的字节内存原语 —— `DecimalDigits.uncheckedPutCharLatin1`
-        // (DecimalDigits.java:440-442)经 `putByte(buf, ARRAY_BYTE_BASE_OFFSET + charPos, (byte)c)`
-        // 把数字字节写入 byte[];解锁 StringBuilder.append(int)/Integer.toString 等 int→string 链。
-        // `putByte/getByte(Object,long,...)` 为 native(Unsafe.java:219/223)。rustj 无真实偏移内存:
-        // byte_index 逆算 `offset - ARRAY_BYTE_BASE_OFFSET`(本模块 arrayBaseOffset0 同源恒 16,
-        // byte[] 刻度 1);仅 byte[] 路径(DecimalDigits 唯一用途)。实参每参数一 Value(J=单个 Long)。
+        // jdk.internal.misc.Unsafe 的偏移读族 —— `getLong/getInt/getShort/getByte(Object,long)`
+        //(Unsafe.java:243/164/227/219 均 `public native`,描述符 `(Ljava/lang/Object;J){J,I,S,B}`)。
+        // 解锁 `String.startsWith`(prefix len>7)→ `ArraysSupport.mismatch` → `vectorizedMismatch`
+        //(纯 Java 字节码,`@IntrinsicCandidate` 非 native;HotSpot 内联 SIMD,rustj 跑其 Java 体)。
+        // `vectorizedMismatch`(ArraysSupport.java:118)对数组以 `getLongUnaligned/getIntUnaligned`
+        //(Unsafe.java:3563/3602,纯 Java)按 offset 对齐度**委派**到下列 native:8 对齐→getLong、
+        // 4 对齐→getInt、2 对齐→getShort、奇对齐→getByte。故四族均须绑,缺一则在未对齐 offset 落 ULE。
+        // **另**:`putByte(Object,long,byte)`(Unsafe.java:219 native)经 `DecimalDigits.uncheckedPutCharLatin1`
+        // 把数字字节写入 byte[],解锁 StringBuilder.append(int)/Integer.toString 等 int→string 链。
+        //
+        // rustj 无真实偏移内存:把 ArrayOop 视为**扁平小端字节缓冲**,按 byte_offset = offset - ABASE
+        //(ABASE 与 `arrayBaseOffset0` 同源恒 16)取 N 字节、按组件类型序列化、小端打包/拆包。
+        // byte[](String 紧凑串)为即时场景;`array_le_bytes` 通吃 byte/char/short/int/long/float/double
+        //(见下)。实参:第 0 = 数组 Reference,第 1 = offset Long(单个 category-2 槽,JVM 级单参)。
         ("jdk/internal/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V") => put_byte(vm, args),
-        ("jdk/internal/misc/Unsafe", "getByte", "(Ljava/lang/Object;)B") => get_byte(vm, args),
+        ("jdk/internal/misc/Unsafe", "getByte", "(Ljava/lang/Object;J)B") => get_byte(vm, args),
+        ("jdk/internal/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S") => get_short(vm, args),
+        ("jdk/internal/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I") => get_int(vm, args),
+        ("jdk/internal/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J") => get_long(vm, args),
 
         // jdk.internal.misc.Unsafe.objectFieldOffset1(Ljava/lang/Class;Ljava/lang/String;)J
         // —— Unsafe.java:1100 `objectFieldOffset(Class, String)`(jmod 内部转调 `objectFieldOffset1`,
@@ -198,28 +209,122 @@ fn put_byte(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
     }
 }
 
-/// `Unsafe.getByte(Object o, long offset)` 的 byte[] 实现(与 put_byte 成对;toString 读
-/// byte[] 时需要)。
+/// `Unsafe.getByte(Object o, long offset)B`(Unsafe.java:219 native):读偏移处 1 字节,有符号返回
+///(`(b as i8) as i32`)。经 `getLongUnaligned`/`getIntUnaligned` 的奇对齐分支(逐字节拼装)及
+/// `DecimalDigits` 读 byte[] 调用。委托 [`array_le_bytes`] 取 1 字节。
 fn get_byte(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
     let (arr, offset) = match (args.first(), args.get(1)) {
         (Some(Value::Reference(r)), Some(Value::Long(o))) => (*r, *o),
         _ => return Err(VmError::BadConstant("Unsafe.getByte 参数形状不符")),
     };
-    let index = byte_index(offset);
-    match vm.heap().get(arr) {
-        Some(Oop::Array(a)) => {
-            if index >= a.length() {
-                return Err(throw_exception(
-                    vm,
-                    "java/lang/ArrayIndexOutOfBoundsException",
-                ));
-            }
-            match a.element(index) {
-                Slot::Int(v) => Ok(Value::Int(v)),
-                _ => Err(VmError::BadConstant("Unsafe.getByte 元素非 int 槽")),
-            }
+    let bytes = array_le_bytes(vm, arr, byte_index(offset), 1)?;
+    Ok(Value::Int((bytes[0] as i8) as i32))
+}
+
+/// `Unsafe.getShort(Object o, long offset)S`(Unsafe.java:227 native):读 2 字节,小端拼为有符号 short。
+/// 经 `getLongUnaligned`(2 对齐分支)/`getIntUnaligned`(2 对齐分支)调用。
+fn get_short(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (arr, offset) = match (args.first(), args.get(1)) {
+        (Some(Value::Reference(r)), Some(Value::Long(o))) => (*r, *o),
+        _ => return Err(VmError::BadConstant("Unsafe.getShort 参数形状不符")),
+    };
+    let bytes = array_le_bytes(vm, arr, byte_index(offset), 2)?;
+    let v = (bytes[0] as u16) | ((bytes[1] as u16) << 8);
+    Ok(Value::Int((v as i16) as i32))
+}
+
+/// `Unsafe.getInt(Object o, long offset)I`(Unsafe.java:164 native):读 4 字节,小端拼为 int。
+/// 经 `getLongUnaligned`(4 对齐分支)/`getIntUnaligned`(4 对齐分支)及 vectorizedMismatch 尾部调用。
+fn get_int(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (arr, offset) = match (args.first(), args.get(1)) {
+        (Some(Value::Reference(r)), Some(Value::Long(o))) => (*r, *o),
+        _ => return Err(VmError::BadConstant("Unsafe.getInt 参数形状不符")),
+    };
+    let bytes = array_le_bytes(vm, arr, byte_index(offset), 4)?;
+    let mut v: u32 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        v |= (b as u32) << (8 * i);
+    }
+    Ok(Value::Int(v as i32))
+}
+
+/// `Unsafe.getLong(Object o, long offset)J`(Unsafe.java:243 native):读 8 字节,小端拼为 long。
+/// 经 `getLongUnaligned`(8 对齐分支)→ `vectorizedMismatch` 主循环调用——byte[] 的向量化比较核心。
+fn get_long(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let (arr, offset) = match (args.first(), args.get(1)) {
+        (Some(Value::Reference(r)), Some(Value::Long(o))) => (*r, *o),
+        _ => return Err(VmError::BadConstant("Unsafe.getLong 参数形状不符")),
+    };
+    let bytes = array_le_bytes(vm, arr, byte_index(offset), 8)?;
+    let mut v: i64 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        v |= (b as i64) << (8 * i);
+    }
+    Ok(Value::Long(v))
+}
+
+/// ArrayOop 组件类型的字节刻度(class_name 形如 `[B`/`[I`/`[Ljava/lang/Object;`)。引用数组及未知 → 1
+///(`vectorizedMismatch` 仅用于基本类型数组,引用数组走 `equals`,不及本路径,保守取 1 不崩溃)。
+fn component_scale(class_name: &str) -> usize {
+    match class_name.as_bytes().get(1) {
+        Some(b'B') | Some(b'Z') => 1,
+        Some(b'C') | Some(b'S') => 2,
+        Some(b'I') | Some(b'F') => 4,
+        Some(b'J') | Some(b'D') => 8,
+        _ => 1,
+    }
+}
+
+/// 把 ArrayOop 在 `[byte_offset, byte_offset+n)` 字节区间的**扁平小端**表示读出。
+/// 按组件类型刻度序列化覆盖到的每个元素(scale 字节 LE),再切片取目标 n 字节区间(支持未对齐
+/// byte_offset,如 getLongUnaligned 的奇对齐分支)。越界 → `ArrayIndexOutOfBoundsException`;
+/// 非数组(裸内存/实例)→ `InternalError`(rustj 不支持裸内存访问)。
+///
+/// 这是 rustj 对 HotSpot "按偏移读原始内存" 的等价物:ArrayOop 不是连续内存,但元素按组件类型
+/// 有确定 LE 字节表示,故可逐元素序列化后按字节切片。byte[](String 紧凑串)scale=1 时退化为逐字节。
+fn array_le_bytes(
+    vm: &mut Vm<'_>,
+    arr: Reference,
+    byte_offset: usize,
+    n: usize,
+) -> Result<Vec<u8>, VmError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let a = match vm.heap().get(arr) {
+        Some(Oop::Array(a)) => a,
+        _ => return Err(throw_exception(vm, "java/lang/InternalError")),
+    };
+    let scale = component_scale(a.class_name());
+    let first = byte_offset / scale;
+    // n>=1 故 byte_offset+n-1 不下溢;若 byte_offset+n 越数组末端,last ≥ length → AIOOBE。
+    let last = byte_offset.saturating_add(n - 1) / scale;
+    if last >= a.length() {
+        return Err(throw_exception(
+            vm,
+            "java/lang/ArrayIndexOutOfBoundsException",
+        ));
+    }
+    let mut buf = Vec::with_capacity((last - first + 1) * scale);
+    for ei in first..=last {
+        buf.extend_from_slice(&element_le_bytes(a.element(ei), scale));
+    }
+    let start = byte_offset - first * scale; // = byte_offset % scale
+    Ok(buf[start..start + n].to_vec())
+}
+
+/// 单个元素 → `scale` 字节小端表示。Int 槽覆盖 byte/char/short/int(取低 `scale` 字节);
+/// Long/Float/Double 按其位模式;Reference/Top/ReturnAddress(引用数组等)→ 全 0(保守,mismatch 不及)。
+fn element_le_bytes(slot: Slot, scale: usize) -> Vec<u8> {
+    match slot {
+        Slot::Int(v) => {
+            let u = v as u32;
+            (0..scale).map(|b| ((u >> (8 * b)) & 0xFF) as u8).collect()
         }
-        _ => Err(throw_exception(vm, "java/lang/InternalError")),
+        Slot::Long(v) => (0..8).map(|b| (((v as u64) >> (8 * b)) & 0xFF) as u8).collect(),
+        Slot::Float(f) => f.to_bits().to_le_bytes().to_vec(),
+        Slot::Double(d) => d.to_bits().to_le_bytes().to_vec(),
+        _ => vec![0u8; scale],
     }
 }
 

@@ -378,8 +378,39 @@ pub(super) fn dispatch(
             Ok(Value::Int(if refers { 1 } else { 0 }))
         }
 
+        // ClassLoader.findLoadedClass0(Ljava/lang/String;)Ljava/lang/Class; —— ClassLoader.java:1270
+        // `private final native`(实例方法;receiver = ClassLoader,经 `findLoadedClass`(包装器先 checkName)
+        // 调)。移植 `JVM_FindLoadedClass`:按 binary name(点形 "java.lang.String")查"本 loader 已加载"集
+        // → 返 Class 镜像或 null。rustj **单注册表模型**:`registry.get(intern)` 命中 → `intern_class_mirror`;
+        // 否则 null(忽略 per-loader 隔离、不触发加载/初始化——纯"是否已加载"查询)。解锁
+        // `BuiltinClassLoader.loadClassOrNull:592`→`findLoadedClass` 的**已加载类快速路径**(命中即返,
+        // 不进 module/parent 委派)。name null → NPE(JNI 解引用 jstring)。
+        ("java/lang/ClassLoader", "findLoadedClass0", "(Ljava/lang/String;)Ljava/lang/Class;") => {
+            find_loaded_class0(vm, args)
+        }
+
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
+    }
+}
+
+/// `ClassLoader.findLoadedClass0(String name)Class`(ClassLoader.java:1270 `private final native`
+/// 实例方法)。移植 `JVM_FindLoadedClass`:按 binary name 查"本 loader 已加载"集 → Class 镜像或 null。
+/// rustj 单注册表:`registry.get(intern)` 命中 → `intern_class_mirror`,否则 `null`。**不触发加载/
+/// 初始化**(纯"已加载"查询);receiver(_this = ClassLoader)忽略——per-loader 隔离顺延。name null → NPE。
+fn find_loaded_class0(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let Value::Reference(r) = args.first().copied().unwrap_or(Value::Void) else {
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
+    };
+    let Some(text) = super::super::string::read_text(vm, r)? else {
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
+    };
+    let internal = text.replace('.', "/");
+    let found = vm.registry().is_some_and(|reg| reg.get(&internal).is_some());
+    if found {
+        Ok(Value::Reference(vm.intern_class_mirror(&internal)))
+    } else {
+        Ok(Value::Reference(Reference::null()))
     }
 }
 

@@ -403,6 +403,17 @@ pub(super) fn dispatch(
             find_loaded_class0(vm, args)
         }
 
+        // System.mapLibraryName(Ljava/lang/String;)Ljava/lang/String; —— System.java:1699
+        // `public static native`。移植 `Java_java_lang_System_mapLibraryName`(System.c:296):
+        // 返 `JNI_LIB_PREFIX + libname + JNI_LIB_SUFFIX`。Windows:"net"→"net.dll";Linux:"libnet.so";
+        // macOS:"libnet.dylib"。null→NPE(System.c:303);UTF-16 单元数 > 240→IllegalArgumentException
+        // (System.c:300,`GetStringLength` 计 UTF-16 单元,非 Unicode 标量数)。解锁
+        // `WindowsNativeDispatcher.<clinit>:1125`→`BootLoader.loadLibrary("net"/"nio")`→
+        // `NativeLibraries.findFromPaths`→`mapLibraryName` 链。
+        ("java/lang/System", "mapLibraryName", "(Ljava/lang/String;)Ljava/lang/String;") => {
+            map_library_name(vm, args)
+        }
+
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }
@@ -426,6 +437,31 @@ fn find_loaded_class0(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError>
     } else {
         Ok(Value::Reference(Reference::null()))
     }
+}
+
+/// `System.mapLibraryName(String)String`(System.c:296):返 `JNI_LIB_PREFIX + libname +
+/// JNI_LIB_SUFFIX`。Windows:""+".dll";Linux:"lib"+".so";macOS:"lib"+".dylib"。null→NPE;
+/// UTF-16 单元数 > 240→IllegalArgumentException(System.c:300,`GetStringLength` 计 UTF-16 单元)。
+fn map_library_name(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let Value::Reference(r) = args.first().copied().unwrap_or(Value::Void) else {
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
+    };
+    let Some(text) = super::super::string::read_text(vm, r)? else {
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
+    };
+    if text.encode_utf16().count() > 240 {
+        return Err(throw_exception(vm, "java/lang/IllegalArgumentException"));
+    }
+    let (prefix, suffix) = if cfg!(windows) {
+        ("", ".dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", ".dylib")
+    } else {
+        ("lib", ".so")
+    };
+    let mapped = format!("{}{}{}", prefix, text, suffix);
+    let out = super::super::string::intern(vm, &mapped)?;
+    Ok(Value::Reference(out))
 }
 
 /// `StackTraceElement.initStackTraceElements(ste[], backtrace, depth)` 的实现(见分派臂注释)。
@@ -1111,6 +1147,106 @@ mod tests {
         )
         .expect("identityHashCode(B) 应返 int");
         assert_ne!(ha1, hb, "不同对象 identityHashCode 须不同(rustj 句柄唯一)");
+    }
+
+    /// **RED→GREEN**(Layer 4.38):`System.mapLibraryName(String)String`(System.java:1699
+    /// `public static native`)。移植 `Java_java_lang_System_mapLibraryName`(System.c:296):
+    /// 返 `JNI_LIB_PREFIX + libname + JNI_LIB_SUFFIX`。Windows:"net"→"net.dll";Linux:"libnet.so";
+    /// macOS:"libnet.dylib"。解锁 `WindowsNativeDispatcher.<clinit>:1125`→`BootLoader.loadLibrary`
+    /// →`NativeLibraries.findFromPaths`→`mapLibraryName` 链(深 NIO/Win32 arc 的入口 native)。
+    #[test]
+    fn map_library_name_applies_platform_prefix_suffix() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/String").unwrap();
+        let mut vm = Vm::new(&registry);
+        let name =
+            crate::runtime::interpreter::string::intern(&mut vm, "net").expect("intern \"net\"");
+
+        let r = super::super::invoke(
+            &mut vm,
+            "java/lang/System",
+            "mapLibraryName",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            None,
+            &[Value::Reference(name)],
+        )
+        .expect("mapLibraryName(\"net\") 应返 String,非抛");
+        let Value::Reference(out) = r else {
+            panic!("须返 Reference,得 {r:?}");
+        };
+        let mapped = crate::runtime::interpreter::string::read_text(&vm, out)
+            .expect("读回 mapped 名")
+            .expect("mapped 名非 null");
+        let expected = if cfg!(windows) {
+            "net.dll"
+        } else if cfg!(target_os = "macos") {
+            "libnet.dylib"
+        } else {
+            "libnet.so"
+        };
+        assert_eq!(mapped, expected, "mapLibraryName(\"net\") 平台映射错误");
+
+        // null → NullPointerException(System.c:303 JNU_ThrowNullPointerException)。
+        let err = super::super::invoke(
+            &mut vm,
+            "java/lang/System",
+            "mapLibraryName",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            None,
+            &[Value::Reference(Reference::null())],
+        )
+        .unwrap_err();
+        match err {
+            VmError::ThrownException(r) => match vm.heap().get(r) {
+                Some(crate::oops::Oop::Instance(i)) => {
+                    assert_eq!(i.class_name(), "java/lang/NullPointerException")
+                }
+                o => panic!("须 Instance,得 {o:?}"),
+            },
+            e => panic!("须 ThrownException,得 {e:?}"),
+        }
+    }
+
+    /// `mapLibraryName` 名过长(>240,System.c:300 `len > 240`)→ IllegalArgumentException。
+    #[test]
+    fn map_library_name_too_long_throws_iae() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/String").unwrap();
+        let mut vm = Vm::new(&registry);
+        let long_name = "x".repeat(241);
+        let name = crate::runtime::interpreter::string::intern(&mut vm, &long_name).expect("intern");
+        let err = super::super::invoke(
+            &mut vm,
+            "java/lang/System",
+            "mapLibraryName",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            None,
+            &[Value::Reference(name)],
+        )
+        .unwrap_err();
+        match err {
+            VmError::ThrownException(r) => match vm.heap().get(r) {
+                Some(crate::oops::Oop::Instance(i)) => {
+                    assert_eq!(i.class_name(), "java/lang/IllegalArgumentException")
+                }
+                o => panic!("须 Instance,得 {o:?}"),
+            },
+            e => panic!("须 ThrownException,得 {e:?}"),
+        }
     }
 
     /// 收尾:未登记的 Reference native 仍抛 ULE。

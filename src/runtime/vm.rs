@@ -75,6 +75,9 @@ pub struct Vm<'a> {
     module_mirrors: HashMap<String, Reference>,
     /// 无名模块单例引用(惰性分配,4.14a)。`Module.getName()` 返 null → `isNamed()`=false。
     unnamed_module: Option<Reference>,
+    /// main 线程单例引用(惰性分配,4.40):`Thread.currentThread()` 返此实例。rustj 单线程 →
+    /// 唯一 "main" 线程;`new_instance`(**不跑 `<init>`**)构造,默认字段(tid=0/name=null/…)。
+    main_thread: Option<Reference>,
 }
 
 impl<'a> Vm<'a> {
@@ -92,6 +95,7 @@ impl<'a> Vm<'a> {
             mirror_class: HashMap::new(),
             module_mirrors: HashMap::new(),
             unnamed_module: None,
+            main_thread: None,
         }
     }
 
@@ -250,6 +254,38 @@ impl<'a> Vm<'a> {
             self.unnamed_module = Some(r);
         }
         r
+    }
+
+    /// main 线程单例(惰性,4.40):`Thread.currentThread()` 返此实例。rustj 单线程 → 唯一 "main"
+    /// 线程。`new_instance`(**不跑 `<init>`**)构造——默认字段(tid=0/name=null/threadLocals=null/
+    /// …),`Thread.<clinit>` 仅 `registerNatives()` 空操作故无重初始化负担。无注册表/Thread 未预载
+    /// → 返 null(防御,`currentThread` native 据 null 抛 InternalError)。
+    pub(crate) fn main_thread(&mut self) -> Reference {
+        if let Some(r) = self.main_thread {
+            return r;
+        }
+        let r = self.alloc_main_thread();
+        if !r.is_null() {
+            self.main_thread = Some(r);
+        }
+        r
+    }
+
+    /// 分配 main 线程 Thread Instance(`new_instance`,不跑 `<init>`)。无注册表 / Thread 未预载
+    /// → 返 null。借用:先借注册表取 `&'a LoadedClass` + `new_instance`(§6 `'a` 不绑 `&self`),
+    /// 出块后 `heap_mut` 分配。
+    fn alloc_main_thread(&mut self) -> Reference {
+        use crate::oops::Oop;
+        let inst = {
+            let Some(reg) = self.registry else {
+                return Reference::null();
+            };
+            let Some(lc) = reg.get("java/lang/Thread") else {
+                return Reference::null();
+            };
+            reg.new_instance(lc)
+        };
+        self.heap_mut().alloc(Oop::Instance(inst))
     }
 
     /// 类内部名 → 所属模块的 Module 镜像(供 Class.module 字段填充):
@@ -473,6 +509,7 @@ impl Default for Vm<'_> {
             mirror_class: HashMap::new(),
             module_mirrors: HashMap::new(),
             unnamed_module: None,
+            main_thread: None,
         }
     }
 }

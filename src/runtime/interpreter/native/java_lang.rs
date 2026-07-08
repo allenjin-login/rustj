@@ -414,6 +414,16 @@ pub(super) fn dispatch(
             map_library_name(vm, args)
         }
 
+        // Thread.currentThread()Ljava/lang/Thread; —— Thread.java:476 `public static native`。
+        // 移植 `JVM_CurrentThread`(jvm.cpp):返当前线程的 Thread 实例。rustj 单线程 → 唯一 "main"
+        // 线程单例(`Vm::main_thread`,惰性 `new_instance` 不跑 `<init>`;Thread.<clinit> 仅
+        // registerNatives 空操作)。解锁 `VM.saveProperties`→`getStackTrace`(深处 Logging /
+        // System props / Reflect 链触发的 Thread 路径)、`Thread.currentThread().getContextClassLoader()`
+        // 等 NIO/反射/类加载链对线程上下文的依赖。
+        ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;") => {
+            Ok(Value::Reference(vm.main_thread()))
+        }
+
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }
@@ -1247,6 +1257,61 @@ mod tests {
             },
             e => panic!("须 ThrownException,得 {e:?}"),
         }
+    }
+
+    /// **RED→GREEN**(Layer 4.40):`Thread.currentThread()Ljava/lang/Thread;`
+    /// (Thread.java:476 `public static native`)。移植 `JVM_CurrentThread`:返当前线程对象。
+    /// rustj 单线程 → 惰性分配 **main 线程单例**(`new_instance`,**不跑 `<init>`**;`Thread.<clinit>`
+    /// 仅 `registerNatives()` 空操作,故无重初始化负担)。两次调用返同一引用(单例身份稳定)。
+    /// 高价值 native:`Thread.currentThread` 在 java.base 普遍使用(ThreadLocal/locks/…)。
+    /// 解锁 `NativeBuffers.getNativeBufferFromCache`→`ThreadLocal.get`→`currentThread` 链。
+    #[test]
+    fn thread_current_thread_returns_stable_main_thread() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
+        let mut vm = Vm::new(&registry);
+
+        let r1 = super::super::invoke(
+            &mut vm,
+            "java/lang/Thread",
+            "currentThread",
+            "()Ljava/lang/Thread;",
+            None,
+            &[],
+        )
+        .expect("currentThread 应返 Thread,非抛");
+        let Value::Reference(t1) = r1 else {
+            panic!("须返 Reference,得 {r1:?}");
+        };
+        assert!(!t1.is_null(), "currentThread 须非 null");
+        match vm.heap().get(t1) {
+            Some(crate::oops::Oop::Instance(i)) => {
+                assert_eq!(i.class_name(), "java/lang/Thread", "须 Thread Instance")
+            }
+            o => panic!("须 Thread Instance,得 {o:?}"),
+        }
+
+        // 稳定:两次返同一 main 线程引用(单例)。
+        let r2 = super::super::invoke(
+            &mut vm,
+            "java/lang/Thread",
+            "currentThread",
+            "()Ljava/lang/Thread;",
+            None,
+            &[],
+        )
+        .expect("currentThread 应返 Thread");
+        let Value::Reference(t2) = r2 else {
+            panic!("须返 Reference,得 {r2:?}");
+        };
+        assert_eq!(t1, t2, "currentThread 须返同一 main 线程单例");
     }
 
     /// 收尾:未登记的 Reference native 仍抛 ULE。

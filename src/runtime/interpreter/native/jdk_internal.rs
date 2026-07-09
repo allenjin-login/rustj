@@ -194,18 +194,21 @@ fn put_byte(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
         _ => return Err(VmError::BadConstant("Unsafe.putByte 参数形状不符")),
     };
     let index = byte_index(offset);
-    match vm.heap_mut().get_mut(arr) {
+    // 持 heap guard 校验 + 写;throw 释 guard 后再抛(B.2.3b drop-before-recurse)。
+    let outcome: Result<Value, &str> = match vm.heap_mut().get_mut(arr) {
         Some(Oop::Array(a)) => {
             if index >= a.length() {
-                return Err(throw_exception(
-                    vm,
-                    "java/lang/ArrayIndexOutOfBoundsException",
-                ));
+                Err("java/lang/ArrayIndexOutOfBoundsException")
+            } else {
+                a.set_element(index, Slot::Int(value));
+                Ok(Value::Void)
             }
-            a.set_element(index, Slot::Int(value));
-            Ok(Value::Void)
         }
-        _ => Err(throw_exception(vm, "java/lang/InternalError")),
+        _ => Err("java/lang/InternalError"),
+    };
+    match outcome {
+        Ok(v) => Ok(v),
+        Err(cls) => Err(throw_exception(vm, cls)),
     }
 }
 
@@ -291,26 +294,31 @@ fn array_le_bytes(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let a = match vm.heap().get(arr) {
-        Some(Oop::Array(a)) => a,
-        _ => return Err(throw_exception(vm, "java/lang/InternalError")),
-    };
-    let scale = component_scale(a.class_name());
-    let first = byte_offset / scale;
-    // n>=1 故 byte_offset+n-1 不下溢;若 byte_offset+n 越数组末端,last ≥ length → AIOOBE。
-    let last = byte_offset.saturating_add(n - 1) / scale;
-    if last >= a.length() {
-        return Err(throw_exception(
-            vm,
-            "java/lang/ArrayIndexOutOfBoundsException",
-        ));
+    // 持 heap guard 读 + 收集;throw 释 guard 后再抛(B.2.3b drop-before-recurse)。
+    let outcome: Result<Vec<u8>, &str> = (|| {
+        let heap = vm.heap();
+        let a = match heap.get(arr) {
+            Some(Oop::Array(a)) => a,
+            _ => return Err("java/lang/InternalError"),
+        };
+        let scale = component_scale(a.class_name());
+        let first = byte_offset / scale;
+        // n>=1 故 byte_offset+n-1 不下溢;若 byte_offset+n 越数组末端,last ≥ length → AIOOBE。
+        let last = byte_offset.saturating_add(n - 1) / scale;
+        if last >= a.length() {
+            return Err("java/lang/ArrayIndexOutOfBoundsException");
+        }
+        let mut buf = Vec::with_capacity((last - first + 1) * scale);
+        for ei in first..=last {
+            buf.extend_from_slice(&element_le_bytes(a.element(ei), scale));
+        }
+        let start = byte_offset - first * scale; // = byte_offset % scale
+        Ok(buf[start..start + n].to_vec())
+    })();
+    match outcome {
+        Ok(v) => Ok(v),
+        Err(cls) => Err(throw_exception(vm, cls)),
     }
-    let mut buf = Vec::with_capacity((last - first + 1) * scale);
-    for ei in first..=last {
-        buf.extend_from_slice(&element_le_bytes(a.element(ei), scale));
-    }
-    let start = byte_offset - first * scale; // = byte_offset % scale
-    Ok(buf[start..start + n].to_vec())
 }
 
 /// 单个元素 → `scale` 字节小端表示。Int 槽覆盖 byte/char/short/int(取低 `scale` 字节);
@@ -441,10 +449,10 @@ fn read_slot(vm: &Vm<'_>, o: Reference, offset: i64) -> Option<Slot> {
 
 /// offset → 槽位写(共用模型,单线程 volatile=plain):Instance = ord;Array = `(offset-ABASE)/scale`
 /// 索引。越界 → `ArrayIndexOutOfBoundsException`(HotSpot Unsafe 越界语义);非堆对象 → `InternalError`。
-/// 供 putReferenceVolatile/putIntVolatile 与 CAS/exchange 的"写新"步共用。借用模式同 `put_byte`:
-/// `heap_mut().get_mut` 借出 `&mut Oop`,越界分支内 `a` 已无后续使用,NLL 释放借后可再 `&mut vm` 抛异常。
+/// 供 putReferenceVolatile/putIntVolatile 与 CAS/exchange 的"写新"步共用。B.2.3b:heap 为 Mutex,
+/// 持 guard 期间不能 `&mut vm` 抛异常 → 先在锁内校验+写并收 `Result<(), &str>` 标记,释 guard 后再抛。
 fn write_slot(vm: &mut Vm<'_>, o: Reference, offset: i64, slot: Slot) -> Result<(), VmError> {
-    match vm.heap_mut().get_mut(o) {
+    let outcome: Result<(), &str> = match vm.heap_mut().get_mut(o) {
         Some(Oop::Instance(i)) => {
             i.set_field(offset as usize, slot);
             Ok(())
@@ -452,15 +460,17 @@ fn write_slot(vm: &mut Vm<'_>, o: Reference, offset: i64, slot: Slot) -> Result<
         Some(Oop::Array(a)) => {
             let idx = array_index_from_offset(a.class_name(), offset);
             if idx >= a.length() {
-                return Err(throw_exception(
-                    vm,
-                    "java/lang/ArrayIndexOutOfBoundsException",
-                ));
+                Err("java/lang/ArrayIndexOutOfBoundsException")
+            } else {
+                a.set_element(idx, slot);
+                Ok(())
             }
-            a.set_element(idx, slot);
-            Ok(())
         }
-        _ => Err(throw_exception(vm, "java/lang/InternalError")),
+        _ => Err("java/lang/InternalError"),
+    };
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(cls) => Err(throw_exception(vm, cls)),
     }
 }
 

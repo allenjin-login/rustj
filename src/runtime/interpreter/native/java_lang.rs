@@ -68,10 +68,13 @@ pub(super) fn dispatch(
             let Some(r) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
-            let name = match vm.heap().get(r) {
-                Some(Oop::Instance(i)) => i.class_name().to_string(),
-                Some(Oop::Array(a)) => a.class_name().to_string(),
-                _ => return Err(throw_exception(vm, "java/lang/InternalError")),
+            let name = {
+                let recv = vm.heap().get(r).cloned();
+                match recv {
+                    Some(Oop::Instance(i)) => i.class_name().to_string(),
+                    Some(Oop::Array(a)) => a.class_name().to_string(),
+                    _ => return Err(throw_exception(vm, "java/lang/InternalError")),
+                }
             };
             Ok(Value::Reference(vm.intern_class_mirror(&name)))
         }
@@ -1413,7 +1416,8 @@ mod tests {
         let VmError::ThrownException(r) = err else {
             panic!("期望 ThrownException,得 {err:?}");
         };
-        let Some(crate::oops::Oop::Instance(i)) = vm.heap().get(r) else {
+        let heap = vm.heap();
+        let Some(crate::oops::Oop::Instance(i)) = heap.get(r) else {
             panic!("NPE 应为异常实例");
         };
         assert_eq!(i.class_name(), "java/lang/NullPointerException");

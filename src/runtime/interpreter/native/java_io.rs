@@ -159,7 +159,8 @@ fn file_path_text(vm: &Vm<'_>, file_ref: Reference) -> Result<Option<String>, Vm
     use crate::oops::Oop;
     use crate::runtime::Slot;
 
-    let inst = match vm.heap().get(file_ref) {
+    // inst 取 owned(clone):其后读 path String 须再锁 heap,持 guard 重锁会自死锁(B.2.3b)。
+    let inst = match vm.heap().get(file_ref).cloned() {
         Some(Oop::Instance(i)) if i.class_name() == "java/io/File" => i,
         _ => return Ok(None),
     };

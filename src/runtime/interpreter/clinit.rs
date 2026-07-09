@@ -53,7 +53,8 @@ fn run_clinit(lc: &LoadedClass, vm: &mut Vm<'_>) -> Result<(), VmError> {
 /// 异常对象是否已是初始化失败类(`ExceptionInInitializerError` /
 /// `NoClassDefFoundError`)——超类初始化失败已上传此类异常时,本类不再重复包装。
 fn is_init_failure_class(vm: &Vm<'_>, exc: Reference) -> bool {
-    let Some(Oop::Instance(i)) = vm.heap().get(exc) else {
+    let heap = vm.heap();
+    let Some(Oop::Instance(i)) = heap.get(exc) else {
         return false;
     };
     matches!(

@@ -359,7 +359,8 @@ mod tests {
 
     /// 读 `int[]` 前 `n` 元为 `Vec<i32>`。
     fn read_ints(vm: &Vm<'_>, r: Reference, n: usize) -> Vec<i32> {
-        let Some(Oop::Array(a)) = vm.heap().get(r) else {
+        let heap = vm.heap();
+        let Some(Oop::Array(a)) = heap.get(r) else {
             return vec![];
         };
         (0..n)
@@ -372,7 +373,8 @@ mod tests {
 
     /// 取数组元素的 `Slot::Reference`(供引用拷贝断言)。
     fn read_ref(vm: &Vm<'_>, r: Reference, idx: usize) -> Reference {
-        let Some(Oop::Array(a)) = vm.heap().get(r) else {
+        let heap = vm.heap();
+        let Some(Oop::Array(a)) = heap.get(r) else {
             return Reference::null();
         };
         match a.element(idx) {
@@ -385,7 +387,8 @@ mod tests {
         let Err(VmError::ThrownException(r)) = result else {
             panic!("期望 ThrownException,得 {result:?}");
         };
-        let Some(Oop::Instance(i)) = vm.heap().get(r) else {
+        let heap = vm.heap();
+        let Some(Oop::Instance(i)) = heap.get(r) else {
             panic!("异常应为 Instance");
         };
         assert_eq!(i.class_name(), expected);
@@ -628,7 +631,8 @@ mod tests {
         let VmError::ThrownException(r) = err else {
             panic!("期望 ThrownException,得 {err:?}");
         };
-        let Some(Oop::Instance(i)) = vm.heap().get(r) else {
+        // clone 出 owned:其后 read_ref(&vm,…) 须再锁 heap,持 guard 重锁会自死锁(B.2.3b)。
+        let Some(Oop::Instance(i)) = vm.heap().get(r).cloned() else {
             panic!("ASE 应为 Instance");
         };
         assert_eq!(i.class_name(), "java/lang/ArrayStoreException");

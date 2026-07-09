@@ -80,8 +80,8 @@ pub(super) fn read_text(vm: &Vm<'_>, r: Reference) -> Result<Option<String>, VmE
     let value_ft = FieldType::Array(Box::new(FieldType::Byte));
     let coder_ft = FieldType::Byte;
 
-    // inst 借堆(不可变);其后 registry() 与 heap().get() 均为共享借用,可并存。
-    let inst = match vm.heap().get(r) {
+    // inst 取 owned(clone):其后须再锁 heap 读 value 数组,持 guard 重锁会自死锁(B.2.3b)。
+    let inst = match vm.heap().get(r).cloned() {
         Some(Oop::Instance(i)) if i.class_name() == STRING => i,
         _ => return Ok(None),
     };
@@ -110,7 +110,7 @@ pub(super) fn read_text(vm: &Vm<'_>, r: Reference) -> Result<Option<String>, VmE
         Slot::Int(c) => c as u8,
         _ => return Ok(None),
     };
-    let arr = match vm.heap().get(value_ref) {
+    let arr = match vm.heap().get(value_ref).cloned() {
         Some(Oop::Array(a)) => a,
         _ => return Ok(None),
     };

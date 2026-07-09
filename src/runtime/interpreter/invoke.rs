@@ -862,12 +862,13 @@ pub(super) fn invoke_virtual(
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
 
-    // 数组 receiver:仅 `Object.clone()` 浅拷贝(同描述符 + 复制元素槽),解锁
-    // `Throwable.getOurStackTrace().clone()`(StackTraceElement[])等;其余数组方法顺延。
-    if let Some(Oop::Array(a)) = vm.heap().get(objref) {
-        if method_name == "clone" {
-            let copy = a.clone();
-            let r = vm.heap_mut().alloc(Oop::Array(copy));
+    // 接收者取 owned(clone):其后 alloc/dispatch 需 &mut vm,持 heap guard 会 E0502(B.2.3b)。
+    let recv = vm.heap().get(objref).cloned();
+    let runtime_class = match recv {
+        // 数组 receiver:仅 `Object.clone()` 浅拷贝(同描述符 + 复制元素槽),解锁
+        // `Throwable.getOurStackTrace().clone()` 等;其余数组方法顺延。
+        Some(Oop::Array(a)) if method_name == "clone" => {
+            let r = vm.heap_mut().alloc(Oop::Array(a));
             return finish_invoke(
                 interp,
                 frame,
@@ -877,23 +878,15 @@ pub(super) fn invoke_virtual(
                 md.return_type,
             );
         }
-        return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
-    }
-
-    // Lambda 闭包 receiver:捕获 ++ SAM 实参交给实现方法(lambda$<caller>$0)静态执行。
-    if let Some(Oop::Lambda(lambda)) = vm.heap().get(objref).cloned() {
-        return dispatch_lambda(interp, frame, vm, caller_pc, lambda, args, md.return_type);
-    }
-
-    // 运行时类 = 对象实际类(owned String,释放堆借用)。
-    let runtime_class = vm
-        .heap()
-        .get(objref)
-        .ok_or(VmError::BadConstant("invokevirtual 引用悬空"))?;
-    let runtime_class = match runtime_class {
-        Oop::Instance(i) => i.class_name().to_string(),
-        Oop::Array(_) => unreachable!("数组 receiver 已先行 clone/顺延分派"),
-        Oop::Lambda(_) => unreachable!("闭包 receiver 已先行 SAM 派发"),
+        Some(Oop::Array(_)) => {
+            return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
+        }
+        // Lambda 闭包 receiver:捕获 ++ SAM 实参交给实现方法(lambda$<caller>$0)静态执行。
+        Some(Oop::Lambda(lambda)) => {
+            return dispatch_lambda(interp, frame, vm, caller_pc, lambda, args, md.return_type);
+        }
+        Some(Oop::Instance(i)) => i.class_name().to_string(),
+        None => return Err(VmError::BadConstant("invokevirtual 引用悬空")),
     };
 
     let registry = vm
@@ -963,11 +956,12 @@ pub(super) fn invoke_interface(
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
     }
 
-    // 数组 receiver:仅 `Object.clone()` 浅拷贝(同 invoke_virtual)。
-    if let Some(Oop::Array(a)) = vm.heap().get(objref) {
-        if method_name == "clone" {
-            let copy = a.clone();
-            let r = vm.heap_mut().alloc(Oop::Array(copy));
+    // 接收者取 owned(clone):其后 alloc/dispatch 需 &mut vm,持 heap guard 会 E0502(B.2.3b)。
+    let recv = vm.heap().get(objref).cloned();
+    let runtime_class = match recv {
+        // 数组 receiver:仅 `Object.clone()` 浅拷贝(同 invoke_virtual)。
+        Some(Oop::Array(a)) if method_name == "clone" => {
+            let r = vm.heap_mut().alloc(Oop::Array(a));
             return finish_invoke(
                 interp,
                 frame,
@@ -977,23 +971,15 @@ pub(super) fn invoke_interface(
                 md.return_type,
             );
         }
-        return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
-    }
-
-    // Lambda 闭包 receiver:捕获 ++ SAM 实参交给实现方法(lambda$<caller>$0)静态执行。
-    if let Some(Oop::Lambda(lambda)) = vm.heap().get(objref).cloned() {
-        return dispatch_lambda(interp, frame, vm, caller_pc, lambda, args, md.return_type);
-    }
-
-    // 运行时类 = 对象实际类(owned String,释放堆借用)。
-    let runtime_class = vm
-        .heap()
-        .get(objref)
-        .ok_or(VmError::BadConstant("invokeinterface 引用悬空"))?;
-    let runtime_class = match runtime_class {
-        Oop::Instance(i) => i.class_name().to_string(),
-        Oop::Array(_) => unreachable!("数组 receiver 已先行 clone/顺延分派"),
-        Oop::Lambda(_) => unreachable!("闭包 receiver 已先行 SAM 派发"),
+        Some(Oop::Array(_)) => {
+            return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
+        }
+        // Lambda 闭包 receiver:捕获 ++ SAM 实参交给实现方法静态执行。
+        Some(Oop::Lambda(lambda)) => {
+            return dispatch_lambda(interp, frame, vm, caller_pc, lambda, args, md.return_type);
+        }
+        Some(Oop::Instance(i)) => i.class_name().to_string(),
+        None => return Err(VmError::BadConstant("invokeinterface 引用悬空")),
     };
 
     let registry = vm
@@ -1097,7 +1083,8 @@ mod tests {
         let super::VmError::ThrownException(exc) = r.unwrap_err() else {
             panic!("应抛 StackOverflowError(ThrownException)");
         };
-        let Some(crate::oops::Oop::Instance(i)) = vm.heap().get(exc) else {
+        let heap = vm.heap();
+        let Some(crate::oops::Oop::Instance(i)) = heap.get(exc) else {
             panic!("StackOverflowError 应为由引导桩分配的实例");
         };
         assert_eq!(i.class_name(), "java/lang/StackOverflowError");

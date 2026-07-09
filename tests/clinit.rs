@@ -117,7 +117,8 @@ fn assert_throws_class(result: Result<Value, VmError>, vm: &Vm<'_>, expected: &s
     let Err(VmError::ThrownException(exc)) = result else {
         panic!("期望抛 ThrownException({expected}),得 {result:?}");
     };
-    let Some(Oop::Instance(i)) = vm.heap().get(exc) else {
+    let heap = vm.heap();
+    let Some(Oop::Instance(i)) = heap.get(exc) else {
         panic!("异常应为引导桩实例,引用 {exc:?}");
     };
     assert_eq!(i.class_name(), expected, "异常类名不符");

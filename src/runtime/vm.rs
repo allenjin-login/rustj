@@ -8,6 +8,7 @@
 //! 超限时解释器抛 `java/lang/StackOverflowError`(统一为 `ThrownException`)。
 
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::oops::{ClassRegistry, Oop};
 use crate::runtime::heap::Heap;
@@ -92,7 +93,8 @@ struct ExceptionMeta {
 /// 保持),确立「共享 vs 线程隔离」字段边界。对应 HotSpot 跨 `JavaThread` 共享的全局结构
 ///(`JavaHeap`/`SystemDictionary`/`StringTable`/`ObjectMonitor` 表等);线程隔离态留 [`Vm::thread`]。
 struct VmShared<'a> {
-    heap: Heap,
+    /// 对象堆(Mutex:Phase B.2.3b 共享态——`Arc<VmShared>` 多线程并发改堆的前置)。
+    heap: Mutex<Heap>,
     registry: Option<&'a ClassRegistry>,
     /// 字符串 intern 池(4.8):文本 → 堆引用,以本 Vm 的堆为后盾。
     string_pool: StringPool,
@@ -123,7 +125,7 @@ impl<'a> VmShared<'a> {
     /// `None` 经 [`Vm::default`](无注册表纯数值测试)。
     fn new(registry: Option<&'a ClassRegistry>) -> Self {
         Self {
-            heap: Heap::new(),
+            heap: Mutex::new(Heap::new()),
             registry,
             string_pool: StringPool::new(),
             monitors: HashMap::new(),
@@ -164,14 +166,15 @@ impl<'a> Vm<'a> {
         self
     }
 
-    /// 对象堆。
-    pub fn heap(&self) -> &Heap {
-        &self.shared.heap
+    /// 对象堆(Mutex 守卫;Phase B.2.3b)。inline 调用经 `Deref` 不破;跨语句绑定 须提取 owned
+    ///(`.cloned()`)——`MutexGuard` 借 `&self`,持 guard 跨 `&mut vm` 会 E0502。
+    pub fn heap(&self) -> MutexGuard<'_, Heap> {
+        self.shared.heap.lock().unwrap()
     }
 
-    /// 对象堆(可变)。
-    pub fn heap_mut(&mut self) -> &mut Heap {
-        &mut self.shared.heap
+    /// 对象堆(可变访问经 Mutex 内部可变性;`&self` 即可,调用方 `&mut vm` 自动协变)。
+    pub fn heap_mut(&self) -> MutexGuard<'_, Heap> {
+        self.shared.heap.lock().unwrap()
     }
 
     /// 字符串 intern 池(4.8/4.10i):文本 → 堆引用的纯备忘;真 String 实例构造在
@@ -221,7 +224,7 @@ impl<'a> Vm<'a> {
             return Reference::null();
         };
         let inst = reg.new_instance(class_lc);
-        self.shared.heap.alloc(Oop::Instance(inst))
+        self.shared.heap.lock().unwrap().alloc(Oop::Instance(inst))
     }
 
     /// 置 VM 管理的 Class 实例字段:`componentType`(数组→组件镜像)、`primitive`(原语→true)、
@@ -280,7 +283,7 @@ impl<'a> Vm<'a> {
             return Reference::null();
         };
         let inst = reg.new_instance(lc);
-        self.shared.heap.alloc(Oop::Instance(inst))
+        self.shared.heap.lock().unwrap().alloc(Oop::Instance(inst))
     }
 
     /// 命名 Module 镜像(intern:同名恒同引用)。分配真 `java/lang/Module` Instance,置 `name`
@@ -527,7 +530,7 @@ impl<'a> Vm<'a> {
                 break;
             }
             depth += 1;
-            let class = match self.shared.heap.get(e) {
+            let class = match self.shared.heap.lock().unwrap().get(e) {
                 Some(Oop::Instance(i)) => i.class_name().to_string(),
                 _ => "<unknown>".to_string(),
             };
@@ -719,7 +722,8 @@ mod monitor_tests {
         let VmError::ThrownException(r) = err else {
             panic!("期望 ThrownException,得 {err:?}");
         };
-        let Some(Oop::Instance(i)) = vm.heap().get(r) else {
+        let heap = vm.heap();
+        let Some(Oop::Instance(i)) = heap.get(r) else {
             panic!("IMSE 应为异常实例");
         };
         assert_eq!(i.class_name(), "java/lang/IllegalMonitorStateException");
@@ -734,7 +738,8 @@ mod monitor_tests {
         let VmError::ThrownException(r) = err else {
             panic!("期望 ThrownException,得 {err:?}");
         };
-        let Some(Oop::Instance(i)) = vm.heap().get(r) else {
+        let heap = vm.heap();
+        let Some(Oop::Instance(i)) = heap.get(r) else {
             panic!("NPE 应为异常实例");
         };
         assert_eq!(i.class_name(), "java/lang/NullPointerException");

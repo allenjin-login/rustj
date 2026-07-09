@@ -201,7 +201,8 @@ mod tests {
         let crate::runtime::VmError::ThrownException(exc) = err else {
             panic!("应抛 ThrownException,得 {err:?}");
         };
-        let crate::oops::Oop::Instance(i) = vm.heap().get(exc).unwrap() else {
+        let heap = vm.heap();
+        let crate::oops::Oop::Instance(i) = heap.get(exc).unwrap() else {
             panic!("须为异常实例");
         };
         assert_eq!(i.class_name(), "java/lang/NullPointerException");
@@ -305,7 +306,8 @@ mod tests {
         let crate::runtime::VmError::ThrownException(exc) = err else {
             panic!("未登记 native 应抛 ThrownException,得 {err:?}");
         };
-        let Some(crate::oops::Oop::Instance(i)) = vm.heap().get(exc) else {
+        let heap = vm.heap();
+        let Some(crate::oops::Oop::Instance(i)) = heap.get(exc) else {
             panic!("UnsatisfiedLinkError 应为引导桩实例");
         };
         assert_eq!(i.class_name(), "java/lang/UnsatisfiedLinkError");

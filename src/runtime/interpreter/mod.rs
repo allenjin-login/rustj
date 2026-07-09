@@ -1589,7 +1589,8 @@ mod tests {
         let Err(VmError::ThrownException(exc)) = result else {
             panic!("应抛 ThrownException({expected_class}), 实得 {result:?}");
         };
-        let Some(crate::oops::Oop::Instance(i)) = vm.heap().get(exc) else {
+        let heap = vm.heap();
+        let Some(crate::oops::Oop::Instance(i)) = heap.get(exc) else {
             panic!("抛出的异常应为引导桩分配的实例, 引用 {exc:?}");
         };
         assert_eq!(i.class_name(), expected_class, "异常类名不符");

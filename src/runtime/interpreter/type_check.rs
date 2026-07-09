@@ -11,8 +11,8 @@ use crate::runtime::{Frame, Reference, Vm};
 /// 取 objectref(非 null)的(是否数组, 运行时类名)。own 字符串避免借用纠缠。
 /// 数组取其类型描述符(`[B` / `[Ljava/lang/String;`),实例取类内部名。
 fn object_type(vm: &Vm<'_>, objref: Reference) -> Result<(bool, Option<String>), VmError> {
-    let obj = vm
-        .heap()
+    let heap = vm.heap();
+    let obj = heap
         .get(objref)
         .ok_or(VmError::BadConstant("checkcast/instanceof 引用悬空"))?;
     Ok(match obj {

@@ -13,8 +13,8 @@ use crate::runtime::{Reference, Vm};
 /// athrow 对象必为实例(数组不能 throw);悬空 / 数组 → `BadConstant`。
 fn runtime_class_name(vm: &Vm<'_>, exc: Reference) -> Result<String, VmError> {
     use crate::oops::Oop;
-    let obj = vm
-        .heap()
+    let heap = vm.heap();
+    let obj = heap
         .get(exc)
         .ok_or(VmError::BadConstant("athrow/异常分派 引用悬空"))?;
     match obj {

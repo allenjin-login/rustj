@@ -8,7 +8,7 @@
 //! 超限时解释器抛 `java/lang/StackOverflowError`(统一为 `ThrownException`)。
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::oops::{ClassRegistry, Oop};
 use crate::runtime::heap::Heap;
@@ -87,12 +87,12 @@ struct ExceptionMeta {
     message: Option<String>,
 }
 
-/// **跨线程共享态**(Phase B.2.3a):Vm 持有的「所有线程共享」字段集合——对象堆、类注册表、
-/// 字符串池、管程表、异常元数据、Class/Module 镜像表。B.2.3b 将以 `&'a VmShared` 视图 + 逐字段
-/// `Mutex` 包装,使多线程经 `Arc<VmShared>` 共享并发改写;本层先内联提取(owned、无 Mutex、行为
-/// 保持),确立「共享 vs 线程隔离」字段边界。对应 HotSpot 跨 `JavaThread` 共享的全局结构
-///(`JavaHeap`/`SystemDictionary`/`StringTable`/`ObjectMonitor` 表等);线程隔离态留 [`Vm::thread`]。
-struct VmShared<'a> {
+/// **跨线程共享态**(Phase B.2.3a/b):Vm 持有的「所有线程共享」字段集合——对象堆、类注册表、
+/// 字符串池、管程表、异常元数据、Class/Module 镜像表。逐字段 `Mutex` 包装,`Vm.shared` 持
+/// `Arc<VmShared>`——多线程经 `Vm::from_shared(Arc::clone(&vm.shared))` 派生各自 Vm、共享并发改写。
+/// 对应 HotSpot 跨 `JavaThread` 共享的全局结构(`JavaHeap`/`SystemDictionary`/`StringTable`/
+/// `ObjectMonitor` 表等);线程隔离态留 [`Vm::thread`]。`pub(crate)`:`from_shared` 签名须命名。
+pub(crate) struct VmShared<'a> {
     /// 对象堆(Mutex:Phase B.2.3b 共享态——`Arc<VmShared>` 多线程并发改堆的前置)。
     heap: Mutex<Heap>,
     registry: Option<&'a ClassRegistry>,
@@ -145,11 +145,12 @@ impl<'a> VmShared<'a> {
 /// 执行上下文:拥有对象堆,借用类注册表,跟踪帧嵌套深度。
 ///
 /// Phase B.2.3a:共享字段归入 [`shared`](Self.shared)([`VmShared`]),线程隔离态
-///([`thread`](Self.thread))留本结构。B.2.3b 将改 `shared: &'a VmShared` 视图,使每线程
-/// `Vm::new(&arc_shared)` 共享同一 `Arc<VmShared>`。
+///([`thread`](Self.thread))留本结构。B.2.3b:`shared: Arc<VmShared>`,每线程经
+/// [`Vm::from_shared`](`Vm::from_shared(Arc::clone(&vm.shared))`) 派生各自 Vm、共享同一
+/// `Arc<VmShared>`(字段全 Mutex → `VmShared: Send + Sync` → `Arc<VmShared>: Send + Sync`)。
 pub struct Vm<'a> {
-    /// 跨线程共享态(堆/注册表/池/管程/镜像表)。B.2.3b 包 `&'a VmShared` + Mutex。
-    shared: VmShared<'a>,
+    /// 跨线程共享态(堆/注册表/池/管程/镜像表)。`Arc` 共享;字段全 Mutex(`Arc::clone` 派生线程)。
+    shared: Arc<VmShared<'a>>,
     /// 当前线程隔离态(调用栈/帧深度/线程镜像)。
     pub(crate) thread: ThreadContext,
 }
@@ -158,9 +159,26 @@ impl<'a> Vm<'a> {
     /// 构造带类注册表的 Vm(空堆,默认深度上限)。
     pub fn new(registry: &'a ClassRegistry) -> Self {
         Self {
-            shared: VmShared::new(Some(registry)),
+            shared: Arc::new(VmShared::new(Some(registry))),
             thread: ThreadContext::new_main(),
         }
+    }
+
+    /// 从既有共享态派生新 Vm(B.3b 真线程:每线程各持 `Arc::clone` 的共享态 + 独立 `ThreadContext`)。
+    /// 调用方先 [`Vm::shared_arc`] 取 `Arc::clone(&vm.shared)`,再经本方法构造派生线程的 Vm。
+    /// 共享态(堆/池/管程/镜像表)跨线程共享;线程隔离态(调用栈/帧深度/线程镜像)各独立。
+    #[allow(dead_code)] // B.3b 真线程派生用;T6 引入,测试 + B.3b 调用
+    pub(crate) fn from_shared(shared: Arc<VmShared<'a>>) -> Self {
+        Self {
+            shared,
+            thread: ThreadContext::new_main(),
+        }
+    }
+
+    /// 取共享态的 `Arc::clone`(供 [`Vm::from_shared`] 派生线程 Vm;`shared` 字段私有)。
+    #[allow(dead_code)] // B.3b 真线程派生用;T6 引入,测试 + B.3b 调用
+    pub(crate) fn shared_arc(&self) -> Arc<VmShared<'a>> {
+        Arc::clone(&self.shared)
     }
 
     /// 设置帧深度上限(builder)。SOE 测试用小值快速触发。
@@ -600,7 +618,7 @@ impl<'a> Vm<'a> {
 impl Default for Vm<'_> {
     fn default() -> Self {
         Self {
-            shared: VmShared::new(None),
+            shared: Arc::new(VmShared::new(None)),
             thread: ThreadContext::new_main(),
         }
     }
@@ -823,6 +841,41 @@ mod sync_assertions {
             assert_send::<Vm<'a>>();
         }
         let _ = check;
+    }
+
+    /// **T6**(B.2.3b):`Arc<VmShared<'a>>: Send + Sync`——B.3b `thread::spawn` 跨线程共享 `Arc::clone`
+    /// 的前置。各共享字段全 `Mutex`(registry 仍 `&'a` 不可变)→ `VmShared: Send+Sync` →
+    /// `Arc<VmShared>: Send+Sync`。RED(任一字段非 Send/Sync)→ 编译失败。
+    #[test]
+    fn arc_vmshared_is_send_sync() {
+        fn check<'a>(_: &'a ClassRegistry) {
+            assert_send::<std::sync::Arc<super::VmShared<'a>>>();
+            assert_sync::<std::sync::Arc<super::VmShared<'a>>>();
+        }
+        let _ = check;
+    }
+
+    /// **T6**(B.2.3b):`from_shared(vm.shared_arc())` 派生的 Vm 与原 Vm **共享同一 `Arc<VmShared>`**
+    /// (堆/池/管程/镜像表)。在 vm 堆上分配的对象,经 vm2(from_shared)同引用可见。
+    #[test]
+    fn from_shared_shares_arc_vmshared() {
+        use crate::oops::{InstanceOop, Oop};
+        let reg = ClassRegistry::new();
+        let vm = Vm::new(&reg);
+        // 在 vm 的共享堆上分配一个对象(无须经注册表/intern)。
+        let r = vm
+            .heap_mut()
+            .alloc(Oop::Instance(InstanceOop::new("probe".into(), vec![])));
+        // shared_arc + from_shared 派生共享态 vm2(各自独立 ThreadContext)。
+        let vm2 = Vm::from_shared(vm.shared_arc());
+        let heap = vm2.heap();
+        let oop = heap
+            .get(r)
+            .expect("共享堆:vm 分配的对象在 vm2 须可见");
+        assert!(
+            matches!(oop, Oop::Instance(i) if i.class_name() == "probe"),
+            "from_shared 须共享 VmShared 堆(同引用同对象)"
+        );
     }
 }
 

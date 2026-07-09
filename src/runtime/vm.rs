@@ -86,15 +86,17 @@ struct ExceptionMeta {
     message: Option<String>,
 }
 
-/// 执行上下文:拥有对象堆,借用类注册表,跟踪帧嵌套深度。
-pub struct Vm<'a> {
+/// **跨线程共享态**(Phase B.2.3a):Vm 持有的「所有线程共享」字段集合——对象堆、类注册表、
+/// 字符串池、管程表、异常元数据、Class/Module 镜像表。B.2.3b 将以 `&'a VmShared` 视图 + 逐字段
+/// `Mutex` 包装,使多线程经 `Arc<VmShared>` 共享并发改写;本层先内联提取(owned、无 Mutex、行为
+/// 保持),确立「共享 vs 线程隔离」字段边界。对应 HotSpot 跨 `JavaThread` 共享的全局结构
+///(`JavaHeap`/`SystemDictionary`/`StringTable`/`ObjectMonitor` 表等);线程隔离态留 [`Vm::thread`]。
+struct VmShared<'a> {
     heap: Heap,
     registry: Option<&'a ClassRegistry>,
     /// 字符串 intern 池(4.8):文本 → 堆引用,以本 Vm 的堆为后盾。
     string_pool: StringPool,
-    /// 当前嵌套帧数(进入一帧 +1,退出 −1)。
-    pub(crate) thread: ThreadContext,
-    /// 对象管程(对象句柄 → 锁状态)。跨线程共享态(B.2 加 Mutex);单线程下 owner 恒为当前线程。
+    /// 对象管程(对象句柄 → 锁状态)。跨线程共享态(B.2.3b 加 Mutex);单线程下 owner 恒为当前线程。
     pub(crate) monitors: HashMap<Reference, MonitorState>,
     /// 下一线程 tid(Thread.tid 递增;main 线程=1)。
     next_tid: u64,
@@ -110,20 +112,20 @@ pub struct Vm<'a> {
     mirror_class: HashMap<Reference, String>,
     /// 命名 Module 镜像表(4.14a):模块名(`java.base`)→ 真 `java/lang/Module` Instance 引用。
     /// 同名模块恒同引用(对应 HotSpot 每个 `Module` 类实例单例)。`name` 字段填模块名;
-    /// 无名模块走 [`Self::unnamed_module`](单例,`name` 字段 null)。
+    /// 无名模块走 [`Vm::unnamed_module`](单例,`name` 字段 null)。
     module_mirrors: HashMap<String, Reference>,
     /// 无名模块单例引用(惰性分配,4.14a)。`Module.getName()` 返 null → `isNamed()`=false。
     unnamed_module: Option<Reference>,
 }
 
-impl<'a> Vm<'a> {
-    /// 构造带类注册表的 Vm(空堆,默认深度上限)。
-    pub fn new(registry: &'a ClassRegistry) -> Self {
+impl<'a> VmShared<'a> {
+    /// 构造共享态(空堆、空池、空表;`next_tid` 起始 1)。`registry` = `Some` 经 [`Vm::new`],
+    /// `None` 经 [`Vm::default`](无注册表纯数值测试)。
+    fn new(registry: Option<&'a ClassRegistry>) -> Self {
         Self {
             heap: Heap::new(),
-            registry: Some(registry),
+            registry,
             string_pool: StringPool::new(),
-            thread: ThreadContext::new_main(),
             monitors: HashMap::new(),
             next_tid: 1,
             exception_meta: HashMap::new(),
@@ -131,6 +133,28 @@ impl<'a> Vm<'a> {
             mirror_class: HashMap::new(),
             module_mirrors: HashMap::new(),
             unnamed_module: None,
+        }
+    }
+}
+
+/// 执行上下文:拥有对象堆,借用类注册表,跟踪帧嵌套深度。
+///
+/// Phase B.2.3a:共享字段归入 [`shared`](Self.shared)([`VmShared`]),线程隔离态
+///([`thread`](Self.thread))留本结构。B.2.3b 将改 `shared: &'a VmShared` 视图,使每线程
+/// `Vm::new(&arc_shared)` 共享同一 `Arc<VmShared>`。
+pub struct Vm<'a> {
+    /// 跨线程共享态(堆/注册表/池/管程/镜像表)。B.2.3b 包 `&'a VmShared` + Mutex。
+    shared: VmShared<'a>,
+    /// 当前线程隔离态(调用栈/帧深度/线程镜像)。
+    pub(crate) thread: ThreadContext,
+}
+
+impl<'a> Vm<'a> {
+    /// 构造带类注册表的 Vm(空堆,默认深度上限)。
+    pub fn new(registry: &'a ClassRegistry) -> Self {
+        Self {
+            shared: VmShared::new(Some(registry)),
+            thread: ThreadContext::new_main(),
         }
     }
 
@@ -142,23 +166,23 @@ impl<'a> Vm<'a> {
 
     /// 对象堆。
     pub fn heap(&self) -> &Heap {
-        &self.heap
+        &self.shared.heap
     }
 
     /// 对象堆(可变)。
     pub fn heap_mut(&mut self) -> &mut Heap {
-        &mut self.heap
+        &mut self.shared.heap
     }
 
     /// 字符串 intern 池(4.8/4.10i):文本 → 堆引用的纯备忘;真 String 实例构造在
     /// interpreter(`string::intern`),本池仅保证「同文本恒同引用」。
     pub(crate) fn string_pool(&self) -> &StringPool {
-        &self.string_pool
+        &self.shared.string_pool
     }
 
     /// 字符串 intern 池(可变)。
     pub(crate) fn string_pool_mut(&mut self) -> &mut StringPool {
-        &mut self.string_pool
+        &mut self.shared.string_pool
     }
 
     /// Class 镜像 intern(4.10t 起;4.12 退役 `Oop::Class`):同一内部类名恒返回同一 Class
@@ -170,21 +194,21 @@ impl<'a> Vm<'a> {
     /// `module` 由 [`Self::populate_class_mirror_fields`](4.14a)按类所属模块填。
     /// `name` 由 `getName` 真字节码首次调用时经 `initClassName` 懒填。
     pub(crate) fn intern_class_mirror(&mut self, name: &str) -> Reference {
-        if let Some(r) = self.class_mirrors.get(name) {
+        if let Some(r) = self.shared.class_mirrors.get(name) {
             return *r;
         }
         // 分配真 java/lang/Class Instance(须已加载:引导 Class 桩或经闭包预载的真 Class)。
         let r = self.alloc_class_mirror_instance();
         // 先缓存再填字段:数组组件互递归([LC→C、[[I→[I)经缓存命中终止。
-        self.class_mirrors.insert(name.to_string(), r);
-        self.mirror_class.insert(r, name.to_string());
+        self.shared.class_mirrors.insert(name.to_string(), r);
+        self.shared.mirror_class.insert(r, name.to_string());
         self.populate_class_mirror_fields(r, name);
         r
     }
 
     /// 镜像所表示类型的内部名(供 Class native 反查)。非镜像引用 → `None`。
     pub(crate) fn mirror_internal_name(&self, r: Reference) -> Option<&str> {
-        self.mirror_class.get(&r).map(String::as_str)
+        self.shared.mirror_class.get(&r).map(String::as_str)
     }
 
     /// 分配一个默认初始化的 `java/lang/Class` Instance。无注册表或 `java/lang/Class` 未加载
@@ -197,7 +221,7 @@ impl<'a> Vm<'a> {
             return Reference::null();
         };
         let inst = reg.new_instance(class_lc);
-        self.heap.alloc(Oop::Instance(inst))
+        self.shared.heap.alloc(Oop::Instance(inst))
     }
 
     /// 置 VM 管理的 Class 实例字段:`componentType`(数组→组件镜像)、`primitive`(原语→true)、
@@ -256,21 +280,21 @@ impl<'a> Vm<'a> {
             return Reference::null();
         };
         let inst = reg.new_instance(lc);
-        self.heap.alloc(Oop::Instance(inst))
+        self.shared.heap.alloc(Oop::Instance(inst))
     }
 
     /// 命名 Module 镜像(intern:同名恒同引用)。分配真 `java/lang/Module` Instance,置 `name`
     /// 字段 = intern(模块名)。对应 HotSpot 每个 `Module` 单例(JVM 侧 `java_lang_Module`)。
     /// `Module.getName()` 真字节码读 `name` 字段即得模块名;`isNamed()` = `name != null`。
     fn intern_named_module(&mut self, name: &str) -> Reference {
-        if let Some(&r) = self.module_mirrors.get(name) {
+        if let Some(&r) = self.shared.module_mirrors.get(name) {
             return r;
         }
         let r = self.alloc_module_instance();
         if r.is_null() {
             return r;
         }
-        self.module_mirrors.insert(name.to_string(), r);
+        self.shared.module_mirrors.insert(name.to_string(), r);
         // 置 Module.name = intern(模块名)(真 String 实例,供 getName/equals 用)。
         if let Ok(name_ref) = crate::runtime::interpreter::string::intern(self, name) {
             self.set_instance_field_by_name(r, "java/lang/Module", "name", Slot::Reference(name_ref));
@@ -281,12 +305,12 @@ impl<'a> Vm<'a> {
     /// 无名模块单例(惰性)。`Module(loader)` 未名构造器语义:`name`=null(默认)、`descriptor`=null。
     /// `getName()` 返 null、`isNamed()`=false。用户类(非模块源)经 [`Self::module_for_class`] 归此。
     fn unnamed_module(&mut self) -> Reference {
-        if let Some(r) = self.unnamed_module {
+        if let Some(r) = self.shared.unnamed_module {
             return r;
         }
         let r = self.alloc_module_instance();
         if !r.is_null() {
-            self.unnamed_module = Some(r);
+            self.shared.unnamed_module = Some(r);
         }
         r
     }
@@ -313,7 +337,7 @@ impl<'a> Vm<'a> {
     /// (§6 `'a` 不绑 `&self`),出块后 `heap_mut` 分配,再 `set_instance_field_by_name` 置字段。
     fn alloc_main_thread(&mut self) -> Reference {
         let inst = {
-            let Some(reg) = self.registry else {
+            let Some(reg) = self.shared.registry else {
                 return Reference::null();
             };
             let Some(lc) = reg.get("java/lang/Thread") else {
@@ -354,7 +378,7 @@ impl<'a> Vm<'a> {
     /// 返回的引用与注册表本身同寿命(`'a`),不依赖本次对 `self` 的借用——
     /// 这样取出 `&'a LoadedClass` 后仍可再借 `&mut self`(如递归 `interpret_with`)。
     pub fn registry(&self) -> Option<&'a ClassRegistry> {
-        self.registry
+        self.shared.registry
     }
 
     // ---- 栈轨迹捕获(4.10j+) ----
@@ -401,7 +425,7 @@ impl<'a> Vm<'a> {
     /// 等价 HotSpot `Throwable.fillInStackTrace` 捕获语义——stub 异常不经真 `<init>`,
     /// 故 `throw_exception` 直接调之;`fillInStackTrace` native 亦调之(为真 Throwable 预留)。
     pub(crate) fn record_trace(&mut self, exc: Reference) {
-        self.exception_meta
+        self.shared.exception_meta
             .entry(exc)
             .or_default()
             .frames = self.thread.call_stack.clone();
@@ -411,13 +435,13 @@ impl<'a> Vm<'a> {
     /// `format_trace` 据此追链渲染 "Caused by:"——被包异常**自身**的轨迹携带真正抛出点
     /// (如 clinit 内部位置),从而顶层不再丢失根因。
     pub(crate) fn record_cause(&mut self, wrapper: Reference, cause: Reference) {
-        self.exception_meta.entry(wrapper).or_default().cause = Some(cause);
+        self.shared.exception_meta.entry(wrapper).or_default().cause = Some(cause);
     }
 
     /// 登记异常的 detailMessage(对应 `Throwable.detailMessage`,如 "/ by zero")。
     /// `format_trace` 据此在头类后渲染 ": <message>"。供 JVM 自动抛出点带上诊断消息。
     pub(crate) fn record_message(&mut self, exc: Reference, message: impl Into<String>) {
-        self.exception_meta
+        self.shared.exception_meta
             .entry(exc)
             .or_default()
             .message = Some(message.into());
@@ -478,7 +502,7 @@ impl<'a> Vm<'a> {
     /// 取异常捕获的调用链快照(`Throwable.fillInStackTrace` / `throw_exception` 捕获)。
     /// 供 `Throwable.getStackTrace` native 构造 `StackTraceElement[]`。键 = 异常句柄。
     pub(crate) fn exception_frames(&self, exc: Reference) -> Option<&[CallFrame]> {
-        self.exception_meta.get(&exc).map(|m| m.frames.as_slice())
+        self.shared.exception_meta.get(&exc).map(|m| m.frames.as_slice())
     }
 
 
@@ -487,7 +511,7 @@ impl<'a> Vm<'a> {
     /// `\nCaused by: <cause 类>[: message]` + cause 自身帧。深度上限 64(防环/失控链)。
     /// 无快照且无 cause/message → 空串(旧契约)。供测试/诊断;顶层未捕获时自动打印。
     pub fn format_trace(&self, exc: Reference) -> String {
-        let Some(meta) = self.exception_meta.get(&exc) else {
+        let Some(meta) = self.shared.exception_meta.get(&exc) else {
             return String::new();
         };
         // 头异常无帧、无 cause、无 message → 无信息,返空串(旧契约)。
@@ -503,7 +527,7 @@ impl<'a> Vm<'a> {
                 break;
             }
             depth += 1;
-            let class = match self.heap.get(e) {
+            let class = match self.shared.heap.get(e) {
                 Some(Oop::Instance(i)) => i.class_name().to_string(),
                 _ => "<unknown>".to_string(),
             };
@@ -514,14 +538,14 @@ impl<'a> Vm<'a> {
                 out.push_str("\nCaused by: ");
                 out.push_str(&class);
             }
-            if let Some(m) = self.exception_meta.get(&e)
+            if let Some(m) = self.shared.exception_meta.get(&e)
                 && let Some(msg) = &m.message
             {
                 out.push_str(": ");
                 out.push_str(msg);
             }
             // call_stack 入栈序 = 外层→内层(抛出帧在最末);Java 惯例最内帧首 → 逆序打印。
-            if let Some(m) = self.exception_meta.get(&e) {
+            if let Some(m) = self.shared.exception_meta.get(&e) {
                 for f in m.frames.iter().rev() {
                     out.push_str("\n\tat ");
                     out.push_str(&f.class);
@@ -533,7 +557,7 @@ impl<'a> Vm<'a> {
                     }
                 }
             }
-            cur = self
+            cur = self.shared
                 .exception_meta
                 .get(&e)
                 .and_then(|m| m.cause);
@@ -545,17 +569,8 @@ impl<'a> Vm<'a> {
 impl Default for Vm<'_> {
     fn default() -> Self {
         Self {
-            heap: Heap::new(),
-            registry: None,
-            string_pool: StringPool::new(),
+            shared: VmShared::new(None),
             thread: ThreadContext::new_main(),
-            monitors: HashMap::new(),
-            next_tid: 1,
-            exception_meta: HashMap::new(),
-            class_mirrors: HashMap::new(),
-            mirror_class: HashMap::new(),
-            module_mirrors: HashMap::new(),
-            unnamed_module: None,
         }
     }
 }
@@ -601,7 +616,7 @@ impl<'a> Vm<'a> {
         }
         let owner = self.main_thread();
         use std::collections::hash_map::Entry;
-        match self.monitors.entry(obj) {
+        match self.shared.monitors.entry(obj) {
             Entry::Occupied(mut e) => e.get_mut().count += 1,
             Entry::Vacant(e) => {
                 e.insert(MonitorState { owner, count: 1 });
@@ -620,7 +635,7 @@ impl<'a> Vm<'a> {
             ));
         }
         let owner = self.main_thread();
-        let held = self
+        let held = self.shared
             .monitors
             .get(&obj)
             .is_some_and(|m| m.owner == owner && m.count > 0);
@@ -630,11 +645,11 @@ impl<'a> Vm<'a> {
                 "java/lang/IllegalMonitorStateException",
             ));
         }
-        let count = self.monitors.get(&obj).unwrap().count;
+        let count = self.shared.monitors.get(&obj).unwrap().count;
         if count == 1 {
-            self.monitors.remove(&obj);
+            self.shared.monitors.remove(&obj);
         } else {
-            self.monitors.get_mut(&obj).unwrap().count -= 1;
+            self.shared.monitors.get_mut(&obj).unwrap().count -= 1;
         }
         Ok(())
     }
@@ -649,7 +664,7 @@ impl<'a> Vm<'a> {
             ));
         }
         let owner = self.main_thread();
-        Ok(self
+        Ok(self.shared
             .monitors
             .get(&obj)
             .is_some_and(|m| m.owner == owner && m.count > 0))
@@ -657,8 +672,8 @@ impl<'a> Vm<'a> {
 
     /// 取并递增下一线程 tid(供 Thread 镜像 tid 字段;main 线程取首值 1,后续递增)。
     pub(crate) fn next_thread_tid(&mut self) -> u64 {
-        let tid = self.next_tid;
-        self.next_tid += 1;
+        let tid = self.shared.next_tid;
+        self.shared.next_tid += 1;
         tid
     }
 }
@@ -739,6 +754,11 @@ mod sync_assertions {
     //! (VmShared 拆分):单独包 `Mutex<Heap>` 须把 ~30 处 `vm.heap().get()` match/let-else
     //! 重构为「先提取 owned 再 `&mut vm`」(`MutexGuard` 的 `Drop` 延长 `&self` 借用到作用域末,
     //! 破坏 §6 NLL 即用即释),无 VmShared 视图拆分上下文则成纯机械搅动,故并入 B.2.3。
+    //!
+    //! Phase B.2.3a(已落):`VmShared` 结构已内联提取(`Vm { shared, thread }`,owned、无 Mutex、
+    //! 行为保持)——确立「共享 vs 线程隔离」字段边界,本断言仍绿(`VmShared: Sync` ⟸ 各字段皆 Sync)。
+    //! B.2.3b 待做:`shared: &'a VmShared` 视图 + 逐字段 `Mutex` + `let heap = vm.heap();` 绑定修 E0716
+    //!(`MutexGuard` 借 VmShared(referent)非 vm → 持 guard 不阻塞 `&mut vm`,E0502 自动消失)。
     use super::Vm;
     use crate::oops::ClassRegistry;
 

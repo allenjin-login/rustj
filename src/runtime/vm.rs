@@ -733,16 +733,33 @@ mod sync_assertions {
     //! 而 `ClassRegistry`/`LoadedClass` 持 `RefCell`(static_storage/flat_cache/init_state/
     //! class_modules),`RefCell: !Sync` → `Vm: !Sync` → 此断言**编译失败**(RED)。把四处
     //! `RefCell` 改 `Mutex` 后 `ClassRegistry: Sync` → `Vm: Sync` → 编译通过(GREEN)。
+    //!
+    //! Phase B.2.1 续:`Vm: Send` 同理达成(`registry: &'a ClassRegistry: Send` ⟸
+    //! `ClassRegistry: Sync`)。Heap→Mutex 的「`&Vm` 共享引用互斥改堆」能力顺延至 B.2.3
+    //! (VmShared 拆分):单独包 `Mutex<Heap>` 须把 ~30 处 `vm.heap().get()` match/let-else
+    //! 重构为「先提取 owned 再 `&mut vm`」(`MutexGuard` 的 `Drop` 延长 `&self` 借用到作用域末,
+    //! 破坏 §6 NLL 即用即释),无 VmShared 视图拆分上下文则成纯机械搅动,故并入 B.2.3。
     use super::Vm;
     use crate::oops::ClassRegistry;
 
     fn assert_sync<T: ?Sized + Sync>() {}
+    fn assert_send<T: ?Sized + Send>() {}
 
     /// `Vm<'a>: Sync` 蕴含 `&'a ClassRegistry: Sync` → `ClassRegistry: Sync`。
     #[test]
     fn vm_is_sync() {
         fn check<'a>(_: &'a ClassRegistry) {
             assert_sync::<Vm<'a>>();
+        }
+        let _ = check;
+    }
+
+    /// `Vm<'a>: Send`(B.2.1):B.3 `Arc<Mutex<VmShared>>: Send+Sync` 须 `VmShared: Send`,
+    /// 进而 `Vm: Send`(`registry: &'a ClassRegistry: Send` ⟸ `ClassRegistry: Sync`,B.2.1 已达)。
+    #[test]
+    fn vm_is_send() {
+        fn check<'a>(_: &'a ClassRegistry) {
+            assert_send::<Vm<'a>>();
         }
         let _ = check;
     }

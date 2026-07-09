@@ -6,14 +6,24 @@
 //! 需要注册表(便捷入口 `interpret()` 自带注册表);[`Vm::default`] 仅空堆 + 无注册表,
 //! 供确不抛异常的纯数值测试。4.2b:帧深度计数 + 可配置上限([`Vm::with_stack_limit`]);
 //! 超限时解释器抛 `java/lang/StackOverflowError`(统一为 `ThrownException`)。
+//!
+//! Phase B.2.3b(T7)职责分解:Class/Module 镜像法 → [`mirrors`]、对象管程 →
+//! [`monitors`]、异常元数据 + 栈轨迹 → [`exceptions`]、线程管理器 + main 线程 → [`threads`]。
+//! 本模块留核心结构([`Vm`]/[`VmShared`]/[`ThreadContext`]/[`CallFrame`]/[`MonitorState`])、
+//! 构造、堆/池/注册表 accessor、栈帧法(T8 下沉 [`ThreadContext`])。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::oops::{ClassRegistry, Oop};
+use crate::oops::ClassRegistry;
 use crate::runtime::heap::Heap;
 use crate::runtime::string_pool::StringPool;
-use crate::runtime::{Reference, Slot, VmError};
+use crate::runtime::Reference;
+
+mod exceptions;
+mod mirrors;
+mod monitors;
+mod threads;
 
 /// 默认帧深度上限。高于 ackermann(3,3) 的递归深度(~120),正常小测试不会误触;
 /// 可经 [`Vm::with_stack_limit`] 调整(SOE 测试用小值快速触发)。
@@ -72,26 +82,12 @@ pub(crate) struct MonitorState {
     pub(crate) count: u32,
 }
 
-/// 异常的元数据(`Throwable` 三要素的 rustj 侧镜像):捕获帧 / cause / detailMessage。
-///
-/// 键 = 异常对象句柄(`Reference` 单调不复用)。`format_trace` 据此渲染
-/// `Class: message\n\tat …\nCaused by: …`。真 `Throwable.getMessage/getCause/getStackTrace`
-/// 字段回填是更大的独立层;当前先以此并行结构服务诊断输出。
-#[derive(Default, Clone)]
-struct ExceptionMeta {
-    /// 抛出点快照的调用链(`Throwable.fillInStackTrace`)。空 = 未捕获。
-    frames: Vec<CallFrame>,
-    /// 包裹 cause(`Throwable.cause` / `new X(cause)`)。
-    cause: Option<Reference>,
-    /// detailMessage(`Throwable.detailMessage`,如 "/ by zero")。
-    message: Option<String>,
-}
-
 /// **跨线程共享态**(Phase B.2.3a/b):Vm 持有的「所有线程共享」字段集合——对象堆、类注册表、
-/// 字符串池、管程表、异常元数据、Class/Module 镜像表。逐字段 `Mutex` 包装,`Vm.shared` 持
-/// `Arc<VmShared>`——多线程经 `Vm::from_shared(Arc::clone(&vm.shared))` 派生各自 Vm、共享并发改写。
-/// 对应 HotSpot 跨 `JavaThread` 共享的全局结构(`JavaHeap`/`SystemDictionary`/`StringTable`/
-/// `ObjectMonitor` 表等);线程隔离态留 [`Vm::thread`]。`pub(crate)`:`from_shared` 签名须命名。
+/// 字符串池、管程表、异常元数据、Class/Module 镜像表、线程管理器。逐字段 `Mutex` 包装,
+/// `Vm.shared` 持 `Arc<VmShared>`——多线程经 `Vm::from_shared(Arc::clone(&vm.shared))` 派生
+/// 各自 Vm、共享并发改写。对应 HotSpot 跨 `JavaThread` 共享的全局结构(`JavaHeap`/
+/// `SystemDictionary`/`StringTable`/`ObjectMonitor` 表等);线程隔离态留 [`Vm::thread`]。
+/// `pub(crate)`:`from_shared` 签名须命名。
 pub(crate) struct VmShared<'a> {
     /// 对象堆(Mutex:Phase B.2.3b 共享态——`Arc<VmShared>` 多线程并发改堆的前置)。
     heap: Mutex<Heap>,
@@ -100,10 +96,11 @@ pub(crate) struct VmShared<'a> {
     string_pool: Mutex<StringPool>,
     /// 对象管程(对象句柄 → 锁状态)。跨线程共享态(B.2.3b 加 Mutex);单线程下 owner 恒为当前线程。
     pub(crate) monitors: Mutex<HashMap<Reference, MonitorState>>,
-    /// 下一线程 tid(Thread.tid 递增;main 线程=1)。Mutex(B.2.3b 共享态;T7 并入 ThreadManager)。
-    next_tid: Mutex<u64>,
+    /// 线程管理器(tid 分配;B.3b 增线程表)。T7 从顶层 `next_tid` 收编为 [`threads::ThreadManager`]。
+    pub(crate) threads: threads::ThreadManager,
     /// 异常 → 元数据(帧 / cause / detailMessage),键 = 异常对象句柄。Mutex(B.2.3b 共享态)。
-    exception_meta: Mutex<HashMap<Reference, ExceptionMeta>>,
+    /// `ExceptionMeta` 在 [`exceptions`](`pub(super)` 供本字段命名类型)。
+    exception_meta: Mutex<HashMap<Reference, exceptions::ExceptionMeta>>,
     /// Class 镜像 intern 表(4.10t):内部类名(`java/lang/Foo`、`int`、`[I` …)→ 唯一 Class
     /// 镜像引用。对应 HotSpot 每个 `Klass` 持有单一 `_java_mirror`(Class 对象)。保证
     /// `Foo.class == Foo.class`、`obj.getClass() == Foo.class` 等 Class 对象身份相等。
@@ -124,7 +121,7 @@ pub(crate) struct VmShared<'a> {
 }
 
 impl<'a> VmShared<'a> {
-    /// 构造共享态(空堆、空池、空表;`next_tid` 起始 1)。`registry` = `Some` 经 [`Vm::new`],
+    /// 构造共享态(空堆、空池、空表;tid 起始 1)。`registry` = `Some` 经 [`Vm::new`],
     /// `None` 经 [`Vm::default`](无注册表纯数值测试)。
     fn new(registry: Option<&'a ClassRegistry>) -> Self {
         Self {
@@ -132,7 +129,7 @@ impl<'a> VmShared<'a> {
             registry,
             string_pool: Mutex::new(StringPool::new()),
             monitors: Mutex::new(HashMap::new()),
-            next_tid: Mutex::new(1),
+            threads: threads::ThreadManager::new(),
             exception_meta: Mutex::new(HashMap::new()),
             class_mirrors: Mutex::new(HashMap::new()),
             mirror_class: Mutex::new(HashMap::new()),
@@ -149,7 +146,7 @@ impl<'a> VmShared<'a> {
 /// [`Vm::from_shared`](`Vm::from_shared(Arc::clone(&vm.shared))`) 派生各自 Vm、共享同一
 /// `Arc<VmShared>`(字段全 Mutex → `VmShared: Send + Sync` → `Arc<VmShared>: Send + Sync`)。
 pub struct Vm<'a> {
-    /// 跨线程共享态(堆/注册表/池/管程/镜像表)。`Arc` 共享;字段全 Mutex(`Arc::clone` 派生线程)。
+    /// 跨线程共享态(堆/注册表/池/管程/镜像表/线程管理器)。`Arc` 共享;字段全 Mutex(`Arc::clone` 派生线程)。
     shared: Arc<VmShared<'a>>,
     /// 当前线程隔离态(调用栈/帧深度/线程镜像)。
     pub(crate) thread: ThreadContext,
@@ -209,212 +206,6 @@ impl<'a> Vm<'a> {
         self.shared.string_pool.lock().unwrap()
     }
 
-    /// Class 镜像 intern(4.10t 起;4.12 退役 `Oop::Class`):同一内部类名恒返回同一 Class
-    /// 镜像引用(对应 HotSpot 每 `Klass` 的单一 `_java_mirror`)。镜像现为**真 `java/lang/Class`
-    /// Instance**——首次 `new_instance` 分配,置 VM 字段(`componentType`/`primitive`),并登记
-    /// 反查表 `mirror_class`;后续命中直接返。使 `Foo.class == Foo.class`、
-    /// `obj.getClass() == Foo.class` 等 Class 身份相等成立。
-    /// `name`/`classLoader` 字段保持默认 null(`classLoader`=null 即 Bootstrap)。
-    /// `module` 由 [`Self::populate_class_mirror_fields`](4.14a)按类所属模块填。
-    /// `name` 由 `getName` 真字节码首次调用时经 `initClassName` 懒填。
-    pub(crate) fn intern_class_mirror(&mut self, name: &str) -> Reference {
-        // 缓存命中:单次锁取 owned Reference,释 guard 再返(drop-before-recurse;B.2.3b)。
-        if let Some(r) = self.shared.class_mirrors.lock().unwrap().get(name).copied() {
-            return r;
-        }
-        // 分配真 java/lang/Class Instance(须已加载:引导 Class 桩或经闭包预载的真 Class)。
-        let r = self.alloc_class_mirror_instance();
-        // 先缓存再填字段:数组组件互递归([LC→C、[[I→[I)经缓存命中终止。
-        // 两表分别单语句锁 insert,释 guard 后再 populate(其递归 intern 会再锁→须 drop)。
-        self.shared
-            .class_mirrors
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), r);
-        self.shared
-            .mirror_class
-            .lock()
-            .unwrap()
-            .insert(r, name.to_string());
-        self.populate_class_mirror_fields(r, name);
-        r
-    }
-
-    /// 镜像所表示类型的内部名(供 Class native 反查)。非镜像引用 → `None`。
-    /// 返 owned `String`(mirror_class 已 Mutex 化,无法返借用 &str;B.2.3b)。
-    pub(crate) fn mirror_internal_name(&self, r: Reference) -> Option<String> {
-        self.shared.mirror_class.lock().unwrap().get(&r).cloned()
-    }
-
-    /// 分配一个默认初始化的 `java/lang/Class` Instance。无注册表或 `java/lang/Class` 未加载
-    /// (非真实运行场景)→ 返 null 兜底(调用方多为 native,返 null 镜像不致 panic)。
-    fn alloc_class_mirror_instance(&mut self) -> Reference {
-        let Some(reg) = self.registry() else {
-            return Reference::null();
-        };
-        let Some(class_lc) = reg.get("java/lang/Class") else {
-            return Reference::null();
-        };
-        let inst = reg.new_instance(class_lc);
-        self.shared.heap.lock().unwrap().alloc(Oop::Instance(inst))
-    }
-
-    /// 置 VM 管理的 Class 实例字段:`componentType`(数组→组件镜像)、`primitive`(原语→true)、
-    /// `module`(4.14a:按类所属命名模块填 Module 镜像,未标记→无名模块)。字段经名查序号;
-    /// `java/lang/Class` 未见该字段(桩精简)→ 静默跳过。
-    fn populate_class_mirror_fields(&mut self, mirror: Reference, internal: &str) {
-        if let Some(comp) = component_internal_of(internal) {
-            let comp_mirror = self.intern_class_mirror(&comp);
-            self.set_class_instance_field(mirror, "componentType", Slot::Reference(comp_mirror));
-        }
-        if is_primitive_keyword(internal) {
-            self.set_class_instance_field(mirror, "primitive", Slot::Int(1));
-        }
-        // Class.module = 所属模块的 Module 镜像(命名模块按类→模块表;否则无名模块)。
-        // 对应 Class.java:1011 `private transient Module module;`,getModule() 仅 `return module`。
-        let module = self.module_for_class(internal);
-        self.set_class_instance_field(mirror, "module", Slot::Reference(module));
-    }
-
-    /// 按**字段名**(忽略描述符)在 `java/lang/Class` 扁平实例字段中查序号并写槽。
-    pub(crate) fn set_class_instance_field(&mut self, mirror: Reference, field_name: &str, slot: Slot) {
-        self.set_instance_field_by_name(mirror, "java/lang/Class", field_name, slot);
-    }
-
-    /// 按**字段名**在指定声明类的扁平实例字段中查序号并写槽。类未加载或无此字段 → 静默跳过
-    /// (供 Class 镜像字段 + Module 镜像 `name` 字段等 VM 管理实例共用)。
-    fn set_instance_field_by_name(
-        &mut self,
-        obj: Reference,
-        declaring_class: &str,
-        field_name: &str,
-        slot: Slot,
-    ) {
-        let Some(reg) = self.registry() else { return };
-        let Some(lc) = reg.get(declaring_class) else { return };
-        let Some(ord) = reg
-            .flattened_instance_fields(lc)
-            .iter()
-            .position(|f| f.name == field_name)
-        else {
-            return;
-        };
-        if let Some(Oop::Instance(i)) = self.heap_mut().get_mut(obj) {
-            i.set_field(ord, slot);
-        }
-    }
-
-    /// 分配一个默认初始化的 `java/lang/Module` Instance(须已闭包预载)。无注册表或 Module
-    /// 未加载 → 返 null 兜底。**不跑 `<init>`**(named/unnamed 两构造器分别调 defineModule0/
-    /// 仅置字段;rustj 直接置 `name` 字段,绕过 native 注册)。
-    fn alloc_module_instance(&mut self) -> Reference {
-        let Some(reg) = self.registry() else {
-            return Reference::null();
-        };
-        let Some(lc) = reg.get("java/lang/Module") else {
-            return Reference::null();
-        };
-        let inst = reg.new_instance(lc);
-        self.shared.heap.lock().unwrap().alloc(Oop::Instance(inst))
-    }
-
-    /// 命名 Module 镜像(intern:同名恒同引用)。分配真 `java/lang/Module` Instance,置 `name`
-    /// 字段 = intern(模块名)。对应 HotSpot 每个 `Module` 单例(JVM 侧 `java_lang_Module`)。
-    /// `Module.getName()` 真字节码读 `name` 字段即得模块名;`isNamed()` = `name != null`。
-    fn intern_named_module(&mut self, name: &str) -> Reference {
-        // 缓存命中:单次锁取 owned Reference,释 guard 再返(B.2.3b)。
-        if let Some(r) = self.shared.module_mirrors.lock().unwrap().get(name).copied() {
-            return r;
-        }
-        let r = self.alloc_module_instance();
-        if r.is_null() {
-            return r;
-        }
-        // 单语句锁 insert,释 guard 后再 intern/set_field(其内部 &mut self;B.2.3b)。
-        self.shared
-            .module_mirrors
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), r);
-        // 置 Module.name = intern(模块名)(真 String 实例,供 getName/equals 用)。
-        if let Ok(name_ref) = crate::runtime::interpreter::string::intern(self, name) {
-            self.set_instance_field_by_name(r, "java/lang/Module", "name", Slot::Reference(name_ref));
-        }
-        r
-    }
-
-    /// 无名模块单例(惰性)。`Module(loader)` 未名构造器语义:`name`=null(默认)、`descriptor`=null。
-    /// `getName()` 返 null、`isNamed()`=false。用户类(非模块源)经 [`Self::module_for_class`] 归此。
-    fn unnamed_module(&mut self) -> Reference {
-        // 命中:单次锁取 owned Option<Reference>(Copy),释 guard 再返(B.2.3b)。
-        if let Some(r) = *self.shared.unnamed_module.lock().unwrap() {
-            return r;
-        }
-        let r = self.alloc_module_instance();
-        if !r.is_null() {
-            *self.shared.unnamed_module.lock().unwrap() = Some(r);
-        }
-        r
-    }
-
-    /// main 线程单例(惰性,4.40):`Thread.currentThread()` 返此实例。rustj 单线程 → 唯一 "main"
-    /// 线程。`new_instance`(**不跑 `<init>`**)构造——默认字段(tid=0/name=null/threadLocals=null/
-    /// …),`Thread.<clinit>` 仅 `registerNatives()` 空操作故无重初始化负担。无注册表/Thread 未预载
-    /// → 返 null(防御,`currentThread` native 据 null 抛 InternalError)。
-    pub(crate) fn main_thread(&mut self) -> Reference {
-        if let Some(r) = self.thread.thread_ref {
-            return r;
-        }
-        let r = self.alloc_main_thread();
-        if !r.is_null() {
-            self.thread.thread_ref = Some(r);
-        }
-        r
-    }
-
-    /// 分配 main 线程 Thread Instance(`new_instance`,不跑 `<init>`),并置核心字段
-    /// `name="main"`、`tid`=递增首值(main=1)。对应 HotSpot `Threads::create_vm` 置 main 线程名
-    /// "main"、`Thread` 构造器赋 `tid`(递增计数,首=1)。`getName()`/`threadId()` 真字节码读字段
-    /// 即得。无注册表 / Thread 未预载 → 返 null。借用:先借注册表取 `&'a LoadedClass` + `new_instance`
-    /// (§6 `'a` 不绑 `&self`),出块后 `heap_mut` 分配,再 `set_instance_field_by_name` 置字段。
-    fn alloc_main_thread(&mut self) -> Reference {
-        let inst = {
-            let Some(reg) = self.shared.registry else {
-                return Reference::null();
-            };
-            let Some(lc) = reg.get("java/lang/Thread") else {
-                return Reference::null();
-            };
-            reg.new_instance(lc)
-        };
-        let r = self.heap_mut().alloc(Oop::Instance(inst));
-        if r.is_null() {
-            return r;
-        }
-        // main 线程 tid(递增首值=1);name="main"(真 String 实例,供 getName/equals)。
-        // 对应 Thread.java:268 `private final long tid`、:271 `private volatile String name`。
-        let tid = self.next_thread_tid();
-        if let Ok(name_ref) = crate::runtime::interpreter::string::intern(self, "main") {
-            self.set_instance_field_by_name(r, "java/lang/Thread", "name", Slot::Reference(name_ref));
-        }
-        self.set_instance_field_by_name(r, "java/lang/Thread", "tid", Slot::Long(tid as i64));
-        r
-    }
-
-    /// 类内部名 → 所属模块的 Module 镜像(供 Class.module 字段填充):
-    /// (1) `class_module` 命中 → 命名模块镜(load_closure 据「源容器模块」标记);
-    /// (2) 数组(`[...`)→ 组件类的模块(递归剥维);
-    /// (3) 未标记(用户类 / 原语 / 默认包)→ 无名模块。
-    fn module_for_class(&mut self, internal: &str) -> Reference {
-        if let Some(m) = self.registry().and_then(|r| r.class_module(internal)) {
-            return self.intern_named_module(&m);
-        }
-        if let Some(comp) = component_internal_of(internal) {
-            return self.module_for_class(&comp);
-        }
-        self.unnamed_module()
-    }
-
     /// 类注册表(若启用)。
     ///
     /// 返回的引用与注册表本身同寿命(`'a`),不依赖本次对 `self` 的借用——
@@ -423,7 +214,7 @@ impl<'a> Vm<'a> {
         self.shared.registry
     }
 
-    // ---- 栈轨迹捕获(4.10j+) ----
+    // ---- 栈帧法(T8 下沉 impl ThreadContext;当前 impl Vm 薄持有)----
 
     /// 入一个 Java 栈帧(类内部名 + 方法名)。`interpret_with` 入口与 `native::invoke`
     /// 入口各推一帧。克隆入 owned [`CallFrame`](各来源生命周期不一)。`pc` 初始 0,
@@ -462,157 +253,6 @@ impl<'a> Vm<'a> {
             top.pc = pc;
         }
     }
-
-    /// 在抛出点快照当前调用链,绑定到异常句柄(此刻 `call_stack` 满)。
-    /// 等价 HotSpot `Throwable.fillInStackTrace` 捕获语义——stub 异常不经真 `<init>`,
-    /// 故 `throw_exception` 直接调之;`fillInStackTrace` native 亦调之(为真 Throwable 预留)。
-    pub(crate) fn record_trace(&mut self, exc: Reference) {
-        let frames = self.thread.call_stack.clone();
-        let mut meta = self.shared.exception_meta.lock().unwrap();
-        meta.entry(exc).or_default().frames = frames;
-    }
-
-    /// 登记包裹异常的 cause(对应 `new ExceptionInInitializerError(cause)` 设 `Throwable.cause`)。
-    /// `format_trace` 据此追链渲染 "Caused by:"——被包异常**自身**的轨迹携带真正抛出点
-    /// (如 clinit 内部位置),从而顶层不再丢失根因。
-    pub(crate) fn record_cause(&mut self, wrapper: Reference, cause: Reference) {
-        let mut meta = self.shared.exception_meta.lock().unwrap();
-        meta.entry(wrapper).or_default().cause = Some(cause);
-    }
-
-    /// 登记异常的 detailMessage(对应 `Throwable.detailMessage`,如 "/ by zero")。
-    /// `format_trace` 据此在头类后渲染 ": <message>"。供 JVM 自动抛出点带上诊断消息。
-    pub(crate) fn record_message(&mut self, exc: Reference, message: impl Into<String>) {
-        let msg = message.into();
-        let mut meta = self.shared.exception_meta.lock().unwrap();
-        meta.entry(exc).or_default().message = Some(msg);
-    }
-
-    /// 解析一帧的源文件名 + 行号(`(file, line)`),供 [`Self::format_trace`] 与
-    /// `StackTraceElement.initStackTraceElements` 构造 STE。经注册表查声明类 → 同名方法且
-    /// `pc` 落在 `code` 长度内(重载按 pc 范围消歧)→ 其 `LineNumberTable` 取最大
-    /// `start_pc ≤ pc` 的 `line_number`;配合 `SourceFile` 文件名。文件名与行号**须同时**
-    /// 可得(对齐 HotSpot:无文件则不印行);否则 `None`。镜像 `Method::line_number_from_bci`。
-    pub(crate) fn frame_source(&self, f: &CallFrame) -> Option<(&str, u16)> {
-        use crate::classfile::attributes::LineNumberEntry;
-        use crate::constant_pool::ConstantPoolEntry;
-        let reg = self.registry()?;
-        let lc = reg.get(&f.class)?;
-        let file = lc.cf.source_file_name();
-        let pc = f.pc as usize;
-        // 取同名且 pc 在 code 长度内的方法,解析最大 start_pc ≤ pc 的行号。
-        let mut best: Option<(u16, u16)> = None; // (start_pc, line_number)
-        for m in &lc.cf.methods {
-            let Ok(ConstantPoolEntry::Utf8(name)) = lc.cf.constant_pool.get(m.name_index) else {
-                continue;
-            };
-            if name.as_str() != f.method {
-                continue;
-            }
-            let Some(code) = &m.code else {
-                continue;
-            };
-            if pc >= code.code.len() {
-                continue;
-            }
-            for &LineNumberEntry { start_pc, line_number } in &code.line_number_table {
-                if start_pc as usize <= pc
-                    && best.is_none_or(|(b_start, _)| start_pc >= b_start)
-                {
-                    best = Some((start_pc, line_number));
-                }
-            }
-            if best.is_some() {
-                break; // 首个匹配(含 pc)的方法即用
-            }
-        }
-        match (file, best.map(|(_, line)| line)) {
-            (Some(f_name), Some(line)) => Some((f_name, line)),
-            _ => None,
-        }
-    }
-
-    /// 渲染一帧的源位置后缀(`(File.java:LINE)`);无文件/无行号 → 空串(裸 `at Class.method`)。
-    fn frame_location_suffix(&self, f: &CallFrame) -> String {
-        match self.frame_source(f) {
-            Some((file, line)) => format!("({file}:{line})"),
-            None => String::new(),
-        }
-    }
-
-    /// 取异常捕获的调用链快照(`Throwable.fillInStackTrace` / `throw_exception` 捕获)。
-    /// 供 `Throwable.getStackTrace` native 构造 `StackTraceElement[]`。键 = 异常句柄。
-    /// 返 owned `Vec`(exception_meta 已 Mutex 化;无法返借用切片——B.2.3b)。
-    pub(crate) fn exception_frames(&self, exc: Reference) -> Option<Vec<CallFrame>> {
-        let meta = self.shared.exception_meta.lock().unwrap();
-        meta.get(&exc).map(|m| m.frames.clone())
-    }
-
-
-    /// 格式化异常的栈轨迹文本:`ExcClass[: message]\n\tat Class.method(File.java:LINE)`、
-    /// **最内(抛出)帧在前**(Java 惯例)。随后沿 cause 链每跳输出
-    /// `\nCaused by: <cause 类>[: message]` + cause 自身帧。深度上限 64(防环/失控链)。
-    /// 无快照且无 cause/message → 空串(旧契约)。供测试/诊断;顶层未捕获时自动打印。
-    pub fn format_trace(&self, exc: Reference) -> String {
-        // 头异常存在性 + 非空判定:单次锁取布尔,释 guard 后再渲染(format_trace 沿 cause 链
-        // 多次读 exception_meta + heap,持 guard 重锁 exception_meta 会自死锁;B.2.3b)。
-        let has_info = {
-            let meta = self.shared.exception_meta.lock().unwrap();
-            match meta.get(&exc) {
-                Some(m) => !(m.frames.is_empty() && m.cause.is_none() && m.message.is_none()),
-                None => return String::new(),
-            }
-        };
-        if !has_info {
-            return String::new();
-        }
-        let mut out = String::new();
-        let mut cur = Some(exc);
-        let mut head = true;
-        let mut depth = 0u32;
-        while let Some(e) = cur {
-            if depth >= 64 {
-                break;
-            }
-            depth += 1;
-            let class = match self.shared.heap.lock().unwrap().get(e) {
-                Some(Oop::Instance(i)) => i.class_name().to_string(),
-                _ => "<unknown>".to_string(),
-            };
-            if head {
-                out.push_str(&class);
-                head = false;
-            } else {
-                out.push_str("\nCaused by: ");
-                out.push_str(&class);
-            }
-            // 每跳单次锁 exception_meta 取 owned(frames/message/cause),释 guard 再渲染。
-            let (frames, message, cause) = {
-                let meta = self.shared.exception_meta.lock().unwrap();
-                match meta.get(&e) {
-                    Some(m) => (m.frames.clone(), m.message.clone(), m.cause),
-                    None => (Vec::new(), None, None),
-                }
-            };
-            if let Some(msg) = &message {
-                out.push_str(": ");
-                out.push_str(msg);
-            }
-            // call_stack 入栈序 = 外层→内层(抛出帧在最末);Java 惯例最内帧首 → 逆序打印。
-            for f in frames.iter().rev() {
-                out.push_str("\n\tat ");
-                out.push_str(&f.class);
-                out.push('.');
-                out.push_str(&f.method);
-                let loc = self.frame_location_suffix(f);
-                if !loc.is_empty() {
-                    out.push_str(&loc);
-                }
-            }
-            cur = cause;
-        }
-        out
-    }
 }
 
 impl Default for Vm<'_> {
@@ -621,117 +261,6 @@ impl Default for Vm<'_> {
             shared: Arc::new(VmShared::new(None)),
             thread: ThreadContext::new_main(),
         }
-    }
-}
-
-/// 是否为原语关键字(`int`/`void`/…;非内部描述符 `I`)。原语 Class 镜像的 intern 名即关键字。
-fn is_primitive_keyword(s: &str) -> bool {
-    matches!(
-        s,
-        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void"
-    )
-}
-
-/// 数组内部名(`[I`/`[Ljava/lang/String;`/`[[I`)的**组件类型内部名**。非数组 → `None`。
-/// 组件为原语时返关键字(`int`);为对象类时返内部名(`java/lang/String`);为嵌套数组返 `[I`。
-fn component_internal_of(name: &str) -> Option<String> {
-    let rest = name.strip_prefix('[')?;
-    match rest.chars().next()? {
-        'B' => Some("byte".into()),
-        'C' => Some("char".into()),
-        'D' => Some("double".into()),
-        'F' => Some("float".into()),
-        'I' => Some("int".into()),
-        'J' => Some("long".into()),
-        'S' => Some("short".into()),
-        'Z' => Some("boolean".into()),
-        'L' => Some(rest.strip_prefix('L')?.strip_suffix(';')?.to_string()),
-        '[' => Some(rest.to_string()),
-        _ => None,
-    }
-}
-
-// ---- 对象管程(monitorenter/monitorexit/holdsLock;Layer 4.41 / Phase B.1)----
-impl<'a> Vm<'a> {
-    /// `monitorenter`(JVMS §6.5):进入 `obj` 管程。null → NPE;owner = 当前线程(`main_thread`);
-    /// 未锁 → 记 owner/count=1;已持 → count+1(重入)。单线程下 owner 恒为当前线程、无争用
-    /// (Phase B.3 真并发:被他人持有时阻塞至释放;rustj 当前单线程直接重入)。
-    pub(crate) fn monitor_enter(&mut self, obj: Reference) -> Result<(), VmError> {
-        if obj.is_null() {
-            return Err(crate::runtime::interpreter::throw_exception(
-                self,
-                "java/lang/NullPointerException",
-            ));
-        }
-        let owner = self.main_thread();
-        // 锁 monitors 仅覆盖本 match 块:body 不调 &mut self,guard 出块即释(B.2.3b)。
-        use std::collections::hash_map::Entry;
-        let mut monitors = self.shared.monitors.lock().unwrap();
-        match monitors.entry(obj) {
-            Entry::Occupied(mut e) => e.get_mut().count += 1,
-            Entry::Vacant(e) => {
-                e.insert(MonitorState { owner, count: 1 });
-            }
-        }
-        Ok(())
-    }
-
-    /// `monitorexit`(JVMS §6.5):退出 `obj` 管程。null → NPE;当前线程持有(count>0)→ count-1
-    /// (归零释放);未持有 / owner 不符 → `IllegalMonitorStateException`。
-    pub(crate) fn monitor_exit(&mut self, obj: Reference) -> Result<(), VmError> {
-        if obj.is_null() {
-            return Err(crate::runtime::interpreter::throw_exception(
-                self,
-                "java/lang/NullPointerException",
-            ));
-        }
-        let owner = self.main_thread();
-        // held 判定:锁 monitors 取 bool,出块释 guard 后再 throw(避免持 guard 调 &mut self)。
-        let held = {
-            let monitors = self.shared.monitors.lock().unwrap();
-            monitors
-                .get(&obj)
-                .is_some_and(|m| m.owner == owner && m.count > 0)
-        };
-        if !held {
-            return Err(crate::runtime::interpreter::throw_exception(
-                self,
-                "java/lang/IllegalMonitorStateException",
-            ));
-        }
-        // 再锁执行 count-1/释放(与 held 判定不重叠,无死锁)。
-        let mut monitors = self.shared.monitors.lock().unwrap();
-        let count = monitors.get(&obj).unwrap().count;
-        if count == 1 {
-            monitors.remove(&obj);
-        } else {
-            monitors.get_mut(&obj).unwrap().count -= 1;
-        }
-        Ok(())
-    }
-
-    /// `Thread.holdsLock(Object)`(Thread.java:2178):当前线程是否持有 `obj` 管程。
-    /// null → NPE(JDK:`holdsLock(null)` 抛 NPE)。
-    pub(crate) fn holds_lock(&mut self, obj: Reference) -> Result<bool, VmError> {
-        if obj.is_null() {
-            return Err(crate::runtime::interpreter::throw_exception(
-                self,
-                "java/lang/NullPointerException",
-            ));
-        }
-        let owner = self.main_thread();
-        let monitors = self.shared.monitors.lock().unwrap();
-        Ok(monitors
-            .get(&obj)
-            .is_some_and(|m| m.owner == owner && m.count > 0))
-    }
-
-    /// 取并递增下一线程 tid(供 Thread 镜像 tid 字段;main 线程取首值 1,后续递增)。
-    pub(crate) fn next_thread_tid(&mut self) -> u64 {
-        let mut tid = self.shared.next_tid.lock().unwrap();
-        let v = *tid;
-        *tid += 1;
-        v
     }
 }
 
@@ -878,4 +407,3 @@ mod sync_assertions {
         );
     }
 }
-

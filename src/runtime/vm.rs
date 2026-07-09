@@ -96,12 +96,12 @@ struct VmShared<'a> {
     /// 对象堆(Mutex:Phase B.2.3b 共享态——`Arc<VmShared>` 多线程并发改堆的前置)。
     heap: Mutex<Heap>,
     registry: Option<&'a ClassRegistry>,
-    /// 字符串 intern 池(4.8):文本 → 堆引用,以本 Vm 的堆为后盾。
-    string_pool: StringPool,
+    /// 字符串 intern 池(4.8):文本 → 堆引用,以本 Vm 的堆为后盾。Mutex(B.2.3b 共享态)。
+    string_pool: Mutex<StringPool>,
     /// 对象管程(对象句柄 → 锁状态)。跨线程共享态(B.2.3b 加 Mutex);单线程下 owner 恒为当前线程。
-    pub(crate) monitors: HashMap<Reference, MonitorState>,
-    /// 下一线程 tid(Thread.tid 递增;main 线程=1)。
-    next_tid: u64,
+    pub(crate) monitors: Mutex<HashMap<Reference, MonitorState>>,
+    /// 下一线程 tid(Thread.tid 递增;main 线程=1)。Mutex(B.2.3b 共享态;T7 并入 ThreadManager)。
+    next_tid: Mutex<u64>,
     /// 异常 → 元数据(帧 / cause / detailMessage),键 = 异常对象句柄。
     exception_meta: HashMap<Reference, ExceptionMeta>,
     /// Class 镜像 intern 表(4.10t):内部类名(`java/lang/Foo`、`int`、`[I` …)→ 唯一 Class
@@ -127,9 +127,9 @@ impl<'a> VmShared<'a> {
         Self {
             heap: Mutex::new(Heap::new()),
             registry,
-            string_pool: StringPool::new(),
-            monitors: HashMap::new(),
-            next_tid: 1,
+            string_pool: Mutex::new(StringPool::new()),
+            monitors: Mutex::new(HashMap::new()),
+            next_tid: Mutex::new(1),
             exception_meta: HashMap::new(),
             class_mirrors: HashMap::new(),
             mirror_class: HashMap::new(),
@@ -179,13 +179,13 @@ impl<'a> Vm<'a> {
 
     /// 字符串 intern 池(4.8/4.10i):文本 → 堆引用的纯备忘;真 String 实例构造在
     /// interpreter(`string::intern`),本池仅保证「同文本恒同引用」。
-    pub(crate) fn string_pool(&self) -> &StringPool {
-        &self.shared.string_pool
+    pub(crate) fn string_pool(&self) -> MutexGuard<'_, StringPool> {
+        self.shared.string_pool.lock().unwrap()
     }
 
-    /// 字符串 intern 池(可变)。
-    pub(crate) fn string_pool_mut(&mut self) -> &mut StringPool {
-        &mut self.shared.string_pool
+    /// 字符串 intern 池(可变;经 MutexGuard 内部可变性,`&self` 即可,同 `heap_mut`)。
+    pub(crate) fn string_pool_mut(&self) -> MutexGuard<'_, StringPool> {
+        self.shared.string_pool.lock().unwrap()
     }
 
     /// Class 镜像 intern(4.10t 起;4.12 退役 `Oop::Class`):同一内部类名恒返回同一 Class
@@ -618,8 +618,10 @@ impl<'a> Vm<'a> {
             ));
         }
         let owner = self.main_thread();
+        // 锁 monitors 仅覆盖本 match 块:body 不调 &mut self,guard 出块即释(B.2.3b)。
         use std::collections::hash_map::Entry;
-        match self.shared.monitors.entry(obj) {
+        let mut monitors = self.shared.monitors.lock().unwrap();
+        match monitors.entry(obj) {
             Entry::Occupied(mut e) => e.get_mut().count += 1,
             Entry::Vacant(e) => {
                 e.insert(MonitorState { owner, count: 1 });
@@ -638,21 +640,26 @@ impl<'a> Vm<'a> {
             ));
         }
         let owner = self.main_thread();
-        let held = self.shared
-            .monitors
-            .get(&obj)
-            .is_some_and(|m| m.owner == owner && m.count > 0);
+        // held 判定:锁 monitors 取 bool,出块释 guard 后再 throw(避免持 guard 调 &mut self)。
+        let held = {
+            let monitors = self.shared.monitors.lock().unwrap();
+            monitors
+                .get(&obj)
+                .is_some_and(|m| m.owner == owner && m.count > 0)
+        };
         if !held {
             return Err(crate::runtime::interpreter::throw_exception(
                 self,
                 "java/lang/IllegalMonitorStateException",
             ));
         }
-        let count = self.shared.monitors.get(&obj).unwrap().count;
+        // 再锁执行 count-1/释放(与 held 判定不重叠,无死锁)。
+        let mut monitors = self.shared.monitors.lock().unwrap();
+        let count = monitors.get(&obj).unwrap().count;
         if count == 1 {
-            self.shared.monitors.remove(&obj);
+            monitors.remove(&obj);
         } else {
-            self.shared.monitors.get_mut(&obj).unwrap().count -= 1;
+            monitors.get_mut(&obj).unwrap().count -= 1;
         }
         Ok(())
     }
@@ -667,17 +674,18 @@ impl<'a> Vm<'a> {
             ));
         }
         let owner = self.main_thread();
-        Ok(self.shared
-            .monitors
+        let monitors = self.shared.monitors.lock().unwrap();
+        Ok(monitors
             .get(&obj)
             .is_some_and(|m| m.owner == owner && m.count > 0))
     }
 
     /// 取并递增下一线程 tid(供 Thread 镜像 tid 字段;main 线程取首值 1,后续递增)。
     pub(crate) fn next_thread_tid(&mut self) -> u64 {
-        let tid = self.shared.next_tid;
-        self.shared.next_tid += 1;
-        tid
+        let mut tid = self.shared.next_tid.lock().unwrap();
+        let v = *tid;
+        *tid += 1;
+        v
     }
 }
 

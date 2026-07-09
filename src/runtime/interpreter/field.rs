@@ -6,8 +6,10 @@
 //! 留待 4.2(随类层次与虚分派)。
 //!
 //! 实例字段每字段一槽(见 [`crate::oops`]);cat-2(long/double)在 getfield/putfield
-//! 边界做类型转换。静态字段经 [`LoadedClass::static_storage`](RefCell) 内部可变性写入——
-//! 对应 HotSpot `InstanceKlass` 中就地持有的静态字段区。
+//! 边界做类型转换。静态字段经 [`LoadedClass::static_storage`](`Mutex`) 内部可变性写入——
+//! 对应 HotSpot `InstanceKlass` 中就地持有的静态字段区。Phase B.2.1:`Mutex`(替 `RefCell`)
+//! 使 `LoadedClass: Sync`;getstatic/putstatic 各 `lock().unwrap()` 单语句即锁即释,不持 guard
+//! 跨递归(`ensure_class_initialized` 已先返回)→ 无重入死锁。
 
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_field_descriptor, FieldType};
@@ -245,7 +247,8 @@ pub(super) fn get_static(
         .ok_or(VmError::BadConstant("getstatic 未找到静态字段"))?;
     let slot = *lc
         .static_storage
-        .borrow()
+        .lock()
+        .unwrap()
         .get(ordinal)
         .ok_or(VmError::BadConstant("getstatic 静态槽越界"))?;
     push_field_value(frame, &ft, slot)?;
@@ -270,7 +273,7 @@ pub(super) fn put_static(
         .resolve_static_field(&class_name, &field_name, &ft)
         .ok_or(VmError::BadConstant("putstatic 未找到静态字段"))?;
     let value = pop_field_value(frame, &ft)?;
-    lc.static_storage.borrow_mut()[ordinal] = value;
+    lc.static_storage.lock().unwrap()[ordinal] = value;
     Ok(())
 }
 

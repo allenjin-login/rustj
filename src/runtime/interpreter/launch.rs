@@ -97,7 +97,7 @@ fn install_java_lang_access(vm: &mut Vm<'_>) -> Result<(), VmError> {
 /// 1. 分配空 `HashMap` Instance(table=null 默认;`HashMap.get` 短路返 null、`HashMap.put` 首次
 ///    `resize` 分配 table —— 单线程下功能完整)。
 /// 2. 分配 `Properties` Instance,置其 `map` 字段 = 该 HashMap(Properties.put/get/remove 委派之)。
-/// 3. `System.props` 静态字段 ← 该 Properties Instance(沿超类链解析声明类 + 序号,RefCell 写)。
+/// 3. `System.props` 静态字段 ← 该 Properties Instance(沿超类链解析声明类 + 序号,Mutex 写)。
 /// 4. 经 `Properties.put(Object,Object)Object` 真字节码逐项写入 OS 派生的 launcher 系统属性
 ///    (Layer 4.26):`file.separator`/`path.separator`/`user.dir`/…—— 解锁 `WinNTFileSystem.<init>:95`
 ///    等 `props.getProperty("file.separator").charAt(0)`(空 props → null → NPE)。
@@ -141,10 +141,10 @@ fn install_system_props(vm: &mut Vm<'_>) -> Result<(), VmError> {
     };
 
     // 3) System.props = props_ref(对应 `props = createProperties(tempProps)`)。resolve_static_field
-    //    沿超类链解析声明类(System 本身)+ 序号;System 未加载 → 返 None 静默跳过。经 RefCell 写。
+    //    沿超类链解析声明类(System 本身)+ 序号;System 未加载 → 返 None 静默跳过。经 Mutex 写。
     let ft = FieldType::Class("java/util/Properties".to_string());
     if let Some((sys_lc, props_ord)) = reg.resolve_static_field("java/lang/System", "props", &ft) {
-        sys_lc.static_storage.borrow_mut()[props_ord] = Slot::Reference(props_ref);
+        sys_lc.static_storage.lock().unwrap()[props_ord] = Slot::Reference(props_ref);
     }
 
     // 4) Phase 1 launcher 系统属性(对应真 launcher 经 native 注入、`System.initPhase1` 装入 props)。
@@ -305,7 +305,7 @@ pub fn bootstrap_module_system(vm: &mut Vm<'_>) -> Result<(), VmError> {
     };
 
     // 2) System.bootLayer = layer(对应 `bootLayer = ModuleBootstrap.boot();`)。沿超类链
-    //    解析(声明类,序号)——bootLayer 声明于 System 本身;经 RefCell 写其 static_storage。
+    //    解析(声明类,序号)——bootLayer 声明于 System 本身;经 Mutex 写其 static_storage。
     let ft = FieldType::Class("java/lang/ModuleLayer".to_string());
     let (sys_lc, boot_layer_ord) = {
         let reg = vm
@@ -314,7 +314,7 @@ pub fn bootstrap_module_system(vm: &mut Vm<'_>) -> Result<(), VmError> {
         reg.resolve_static_field("java/lang/System", "bootLayer", &ft)
             .ok_or(VmError::BadConstant("Phase 2:System.bootLayer 静态字段未找到"))?
     };
-    sys_lc.static_storage.borrow_mut()[boot_layer_ord] = Slot::Reference(layer_ref);
+    sys_lc.static_storage.lock().unwrap()[boot_layer_ord] = Slot::Reference(layer_ref);
 
     // 3) invokestatic VM.initLevel(I)V —— 置 2(MODULE_SYSTEM_INITED)。Phase 1 已置 1,
     //    单调上行校验(1 < 2 ≤ SYSTEM_SHUTDOWN)通过。

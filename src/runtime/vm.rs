@@ -726,3 +726,25 @@ mod monitor_tests {
     }
 }
 
+#[cfg(test)]
+mod sync_assertions {
+    //! Layer 4.42 / Phase B.2.1:`Vm` 须为 `Sync`——B.3 真并发(`Arc<Mutex<VmShared>>:
+    //! Send+Sync`)的前置。当前 `Vm<'a>` 经 `registry: Option<&'a ClassRegistry>` 借注册表,
+    //! 而 `ClassRegistry`/`LoadedClass` 持 `RefCell`(static_storage/flat_cache/init_state/
+    //! class_modules),`RefCell: !Sync` → `Vm: !Sync` → 此断言**编译失败**(RED)。把四处
+    //! `RefCell` 改 `Mutex` 后 `ClassRegistry: Sync` → `Vm: Sync` → 编译通过(GREEN)。
+    use super::Vm;
+    use crate::oops::ClassRegistry;
+
+    fn assert_sync<T: ?Sized + Sync>() {}
+
+    /// `Vm<'a>: Sync` 蕴含 `&'a ClassRegistry: Sync` → `ClassRegistry: Sync`。
+    #[test]
+    fn vm_is_sync() {
+        fn check<'a>(_: &'a ClassRegistry) {
+            assert_sync::<Vm<'a>>();
+        }
+        let _ = check;
+    }
+}
+

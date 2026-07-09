@@ -229,13 +229,13 @@ mod tests {
         let mut vm = Vm::new(&reg);
         // <clinit> 执行前:静态字段为默认 0。
         assert_eq!(
-            *reg.get("Cls").unwrap().static_storage.borrow(),
+            *reg.get("Cls").unwrap().static_storage.lock().unwrap(),
             vec![Slot::Int(0)]
         );
         ensure_class_initialized(&mut vm, "Cls").unwrap();
         // <clinit> 的 putstatic 写入 5,状态推进到 Done。
         assert_eq!(
-            *reg.get("Cls").unwrap().static_storage.borrow(),
+            *reg.get("Cls").unwrap().static_storage.lock().unwrap(),
             vec![Slot::Int(5)]
         );
         assert_eq!(reg.get("Cls").unwrap().init_state(), InitState::Done);
@@ -250,7 +250,7 @@ mod tests {
         // 再次触发:Done → 直接返回,不重跑 <clinit>(静态值仍为 5,非 10)。
         ensure_class_initialized(&mut vm, "Cls").unwrap();
         assert_eq!(
-            *reg.get("Cls").unwrap().static_storage.borrow(),
+            *reg.get("Cls").unwrap().static_storage.lock().unwrap(),
             vec![Slot::Int(5)]
         );
     }

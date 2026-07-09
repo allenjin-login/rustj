@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use crate::classfile::ClassFileError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
@@ -23,8 +23,9 @@ pub struct ResolvedField {
     pub descriptor: FieldType,
 }
 
-/// 类初始化状态(JVMS §5.5 子集)。`RefCell` 承载:类初始化是类级可变状态(类比
-/// `static_storage`),而 `Vm` 以不可变借用持注册表,只能经内部可变性改之。
+/// 类初始化状态(JVMS §5.5 子集)。`Mutex` 承载:类初始化是类级可变状态(类比
+/// `static_storage`),而 `Vm` 以不可变借用持注册表,只能经内部可变性改之;`Mutex`(非
+/// `RefCell`)使其 `Sync`(Phase B.2.1:为 B.3 真并发共享 `Arc<Mutex<VmShared>>` 铺路)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitState {
     /// 尚未初始化(默认)。
@@ -42,18 +43,21 @@ pub enum InitState {
 /// `instance_fields` 为**本类声明**的实例字段;**继承字段**经
 /// [`ClassRegistry::flattened_instance_fields`] 惰性扁平化(超类链 ++ 本类)并缓存于 `flat_cache`。
 ///
-/// `static_storage` 用 [`RefCell`] 承载:静态字段是**类级可变状态**(putstatic 写入),
+/// `static_storage` 用 [`Mutex`] 承载:静态字段是**类级可变状态**(putstatic 写入),
 /// 对应 HotSpot `InstanceKlass` 中就地持有的静态字段区;注册表以不可变引用暴露
-/// `LoadedClass`,静态字段经 `RefCell` 内部可变性写入。
+/// `LoadedClass`,静态字段经 `Mutex` 内部可变性写入。`Mutex`(Phase B.2.1,替 `RefCell`)
+/// 使 `LoadedClass: Sync`——B.3 真并发共享注册表的前置。锁粒度为**单字段单语句**:
+/// getstatic/putstatic/launch 各 `lock().unwrap()` 后即写即释,**不持 guard 跨 `interpret_with`
+/// 递归**(clinit 的 putstatic 经同路径;`ensure_class_initialized` 先 `set_init_state` 释锁再跑 clinit)→ 无重入死锁。
 pub struct LoadedClass {
     pub cf: ClassFile,
     instance_fields: Vec<ResolvedField>,
     static_fields: Vec<ResolvedField>,
-    pub static_storage: RefCell<Vec<Slot>>,
+    pub static_storage: Mutex<Vec<Slot>>,
     super_class_name: Option<String>,
-    flat_cache: RefCell<Option<Vec<ResolvedField>>>,
+    flat_cache: Mutex<Option<Vec<ResolvedField>>>,
     /// 类初始化状态(4.9 `<clinit>`):首次 active use 时由解释器推进。
-    init_state: RefCell<InitState>,
+    init_state: Mutex<InitState>,
     /// 是否为**合成引导桩**(非从真实 `.class` 解析)。由 [`ClassRegistry::load_stub`] 置位;
     /// 真类(经 `load`/`load_or_replace` 从容器解析)恒为 `false`。闭包加载器据此识别「待真类
     /// 覆盖」的桩并跳过已是真类者(幂等)。
@@ -91,12 +95,12 @@ impl LoadedClass {
 
     /// 类初始化状态(4.9)。
     pub fn init_state(&self) -> InitState {
-        *self.init_state.borrow()
+        *self.init_state.lock().unwrap()
     }
 
-    /// 设置类初始化状态(4.9)。经 `RefCell` 内部可变性。
+    /// 设置类初始化状态(4.9)。经 `Mutex` 内部可变性。
     pub fn set_init_state(&self, state: InitState) {
-        *self.init_state.borrow_mut() = state;
+        *self.init_state.lock().unwrap() = state;
     }
 
     /// 是否为合成引导桩(非真实 `.class`)。真类恒为 `false`。
@@ -128,10 +132,10 @@ impl LoadedClass {
             cf,
             instance_fields: layout.instance_fields,
             static_fields: layout.static_fields,
-            static_storage: RefCell::new(layout.static_storage),
+            static_storage: Mutex::new(layout.static_storage),
             super_class_name,
-            flat_cache: RefCell::new(None),
-            init_state: RefCell::new(InitState::NotStarted),
+            flat_cache: Mutex::new(None),
+            init_state: Mutex::new(InitState::NotStarted),
             is_synthetic_stub: false,
         })
     }
@@ -148,16 +152,17 @@ struct FieldLayout {
 pub struct ClassRegistry {
     classes: HashMap<String, LoadedClass>,
     /// 类内部名 → 所属模块名(由 `load_closure` 据「源容器模块」标记;`Class.getModule()` 用)。
-    /// `None`(未标记)= 无名模块。RefCell 内部可变:注册表以不可变借用暴露,经此写回
-    /// (CLAUDE.md §6 类级可变状态惯例,同 `static_storage`)。
-    class_modules: RefCell<HashMap<String, String>>,
+    /// `None`(未标记)= 无名模块。`Mutex` 内部可变:注册表以不可变借用暴露,经此写回
+    /// (CLAUDE.md §6 类级可变状态惯例,同 `static_storage`);`Mutex`(替 `RefCell`)使其 `Sync`
+    /// (Phase B.2.1)。锁粒度单语句(`set_class_module`/`class_module` 即锁即释),无重入死锁。
+    class_modules: Mutex<HashMap<String, String>>,
 }
 
 impl ClassRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             classes: HashMap::new(),
-            class_modules: RefCell::new(HashMap::new()),
+            class_modules: Mutex::new(HashMap::new()),
         };
         // 预装标准 java.lang.* 异常层次(合成桩),使 catch(Throwable/Exception/NPE …)
         // 与运行时异常抛出无需额外加载即可解析。Vm 以不可变借用持注册表,故须在构造期装好。
@@ -207,24 +212,27 @@ impl ClassRegistry {
     }
 
     /// 标记一个类所属的**命名模块**(由 `load_closure` 据源容器的 `module-info` 推导)。
-    /// 未标记的类视为无名模块(`Class.getModule()` 返无名 Module)。RefCell 内部可变:
-    /// 注册表经不可变借用暴露,经此写回(§6 惯例)。
+    /// 未标记的类视为无名模块(`Class.getModule()` 返无名 Module)。`Mutex` 内部可变:
+    /// 注册表经不可变借用暴露,经此写回(§6 惯例);即锁即释,无重入死锁。
     pub fn set_class_module(&self, class_name: &str, module_name: &str) {
         self.class_modules
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(class_name.to_string(), module_name.to_string());
     }
 
     /// 类所属命名模块名(`None` = 未标记 → 无名模块)。供 `Vm::module_for_class` 查模块镜像。
     pub fn class_module(&self, class_name: &str) -> Option<String> {
-        self.class_modules.borrow().get(class_name).cloned()
+        self.class_modules.lock().unwrap().get(class_name).cloned()
     }
 
     /// 扁平化实例字段(超类链 ++ 本类),惰性缓存于 `flat_cache`。
     ///
     /// 超类链置前、本类在后;`java/lang/Object`(未加载)作根终止。解耦加载顺序。
+    /// `flat_cache` 经 `Mutex`:`borrow().clone()`/`borrow_mut()=` 均**单语句即锁即释**;
+    /// 超类递归(`flattened_instance_fields(super_lc)`)在两次锁之间进行、不持 guard → 无重入死锁。
     pub fn flattened_instance_fields(&self, lc: &LoadedClass) -> Vec<ResolvedField> {
-        if let Some(cached) = lc.flat_cache.borrow().clone() {
+        if let Some(cached) = lc.flat_cache.lock().unwrap().clone() {
             return cached;
         }
         let mut fields = Vec::new();
@@ -235,7 +243,7 @@ impl ClassRegistry {
             fields.extend(self.flattened_instance_fields(super_lc));
         }
         fields.extend(lc.instance_fields.iter().cloned());
-        *lc.flat_cache.borrow_mut() = Some(fields.clone());
+        *lc.flat_cache.lock().unwrap() = Some(fields.clone());
         fields
     }
 

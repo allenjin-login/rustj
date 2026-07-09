@@ -145,7 +145,7 @@ mod tests {
         };
         assert!(!mirror.is_null(), "getCallerClass 不得返 null(栈深足够)");
         assert_eq!(
-            vm.mirror_internal_name(mirror),
+            vm.mirror_internal_name(mirror).as_deref(),
             Some("java/lang/Object"),
             "getCallerClass 须返底帧(调用者的调用者)的 Class"
         );

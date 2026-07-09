@@ -107,11 +107,13 @@ struct VmShared<'a> {
     /// Class 镜像 intern 表(4.10t):内部类名(`java/lang/Foo`、`int`、`[I` …)→ 唯一 Class
     /// 镜像引用。对应 HotSpot 每个 `Klass` 持有单一 `_java_mirror`(Class 对象)。保证
     /// `Foo.class == Foo.class`、`obj.getClass() == Foo.class` 等 Class 对象身份相等。
-    class_mirrors: HashMap<String, Reference>,
+    /// Mutex(B.2.3b 共享态)。
+    class_mirrors: Mutex<HashMap<String, Reference>>,
     /// Class 镜像反查表(4.12):镜像引用 → 所表示类型的内部名。供 Class native
     /// (`getSuperclass`/`isInstance`/`isAssignableFrom`/`initClassName`…)由镜像反查类。
     /// 镜像现为真 `java/lang/Class` Instance,Instance 本身不记所表示的类 → 须此表。
-    mirror_class: HashMap<Reference, String>,
+    /// Mutex(B.2.3b 共享态)。
+    mirror_class: Mutex<HashMap<Reference, String>>,
     /// 命名 Module 镜像表(4.14a):模块名(`java.base`)→ 真 `java/lang/Module` Instance 引用。
     /// 同名模块恒同引用(对应 HotSpot 每个 `Module` 类实例单例)。`name` 字段填模块名;
     /// 无名模块走 [`Vm::unnamed_module`](单例,`name` 字段 null)。
@@ -131,8 +133,8 @@ impl<'a> VmShared<'a> {
             monitors: Mutex::new(HashMap::new()),
             next_tid: Mutex::new(1),
             exception_meta: Mutex::new(HashMap::new()),
-            class_mirrors: HashMap::new(),
-            mirror_class: HashMap::new(),
+            class_mirrors: Mutex::new(HashMap::new()),
+            mirror_class: Mutex::new(HashMap::new()),
             module_mirrors: HashMap::new(),
             unnamed_module: None,
         }
@@ -197,21 +199,32 @@ impl<'a> Vm<'a> {
     /// `module` 由 [`Self::populate_class_mirror_fields`](4.14a)按类所属模块填。
     /// `name` 由 `getName` 真字节码首次调用时经 `initClassName` 懒填。
     pub(crate) fn intern_class_mirror(&mut self, name: &str) -> Reference {
-        if let Some(r) = self.shared.class_mirrors.get(name) {
-            return *r;
+        // 缓存命中:单次锁取 owned Reference,释 guard 再返(drop-before-recurse;B.2.3b)。
+        if let Some(r) = self.shared.class_mirrors.lock().unwrap().get(name).copied() {
+            return r;
         }
         // 分配真 java/lang/Class Instance(须已加载:引导 Class 桩或经闭包预载的真 Class)。
         let r = self.alloc_class_mirror_instance();
         // 先缓存再填字段:数组组件互递归([LC→C、[[I→[I)经缓存命中终止。
-        self.shared.class_mirrors.insert(name.to_string(), r);
-        self.shared.mirror_class.insert(r, name.to_string());
+        // 两表分别单语句锁 insert,释 guard 后再 populate(其递归 intern 会再锁→须 drop)。
+        self.shared
+            .class_mirrors
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), r);
+        self.shared
+            .mirror_class
+            .lock()
+            .unwrap()
+            .insert(r, name.to_string());
         self.populate_class_mirror_fields(r, name);
         r
     }
 
     /// 镜像所表示类型的内部名(供 Class native 反查)。非镜像引用 → `None`。
-    pub(crate) fn mirror_internal_name(&self, r: Reference) -> Option<&str> {
-        self.shared.mirror_class.get(&r).map(String::as_str)
+    /// 返 owned `String`(mirror_class 已 Mutex 化,无法返借用 &str;B.2.3b)。
+    pub(crate) fn mirror_internal_name(&self, r: Reference) -> Option<String> {
+        self.shared.mirror_class.lock().unwrap().get(&r).cloned()
     }
 
     /// 分配一个默认初始化的 `java/lang/Class` Instance。无注册表或 `java/lang/Class` 未加载

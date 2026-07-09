@@ -89,12 +89,12 @@ pub(crate) fn run_with_depth<R>(
     vm: &mut Vm<'_>,
     f: impl FnOnce(&mut Vm<'_>) -> Result<R, VmError>,
 ) -> Result<R, VmError> {
-    if vm.frame_depth >= vm.stack_limit {
+    if vm.thread.frame_depth >= vm.thread.stack_limit {
         return Err(throw_exception(vm, "java/lang/StackOverflowError"));
     }
-    vm.frame_depth += 1;
+    vm.thread.frame_depth += 1;
     let r = f(vm);
-    vm.frame_depth -= 1;
+    vm.thread.frame_depth -= 1;
     r
 }
 
@@ -1075,14 +1075,14 @@ mod tests {
         // Ok 路径:进入 +1、退出 −1(嵌套两层验证递增)。
         let mut vm = crate::runtime::Vm::default();
         let r = super::run_with_depth(&mut vm, |vm| {
-            let d1 = vm.frame_depth;
-            let inner = super::run_with_depth(vm, |vm| Ok(vm.frame_depth));
+            let d1 = vm.thread.frame_depth;
+            let inner = super::run_with_depth(vm, |vm| Ok(vm.thread.frame_depth));
             assert_eq!(d1, 1);
             assert_eq!(inner.unwrap(), 2);
             Ok(())
         });
         assert!(r.is_ok());
-        assert_eq!(vm.frame_depth, 0);
+        assert_eq!(vm.thread.frame_depth, 0);
     }
 
     #[test]
@@ -1101,6 +1101,6 @@ mod tests {
             panic!("StackOverflowError 应为由引导桩分配的实例");
         };
         assert_eq!(i.class_name(), "java/lang/StackOverflowError");
-        assert_eq!(vm.frame_depth, 0);
+        assert_eq!(vm.thread.frame_depth, 0);
     }
 }

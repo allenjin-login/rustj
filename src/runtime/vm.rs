@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use crate::oops::{ClassRegistry, Oop};
 use crate::runtime::heap::Heap;
 use crate::runtime::string_pool::StringPool;
-use crate::runtime::{Reference, Slot};
+use crate::runtime::{Reference, Slot, VmError};
 
 /// 默认帧深度上限。高于 ackermann(3,3) 的递归深度(~120),正常小测试不会误触;
 /// 可经 [`Vm::with_stack_limit`] 调整(SOE 测试用小值快速触发)。
@@ -30,6 +30,45 @@ pub struct CallFrame {
     pub class: String,
     pub method: String,
     pub pc: u32,
+}
+
+/// 每线程执行上下文(对应 HotSpot `JavaThread` 的栈区 + 线程身份)。Vm 单线程入口下,Vm 持
+/// "当前线程"的 ThreadContext;Phase B.3 真并发后每 OS 线程一个,经 `Arc<Mutex<VmShared>>` 共享。
+///
+/// 持 Java 调用栈、帧深度(SOE 检测)、上限、线程镜像句柄——皆为**线程隔离态**(CLAUDE.md §6
+/// "调用栈归属线程"的落实,Phase B.1 起 call_stack 不再是 Vm 顶层字段)。镜像句柄惰性分配:
+/// `Vm::new` 时 Thread 类未必加载,首调 `currentThread` 时经 [`Vm::main_thread`] 填入。
+pub(crate) struct ThreadContext {
+    /// 当前活动 Java 调用栈(逐帧 push/pop),供栈轨迹捕获。
+    pub(crate) call_stack: Vec<CallFrame>,
+    /// 当前嵌套帧数(进入一帧 +1,退出 −1;SOE 检测用)。
+    pub(crate) frame_depth: u32,
+    /// 帧深度上限;`frame_depth >= stack_limit` 时再调用 → StackOverflowError。
+    pub(crate) stack_limit: u32,
+    /// 此上下文对应的 `java/lang/Thread` 镜像句柄(惰性;`Thread.currentThread` 返此)。
+    pub(crate) thread_ref: Option<Reference>,
+}
+
+impl ThreadContext {
+    /// 主线程上下文(main 线程单例;镜像句柄惰性,thread_ref 初始 None)。
+    pub(crate) fn new_main() -> Self {
+        Self {
+            call_stack: Vec::new(),
+            frame_depth: 0,
+            stack_limit: DEFAULT_STACK_LIMIT,
+            thread_ref: None,
+        }
+    }
+}
+
+/// 对象管程状态(对应 HotSpot 对象头 mark word 的锁态子集;Layer 4.41 / Phase B.1)。
+///
+/// `owner` = 持有者线程的 Thread 镜像句柄;`count` = 重入计数(同线程多次 monitorenter
+/// 累加,monitorexit 减,归零释放)。单线程下 owner 恒为当前线程;B.3 真并发后多线程争用。
+#[derive(Clone, Copy)]
+pub(crate) struct MonitorState {
+    pub(crate) owner: Reference,
+    pub(crate) count: u32,
 }
 
 /// 异常的元数据(`Throwable` 三要素的 rustj 侧镜像):捕获帧 / cause / detailMessage。
@@ -54,11 +93,11 @@ pub struct Vm<'a> {
     /// 字符串 intern 池(4.8):文本 → 堆引用,以本 Vm 的堆为后盾。
     string_pool: StringPool,
     /// 当前嵌套帧数(进入一帧 +1,退出 −1)。
-    pub(crate) frame_depth: u32,
-    /// 帧深度上限;`frame_depth >= stack_limit` 时再调用 → 抛 `StackOverflowError`。
-    pub(crate) stack_limit: u32,
-    /// 当前活动 Java 调用栈(逐帧 push/pop),供栈轨迹捕获。
-    call_stack: Vec<CallFrame>,
+    pub(crate) thread: ThreadContext,
+    /// 对象管程(对象句柄 → 锁状态)。跨线程共享态(B.2 加 Mutex);单线程下 owner 恒为当前线程。
+    pub(crate) monitors: HashMap<Reference, MonitorState>,
+    /// 下一线程 tid(Thread.tid 递增;main 线程=1)。
+    next_tid: u64,
     /// 异常 → 元数据(帧 / cause / detailMessage),键 = 异常对象句柄。
     exception_meta: HashMap<Reference, ExceptionMeta>,
     /// Class 镜像 intern 表(4.10t):内部类名(`java/lang/Foo`、`int`、`[I` …)→ 唯一 Class
@@ -75,9 +114,6 @@ pub struct Vm<'a> {
     module_mirrors: HashMap<String, Reference>,
     /// 无名模块单例引用(惰性分配,4.14a)。`Module.getName()` 返 null → `isNamed()`=false。
     unnamed_module: Option<Reference>,
-    /// main 线程单例引用(惰性分配,4.40):`Thread.currentThread()` 返此实例。rustj 单线程 →
-    /// 唯一 "main" 线程;`new_instance`(**不跑 `<init>`**)构造,默认字段(tid=0/name=null/…)。
-    main_thread: Option<Reference>,
 }
 
 impl<'a> Vm<'a> {
@@ -87,21 +123,20 @@ impl<'a> Vm<'a> {
             heap: Heap::new(),
             registry: Some(registry),
             string_pool: StringPool::new(),
-            frame_depth: 0,
-            stack_limit: DEFAULT_STACK_LIMIT,
-            call_stack: Vec::new(),
+            thread: ThreadContext::new_main(),
+            monitors: HashMap::new(),
+            next_tid: 1,
             exception_meta: HashMap::new(),
             class_mirrors: HashMap::new(),
             mirror_class: HashMap::new(),
             module_mirrors: HashMap::new(),
             unnamed_module: None,
-            main_thread: None,
         }
     }
 
     /// 设置帧深度上限(builder)。SOE 测试用小值快速触发。
     pub fn with_stack_limit(mut self, limit: u32) -> Self {
-        self.stack_limit = limit;
+        self.thread.stack_limit = limit;
         self
     }
 
@@ -261,21 +296,22 @@ impl<'a> Vm<'a> {
     /// …),`Thread.<clinit>` 仅 `registerNatives()` 空操作故无重初始化负担。无注册表/Thread 未预载
     /// → 返 null(防御,`currentThread` native 据 null 抛 InternalError)。
     pub(crate) fn main_thread(&mut self) -> Reference {
-        if let Some(r) = self.main_thread {
+        if let Some(r) = self.thread.thread_ref {
             return r;
         }
         let r = self.alloc_main_thread();
         if !r.is_null() {
-            self.main_thread = Some(r);
+            self.thread.thread_ref = Some(r);
         }
         r
     }
 
-    /// 分配 main 线程 Thread Instance(`new_instance`,不跑 `<init>`)。无注册表 / Thread 未预载
-    /// → 返 null。借用:先借注册表取 `&'a LoadedClass` + `new_instance`(§6 `'a` 不绑 `&self`),
-    /// 出块后 `heap_mut` 分配。
+    /// 分配 main 线程 Thread Instance(`new_instance`,不跑 `<init>`),并置核心字段
+    /// `name="main"`、`tid`=递增首值(main=1)。对应 HotSpot `Threads::create_vm` 置 main 线程名
+    /// "main"、`Thread` 构造器赋 `tid`(递增计数,首=1)。`getName()`/`threadId()` 真字节码读字段
+    /// 即得。无注册表 / Thread 未预载 → 返 null。借用:先借注册表取 `&'a LoadedClass` + `new_instance`
+    /// (§6 `'a` 不绑 `&self`),出块后 `heap_mut` 分配,再 `set_instance_field_by_name` 置字段。
     fn alloc_main_thread(&mut self) -> Reference {
-        use crate::oops::Oop;
         let inst = {
             let Some(reg) = self.registry else {
                 return Reference::null();
@@ -285,7 +321,18 @@ impl<'a> Vm<'a> {
             };
             reg.new_instance(lc)
         };
-        self.heap_mut().alloc(Oop::Instance(inst))
+        let r = self.heap_mut().alloc(Oop::Instance(inst));
+        if r.is_null() {
+            return r;
+        }
+        // main 线程 tid(递增首值=1);name="main"(真 String 实例,供 getName/equals)。
+        // 对应 Thread.java:268 `private final long tid`、:271 `private volatile String name`。
+        let tid = self.next_thread_tid();
+        if let Ok(name_ref) = crate::runtime::interpreter::string::intern(self, "main") {
+            self.set_instance_field_by_name(r, "java/lang/Thread", "name", Slot::Reference(name_ref));
+        }
+        self.set_instance_field_by_name(r, "java/lang/Thread", "tid", Slot::Long(tid as i64));
+        r
     }
 
     /// 类内部名 → 所属模块的 Module 镜像(供 Class.module 字段填充):
@@ -316,7 +363,7 @@ impl<'a> Vm<'a> {
     /// 入口各推一帧。克隆入 owned [`CallFrame`](各来源生命周期不一)。`pc` 初始 0,
     /// 由 [`Self::set_top_frame_pc`] 在 `run()` 分派前持续刷新。
     pub(crate) fn push_frame(&mut self, class: &str, method: &str) {
-        self.call_stack.push(CallFrame {
+        self.thread.call_stack.push(CallFrame {
             class: class.to_string(),
             method: method.to_string(),
             pc: 0,
@@ -325,7 +372,7 @@ impl<'a> Vm<'a> {
 
     /// 退一个 Java 栈帧(与 `push_frame` 配对;`interpret_with`/`native::invoke` 出口调)。
     pub(crate) fn pop_frame(&mut self) {
-        self.call_stack.pop();
+        self.thread.call_stack.pop();
     }
 
     /// 自栈顶(最新帧)向下第 `depth_from_top` 层帧的声明类内部名(0 = 栈顶)。
@@ -334,10 +381,10 @@ impl<'a> Vm<'a> {
     /// 栈深不足(无对应层)→ `None`。`native::invoke` 已为本 native 推入自身帧(即栈顶),
     /// 故 `depth_from_top=2` = "调用 getCallerClass 的方法"的**调用者**。
     pub(crate) fn frame_class_at(&self, depth_from_top: usize) -> Option<&str> {
-        let n = self.call_stack.len();
+        let n = self.thread.call_stack.len();
         n.checked_sub(1)
             .and_then(|last| last.checked_sub(depth_from_top))
-            .and_then(|i| self.call_stack.get(i))
+            .and_then(|i| self.thread.call_stack.get(i))
             .map(|f| f.class.as_str())
     }
 
@@ -345,7 +392,7 @@ impl<'a> Vm<'a> {
     /// 调用者陷入被调用者后,其顶帧 pc 冻结于 invoke 点(其 run loop 挂起前最后写入)。
     /// 栈为空(匿名纯算术帧)时无操作。
     pub(crate) fn set_top_frame_pc(&mut self, pc: u32) {
-        if let Some(top) = self.call_stack.last_mut() {
+        if let Some(top) = self.thread.call_stack.last_mut() {
             top.pc = pc;
         }
     }
@@ -357,7 +404,7 @@ impl<'a> Vm<'a> {
         self.exception_meta
             .entry(exc)
             .or_default()
-            .frames = self.call_stack.clone();
+            .frames = self.thread.call_stack.clone();
     }
 
     /// 登记包裹异常的 cause(对应 `new ExceptionInInitializerError(cause)` 设 `Throwable.cause`)。
@@ -501,15 +548,14 @@ impl Default for Vm<'_> {
             heap: Heap::new(),
             registry: None,
             string_pool: StringPool::new(),
-            frame_depth: 0,
-            stack_limit: DEFAULT_STACK_LIMIT,
-            call_stack: Vec::new(),
+            thread: ThreadContext::new_main(),
+            monitors: HashMap::new(),
+            next_tid: 1,
             exception_meta: HashMap::new(),
             class_mirrors: HashMap::new(),
             mirror_class: HashMap::new(),
             module_mirrors: HashMap::new(),
             unnamed_module: None,
-            main_thread: None,
         }
     }
 }
@@ -538,6 +584,145 @@ fn component_internal_of(name: &str) -> Option<String> {
         'L' => Some(rest.strip_prefix('L')?.strip_suffix(';')?.to_string()),
         '[' => Some(rest.to_string()),
         _ => None,
+    }
+}
+
+// ---- 对象管程(monitorenter/monitorexit/holdsLock;Layer 4.41 / Phase B.1)----
+impl<'a> Vm<'a> {
+    /// `monitorenter`(JVMS §6.5):进入 `obj` 管程。null → NPE;owner = 当前线程(`main_thread`);
+    /// 未锁 → 记 owner/count=1;已持 → count+1(重入)。单线程下 owner 恒为当前线程、无争用
+    /// (Phase B.3 真并发:被他人持有时阻塞至释放;rustj 当前单线程直接重入)。
+    pub(crate) fn monitor_enter(&mut self, obj: Reference) -> Result<(), VmError> {
+        if obj.is_null() {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/NullPointerException",
+            ));
+        }
+        let owner = self.main_thread();
+        use std::collections::hash_map::Entry;
+        match self.monitors.entry(obj) {
+            Entry::Occupied(mut e) => e.get_mut().count += 1,
+            Entry::Vacant(e) => {
+                e.insert(MonitorState { owner, count: 1 });
+            }
+        }
+        Ok(())
+    }
+
+    /// `monitorexit`(JVMS §6.5):退出 `obj` 管程。null → NPE;当前线程持有(count>0)→ count-1
+    /// (归零释放);未持有 / owner 不符 → `IllegalMonitorStateException`。
+    pub(crate) fn monitor_exit(&mut self, obj: Reference) -> Result<(), VmError> {
+        if obj.is_null() {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/NullPointerException",
+            ));
+        }
+        let owner = self.main_thread();
+        let held = self
+            .monitors
+            .get(&obj)
+            .is_some_and(|m| m.owner == owner && m.count > 0);
+        if !held {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/IllegalMonitorStateException",
+            ));
+        }
+        let count = self.monitors.get(&obj).unwrap().count;
+        if count == 1 {
+            self.monitors.remove(&obj);
+        } else {
+            self.monitors.get_mut(&obj).unwrap().count -= 1;
+        }
+        Ok(())
+    }
+
+    /// `Thread.holdsLock(Object)`(Thread.java:2178):当前线程是否持有 `obj` 管程。
+    /// null → NPE(JDK:`holdsLock(null)` 抛 NPE)。
+    pub(crate) fn holds_lock(&mut self, obj: Reference) -> Result<bool, VmError> {
+        if obj.is_null() {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/NullPointerException",
+            ));
+        }
+        let owner = self.main_thread();
+        Ok(self
+            .monitors
+            .get(&obj)
+            .is_some_and(|m| m.owner == owner && m.count > 0))
+    }
+
+    /// 取并递增下一线程 tid(供 Thread 镜像 tid 字段;main 线程取首值 1,后续递增)。
+    pub(crate) fn next_thread_tid(&mut self) -> u64 {
+        let tid = self.next_tid;
+        self.next_tid += 1;
+        tid
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    //! Layer 4.41 / Phase B.1:`monitorenter/monitorexit` 真重入 + IMSE。
+    use super::*;
+    use crate::oops::{ClassRegistry, InstanceOop, Oop};
+    use crate::runtime::VmError;
+
+    /// 分配一个锁对象(裸 Instance,类名 "Lock")。owner 经 `main_thread` 解析(无 Thread 预载
+    /// 时返 null——单线程下 owner 一致即可测重入/释放/IMSE 机制)。
+    fn lock_obj(vm: &mut Vm<'_>) -> Reference {
+        vm.heap_mut()
+            .alloc(Oop::Instance(InstanceOop::new("Lock".into(), vec![])))
+    }
+
+    /// **RED→GREEN**(S2):同对象两次 monitorenter(重入 count=2)→ holds_lock=true;一次 exit
+    /// (count=1)仍持有;再次 exit(count=0)释放 → holds_lock=false。验证重入计数 + 释放。
+    #[test]
+    fn monitor_enter_reentry_and_exit_releases() {
+        let reg = ClassRegistry::new();
+        let mut vm = Vm::new(&reg);
+        let obj = lock_obj(&mut vm);
+        vm.monitor_enter(obj).expect("enter #1");
+        vm.monitor_enter(obj).expect("enter #2 (重入)");
+        assert!(vm.holds_lock(obj).unwrap(), "重入后应持有");
+        vm.monitor_exit(obj).expect("exit #1");
+        assert!(vm.holds_lock(obj).unwrap(), "count>0 仍持有");
+        vm.monitor_exit(obj).expect("exit #2 (释放)");
+        assert!(!vm.holds_lock(obj).unwrap(), "count=0 应释放");
+    }
+
+    /// **RED→GREEN**(S2):monitorexit 一个未持有的对象 → IllegalMonitorStateException
+    ///(`monitorexit` 要求当前线程持有;JVMS §6.5 monitorexit)。验证 IMSE 抛出。
+    #[test]
+    fn monitor_exit_unheld_throws_imse() {
+        let reg = ClassRegistry::new();
+        let mut vm = Vm::new(&reg);
+        let obj = lock_obj(&mut vm);
+        let err = vm.monitor_exit(obj).unwrap_err();
+        let VmError::ThrownException(r) = err else {
+            panic!("期望 ThrownException,得 {err:?}");
+        };
+        let Some(Oop::Instance(i)) = vm.heap().get(r) else {
+            panic!("IMSE 应为异常实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/IllegalMonitorStateException");
+    }
+
+    /// **RED→GREEN**(S2):monitorenter null → NullPointerException(JVMS §6.5 monitorenter)。
+    #[test]
+    fn monitor_enter_null_throws_npe() {
+        let reg = ClassRegistry::new();
+        let mut vm = Vm::new(&reg);
+        let err = vm.monitor_enter(Reference::null()).unwrap_err();
+        let VmError::ThrownException(r) = err else {
+            panic!("期望 ThrownException,得 {err:?}");
+        };
+        let Some(Oop::Instance(i)) = vm.heap().get(r) else {
+            panic!("NPE 应为异常实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/NullPointerException");
     }
 }
 

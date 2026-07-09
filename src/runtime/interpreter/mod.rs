@@ -306,7 +306,7 @@ impl<'a> Interpreter<'a> {
         // → 自动打印栈轨迹,方便调试。仅 eprintln,不改返回值/不抛(同帧异常表已捕获的不会到此)。
         // 栈轨迹于抛出点捕获(深层被调用者有身份),与顶层帧是否有身份无关。
         // cargo 捕获测试输出、仅失败时回放 → 通过的测试零噪音。
-        if vm.frame_depth == 0
+        if vm.thread.frame_depth == 0
             && let Err(VmError::ThrownException(r)) = &result
         {
             let trace = vm.format_trace(*r);
@@ -1318,20 +1318,19 @@ impl<'a> Interpreter<'a> {
                 return Err(err);
             }
             // monitorenter/monitorexit(JVMS §6.5 monitorenter/monitorexit):进入/退出 objref 的管程。
-            // rustj 单线程解释器——管程恒已满足(无并发争用),故两指令均**空操作 + 弹 objref**
-            //(对应 HotSpot `ObjectSynchronizer::enter`/`exit` 在单线程下的快路径)。解锁所有
-            // `synchronized` 方法/块(java.base 普遍使用,如 `VM.initLevel` 的 `synchronized(lock)`)。
-            // null objref → NPE(忠实 JVM);管程计数/重入/IllegalMonitorStateException 顺延。
+            // 移植 HotSpot `ObjectSynchronizer::enter`/`exit`:enter 记 owner=当前线程/count(重入累加);
+            // exit 减 count(归零释放),owner 不符 → IllegalMonitorStateException。null objref → NPE
+            //(JVMS §6.5)。单线程下 owner 恒为当前线程、无争用(B.3 真并发后阻塞至释放)。解锁所有
+            // `synchronized` 方法/块(java.base 普遍使用)。异常表驱动的 monitorexit(synchronized 块内
+            // 抛出时)由本帧异常表捕获后仍走此分派 → 忠实释放。
             Opcode::Monitorenter => {
-                if frame.operands.pop_reference()?.is_null() {
-                    return Err(throw_exception(vm, "java/lang/NullPointerException"));
-                }
+                let obj = frame.operands.pop_reference()?;
+                vm.monitor_enter(obj)?;
                 pc += 1;
             }
             Opcode::Monitorexit => {
-                if frame.operands.pop_reference()?.is_null() {
-                    return Err(throw_exception(vm, "java/lang/NullPointerException"));
-                }
+                let obj = frame.operands.pop_reference()?;
+                vm.monitor_exit(obj)?;
                 pc += 1;
             }
             other => return Err(VmError::UnsupportedOpcode(other)),

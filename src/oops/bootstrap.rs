@@ -44,6 +44,7 @@ const BOOTSTRAP_HIERARCHY: &[(&str, Option<&str>)] = &[
     ("java/lang/ArithmeticException", Some("java/lang/RuntimeException")),
     ("java/lang/ArrayStoreException", Some("java/lang/RuntimeException")),
     ("java/lang/NegativeArraySizeException", Some("java/lang/RuntimeException")),
+    ("java/lang/IllegalMonitorStateException", Some("java/lang/RuntimeException")),
 ];
 
 /// 在字节流尾追加一个 `Utf8` 条目,返回它的常量池索引(并推进 `next`)。

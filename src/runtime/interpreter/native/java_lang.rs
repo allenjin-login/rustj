@@ -424,6 +424,43 @@ pub(super) fn dispatch(
             Ok(Value::Reference(vm.main_thread()))
         }
 
+        // Thread.holdsLock(Ljava/lang/Object;)Z —— Thread.java:2178 `public static native`。
+        // 移植 `JVM_HoldsLock`(jvm.cpp):当前线程是否持有 `obj` 管程。null → NPE(JDK 行为:
+        // `holdsLock(null)` 抛 NPE)。查 `Vm::holds_lock`(monitors 表 owner==当前线程)。
+        ("java/lang/Thread", "holdsLock", "(Ljava/lang/Object;)Z") => {
+            let obj = match args.first().copied().unwrap_or(Value::Void) {
+                Value::Reference(r) => r,
+                _ => Reference::null(),
+            };
+            vm.holds_lock(obj).map(|b| Value::Int(b as i32))
+        }
+
+        // Thread.yield0()V —— Thread.java:519 `private static native`。移植 `JVM_Yield`
+        // (os::yield_thread / os::naked_yield):提示调度器让出 CPU。rustj → `std::thread::yield_now`。
+        ("java/lang/Thread", "yield0", "()V") => {
+            std::thread::yield_now();
+            Ok(Value::Void)
+        }
+
+        // Thread.sleepNanos0(J)V —— Thread.java:569 `private static native`。移植 `JVM_Sleep`
+        // (os::sleep):当前线程睡眠 nanos 纳秒。rustj 单线程 → `std::thread::sleep`;0 纳秒即立返。
+        // InterruptedException 顺延(B.4 中断支持):单线程无中断源,不抛。
+        ("java/lang/Thread", "sleepNanos0", "(J)V") => {
+            let nanos = match args.first().copied().unwrap_or(Value::Long(0)) {
+                Value::Long(n) => n.max(0),
+                _ => 0,
+            };
+            if nanos > 0 {
+                std::thread::sleep(std::time::Duration::from_nanos(nanos as u64));
+            }
+            Ok(Value::Void)
+        }
+
+        // Thread.start0()V —— Thread.java:1507 `private native`(实例)。移植 `JVM_StartThread`
+        // (os::create_thread):创建新 OS 线程跑 target.run()。**B.1 单线程桩:空操作**(不并发);
+        // B.3 升级为 `std::thread::spawn` 跑 holder.task.run() + JoinHandle 生命周期管理。
+        ("java/lang/Thread", "start0", "()V") => Ok(Value::Void),
+
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }
@@ -1312,6 +1349,136 @@ mod tests {
             panic!("须返 Reference,得 {r2:?}");
         };
         assert_eq!(t1, t2, "currentThread 须返同一 main 线程单例");
+    }
+
+    /// **RED→GREEN**(Layer 4.41 / Phase B.1):`Thread.holdsLock(Object)Z`
+    /// (Thread.java:2178 `public static native`)。移植 `JVM_HoldsLock`:当前线程是否持有
+    /// `obj` 管程。null → NPE(JDK:`holdsLock(null)` 抛 NPE)。先 `monitor_enter`(直接调 Vm)
+    /// 持有 a,再查 holdsLock(a)=true、holdsLock(b)=false、holdsLock(null)=NPE。
+    #[test]
+    fn thread_holds_lock_reflects_monitor_state() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
+        let mut vm = Vm::new(&registry);
+
+        // 分配两个锁对象(裸 Instance;holdsLock 只认句柄,与类无关)。
+        let lock = |vm: &mut Vm<'_>| {
+            vm.heap_mut().alloc(crate::oops::Oop::Instance(
+                crate::oops::InstanceOop::new("Lock".into(), vec![]),
+            ))
+        };
+        let a = lock(&mut vm);
+        let b = lock(&mut vm);
+
+        // 持有 a → holdsLock(a)=true、holdsLock(b)=false。
+        vm.monitor_enter(a).expect("monitor_enter a");
+        let r = super::super::invoke(
+            &mut vm,
+            "java/lang/Thread",
+            "holdsLock",
+            "(Ljava/lang/Object;)Z",
+            None,
+            &[Value::Reference(a)],
+        )
+        .expect("holdsLock(a) 应非抛");
+        assert_eq!(r, Value::Int(1), "holdsLock(a) 应为 true");
+        let r = super::super::invoke(
+            &mut vm,
+            "java/lang/Thread",
+            "holdsLock",
+            "(Ljava/lang/Object;)Z",
+            None,
+            &[Value::Reference(b)],
+        )
+        .expect("holdsLock(b) 应非抛");
+        assert_eq!(r, Value::Int(0), "holdsLock(b) 应为 false");
+
+        // holdsLock(null) → NullPointerException。
+        let err = super::super::invoke(
+            &mut vm,
+            "java/lang/Thread",
+            "holdsLock",
+            "(Ljava/lang/Object;)Z",
+            None,
+            &[Value::Reference(Reference::null())],
+        )
+        .unwrap_err();
+        let VmError::ThrownException(r) = err else {
+            panic!("期望 ThrownException,得 {err:?}");
+        };
+        let Some(crate::oops::Oop::Instance(i)) = vm.heap().get(r) else {
+            panic!("NPE 应为异常实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/NullPointerException");
+    }
+
+    /// **RED→GREEN**(Layer 4.41 / Phase B.1):`Thread.yield0()V`(Thread.java:519 `private static
+    /// native`)、`Thread.sleepNanos0(J)V`(Thread.java:569)、`Thread.start0()V`(Thread.java:1507
+    /// `private native` 实例)。B.1 单线程桩:`yield0`→`std::thread::yield_now`;
+    /// `sleepNanos0(nanos)`→`std::thread::sleep`(0 纳秒即立返,不实际阻塞);`start0`→**空操作桩**
+    /// (B.3 升级为真 `std::thread::spawn`;单线程下不并发)。三者均返 void、不抛。
+    #[test]
+    fn thread_yield_sleep_start_stubs_do_not_throw() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
+        let mut vm = Vm::new(&registry);
+
+        // yield0()V —— 空操作(yield_now),返 Void。
+        assert_eq!(
+            super::super::invoke(
+                &mut vm,
+                "java/lang/Thread",
+                "yield0",
+                "()V",
+                None,
+                &[],
+            )
+            .expect("yield0 应非抛"),
+            Value::Void,
+        );
+
+        // sleepNanos0(0)V —— 0 纳秒即立返,不实际阻塞,返 Void。
+        assert_eq!(
+            super::super::invoke(
+                &mut vm,
+                "java/lang/Thread",
+                "sleepNanos0",
+                "(J)V",
+                None,
+                &[Value::Long(0)],
+            )
+            .expect("sleepNanos0(0) 应非抛"),
+            Value::Void,
+        );
+
+        // start0()V —— 实例方法,this = main 线程镜像;B.1 空操作桩,返 Void。
+        let main = vm.main_thread();
+        assert_eq!(
+            super::super::invoke(
+                &mut vm,
+                "java/lang/Thread",
+                "start0",
+                "()V",
+                Some(main),
+                &[],
+            )
+            .expect("start0 应非抛"),
+            Value::Void,
+        );
     }
 
     /// 收尾:未登记的 Reference native 仍抛 ULE。

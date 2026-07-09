@@ -529,11 +529,10 @@ fn init_stack_trace_elements(
         return Ok(());
     }
 
-    // 取捕获帧(exception_meta),逆序使最内帧对应 ste[0](Java 惯例)。to_vec 释放共享借用。
-    let frames: Vec<crate::runtime::vm::CallFrame> = vm
-        .exception_frames(backtrace)
-        .map(|f| f.to_vec())
-        .unwrap_or_default();
+    // 取捕获帧(exception_meta 已 Mutex 化→exception_frames 返 owned Vec;B.2.3b),
+    // 逆序使最内帧对应 ste[0](Java 惯例)。
+    let frames: Vec<crate::runtime::vm::CallFrame> =
+        vm.exception_frames(backtrace).unwrap_or_default();
     if frames.is_empty() {
         return Ok(());
     }

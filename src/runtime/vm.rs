@@ -70,6 +70,44 @@ impl ThreadContext {
             thread_ref: None,
         }
     }
+
+    /// 入一个 Java 栈帧(类内部名 + 方法名)。`interpret_with` 入口与 `native::invoke`
+    /// 入口各推一帧。克隆入 owned [`CallFrame`](各来源生命周期不一)。`pc` 初始 0,
+    /// 由 [`Self::set_top_frame_pc`] 在 `run()` 分派前持续刷新。
+    pub(crate) fn push_frame(&mut self, class: &str, method: &str) {
+        self.call_stack.push(CallFrame {
+            class: class.to_string(),
+            method: method.to_string(),
+            pc: 0,
+        });
+    }
+
+    /// 退一个 Java 栈帧(与 `push_frame` 配对;`interpret_with`/`native::invoke` 出口调)。
+    pub(crate) fn pop_frame(&mut self) {
+        self.call_stack.pop();
+    }
+
+    /// 自栈顶(最新帧)向下第 `depth_from_top` 层帧的声明类内部名(0 = 栈顶)。
+    ///
+    /// 供 `Reflection.getCallerClass`(@CallerSensitive 基础设施)等栈帧回溯 native 用。
+    /// 栈深不足(无对应层)→ `None`。`native::invoke` 已为本 native 推入自身帧(即栈顶),
+    /// 故 `depth_from_top=2` = "调用 getCallerClass 的方法"的**调用者**。
+    pub(crate) fn frame_class_at(&self, depth_from_top: usize) -> Option<&str> {
+        let n = self.call_stack.len();
+        n.checked_sub(1)
+            .and_then(|last| last.checked_sub(depth_from_top))
+            .and_then(|i| self.call_stack.get(i))
+            .map(|f| f.class.as_str())
+    }
+
+    /// 刷新**栈顶**帧的 bci(`run()` 分派前调,记当前指令起始)。抛出时即抛点 bci;
+    /// 调用者陷入被调用者后,其顶帧 pc 冻结于 invoke 点(其 run loop 挂起前最后写入)。
+    /// 栈为空(匿名纯算术帧)时无操作。
+    pub(crate) fn set_top_frame_pc(&mut self, pc: u32) {
+        if let Some(top) = self.call_stack.last_mut() {
+            top.pc = pc;
+        }
+    }
 }
 
 /// 对象管程状态(对应 HotSpot 对象头 mark word 的锁态子集;Layer 4.41 / Phase B.1)。
@@ -214,44 +252,26 @@ impl<'a> Vm<'a> {
         self.shared.registry
     }
 
-    // ---- 栈帧法(T8 下沉 impl ThreadContext;当前 impl Vm 薄持有)----
+    // ---- 栈帧法(T8 下沉 impl ThreadContext;Vm 薄转发,保调用点零改动)----
 
-    /// 入一个 Java 栈帧(类内部名 + 方法名)。`interpret_with` 入口与 `native::invoke`
-    /// 入口各推一帧。克隆入 owned [`CallFrame`](各来源生命周期不一)。`pc` 初始 0,
-    /// 由 [`Self::set_top_frame_pc`] 在 `run()` 分派前持续刷新。
+    /// 入一个 Java 栈帧(转发 [`ThreadContext::push_frame`])。
     pub(crate) fn push_frame(&mut self, class: &str, method: &str) {
-        self.thread.call_stack.push(CallFrame {
-            class: class.to_string(),
-            method: method.to_string(),
-            pc: 0,
-        });
+        self.thread.push_frame(class, method);
     }
 
-    /// 退一个 Java 栈帧(与 `push_frame` 配对;`interpret_with`/`native::invoke` 出口调)。
+    /// 退一个 Java 栈帧(转发 [`ThreadContext::pop_frame`])。
     pub(crate) fn pop_frame(&mut self) {
-        self.thread.call_stack.pop();
+        self.thread.pop_frame();
     }
 
-    /// 自栈顶(最新帧)向下第 `depth_from_top` 层帧的声明类内部名(0 = 栈顶)。
-    ///
-    /// 供 `Reflection.getCallerClass`(@CallerSensitive 基础设施)等栈帧回溯 native 用。
-    /// 栈深不足(无对应层)→ `None`。`native::invoke` 已为本 native 推入自身帧(即栈顶),
-    /// 故 `depth_from_top=2` = "调用 getCallerClass 的方法"的**调用者**。
+    /// 自栈顶向下第 `depth_from_top` 层帧的声明类内部名(转发 [`ThreadContext::frame_class_at`])。
     pub(crate) fn frame_class_at(&self, depth_from_top: usize) -> Option<&str> {
-        let n = self.thread.call_stack.len();
-        n.checked_sub(1)
-            .and_then(|last| last.checked_sub(depth_from_top))
-            .and_then(|i| self.thread.call_stack.get(i))
-            .map(|f| f.class.as_str())
+        self.thread.frame_class_at(depth_from_top)
     }
 
-    /// 刷新**栈顶**帧的 bci(`run()` 分派前调,记当前指令起始)。抛出时即抛点 bci;
-    /// 调用者陷入被调用者后,其顶帧 pc 冻结于 invoke 点(其 run loop 挂起前最后写入)。
-    /// 栈为空(匿名纯算术帧)时无操作。
+    /// 刷新栈顶帧 bci(转发 [`ThreadContext::set_top_frame_pc`])。
     pub(crate) fn set_top_frame_pc(&mut self, pc: u32) {
-        if let Some(top) = self.thread.call_stack.last_mut() {
-            top.pc = pc;
-        }
+        self.thread.set_top_frame_pc(pc);
     }
 }
 

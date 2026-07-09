@@ -116,10 +116,11 @@ struct VmShared<'a> {
     mirror_class: Mutex<HashMap<Reference, String>>,
     /// 命名 Module 镜像表(4.14a):模块名(`java.base`)→ 真 `java/lang/Module` Instance 引用。
     /// 同名模块恒同引用(对应 HotSpot 每个 `Module` 类实例单例)。`name` 字段填模块名;
-    /// 无名模块走 [`Vm::unnamed_module`](单例,`name` 字段 null)。
-    module_mirrors: HashMap<String, Reference>,
+    /// 无名模块走 [`Vm::unnamed_module`](单例,`name` 字段 null)。Mutex(B.2.3b 共享态)。
+    module_mirrors: Mutex<HashMap<String, Reference>>,
     /// 无名模块单例引用(惰性分配,4.14a)。`Module.getName()` 返 null → `isNamed()`=false。
-    unnamed_module: Option<Reference>,
+    /// Mutex(B.2.3b 共享态)。
+    unnamed_module: Mutex<Option<Reference>>,
 }
 
 impl<'a> VmShared<'a> {
@@ -135,8 +136,8 @@ impl<'a> VmShared<'a> {
             exception_meta: Mutex::new(HashMap::new()),
             class_mirrors: Mutex::new(HashMap::new()),
             mirror_class: Mutex::new(HashMap::new()),
-            module_mirrors: HashMap::new(),
-            unnamed_module: None,
+            module_mirrors: Mutex::new(HashMap::new()),
+            unnamed_module: Mutex::new(None),
         }
     }
 }
@@ -303,14 +304,20 @@ impl<'a> Vm<'a> {
     /// 字段 = intern(模块名)。对应 HotSpot 每个 `Module` 单例(JVM 侧 `java_lang_Module`)。
     /// `Module.getName()` 真字节码读 `name` 字段即得模块名;`isNamed()` = `name != null`。
     fn intern_named_module(&mut self, name: &str) -> Reference {
-        if let Some(&r) = self.shared.module_mirrors.get(name) {
+        // 缓存命中:单次锁取 owned Reference,释 guard 再返(B.2.3b)。
+        if let Some(r) = self.shared.module_mirrors.lock().unwrap().get(name).copied() {
             return r;
         }
         let r = self.alloc_module_instance();
         if r.is_null() {
             return r;
         }
-        self.shared.module_mirrors.insert(name.to_string(), r);
+        // 单语句锁 insert,释 guard 后再 intern/set_field(其内部 &mut self;B.2.3b)。
+        self.shared
+            .module_mirrors
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), r);
         // 置 Module.name = intern(模块名)(真 String 实例,供 getName/equals 用)。
         if let Ok(name_ref) = crate::runtime::interpreter::string::intern(self, name) {
             self.set_instance_field_by_name(r, "java/lang/Module", "name", Slot::Reference(name_ref));
@@ -321,12 +328,13 @@ impl<'a> Vm<'a> {
     /// 无名模块单例(惰性)。`Module(loader)` 未名构造器语义:`name`=null(默认)、`descriptor`=null。
     /// `getName()` 返 null、`isNamed()`=false。用户类(非模块源)经 [`Self::module_for_class`] 归此。
     fn unnamed_module(&mut self) -> Reference {
-        if let Some(r) = self.shared.unnamed_module {
+        // 命中:单次锁取 owned Option<Reference>(Copy),释 guard 再返(B.2.3b)。
+        if let Some(r) = *self.shared.unnamed_module.lock().unwrap() {
             return r;
         }
         let r = self.alloc_module_instance();
         if !r.is_null() {
-            self.shared.unnamed_module = Some(r);
+            *self.shared.unnamed_module.lock().unwrap() = Some(r);
         }
         r
     }

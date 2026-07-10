@@ -51,14 +51,60 @@ pub(super) fn dispatch(
             Ok(Value::Int(id))
         }
 
-        // Object.notify()/notifyAll()/wait() —— jvm.cpp JVM_MonitorNotify/NotifyAll/Wait。
-        // rustj 单线程:管程恒已满足、无 wait set → **空操作**(无并发线程可唤醒/等待)。
-        // 解锁 `synchronized` 块尾的 `lock.notifyAll()`(如 VM.initLevel)等;真阻塞/调度顺延。
-        ("java/lang/Object", "notify", "()V") => Ok(Value::Void),
-        ("java/lang/Object", "notifyAll", "()V") => Ok(Value::Void),
-        ("java/lang/Object", "wait", "()V") => Ok(Value::Void),
-        ("java/lang/Object", "wait", "(J)V") => Ok(Value::Void),
-        ("java/lang/Object", "wait", "(JI)V") => Ok(Value::Void),
+        // Object.notify()/notifyAll() + wait0(long) —— jvm.cpp JVM_MonitorNotify/NotifyAll/Wait;
+        // 语义移植自 ObjectSynchronizer::notify/notifyall/wait(synchronizer.cpp:543/556/514)。
+        // Phase B.3c 真阻塞语义(经 [`Vm::object_wait`] 等):notify/notifyAll 推 wait_cvar 唤醒等待者;
+        // wait0 释管程→阻塞→重获。null→NPE、未持有→IMSE、millis<0→IAE 由 [`Vm`] 侧处理。
+        //
+        // **JDK25 Object 实况**(Object.java):notify()V(307)/notifyAll()V(332) 为 `native`;而
+        // wait()V(352)→wait(0)、wait(J)V(377)→`wait0(J)`、wait(JI)V(492)→wait(J) **皆为字节码包装**,
+        // 唯一 native 为 `wait0(J)V`(396,private final)。故本表绑 `wait0` 为真路径;wait()V/wait(J)V/
+        // wait(JI)V 为防御性兜底(桩/非 JDK25 Object 若直接声 native 时可达,真 Object 永经字节码→wait0)。
+        ("java/lang/Object", "notify", "()V") => match this {
+            None => Err(throw_exception(vm, "java/lang/NullPointerException")),
+            Some(r) => vm.object_notify(r).map(|()| Value::Void),
+        },
+        ("java/lang/Object", "notifyAll", "()V") => match this {
+            None => Err(throw_exception(vm, "java/lang/NullPointerException")),
+            Some(r) => vm.object_notify_all(r).map(|()| Value::Void),
+        },
+        // wait0(long):真 native(Object.java:396)。wait(J)/wait()/wait(JI) 字节码包装最终汇此。
+        ("java/lang/Object", "wait0", "(J)V") => match this {
+            None => Err(throw_exception(vm, "java/lang/NullPointerException")),
+            Some(r) => {
+                let millis = match args.first().copied() {
+                    Some(Value::Long(m)) => m,
+                    _ => 0,
+                };
+                vm.object_wait(r, millis).map(|()| Value::Void)
+            }
+        },
+        // 防御性兜底:若 Object 以 native 形式声 wait(桩/非 JDK25),委派 object_wait 保语义一致。
+        ("java/lang/Object", "wait", "()V") => match this {
+            None => Err(throw_exception(vm, "java/lang/NullPointerException")),
+            Some(r) => vm.object_wait(r, 0).map(|()| Value::Void),
+        },
+        ("java/lang/Object", "wait", "(J)V") => match this {
+            None => Err(throw_exception(vm, "java/lang/NullPointerException")),
+            Some(r) => {
+                let millis = match args.first().copied() {
+                    Some(Value::Long(m)) => m,
+                    _ => 0,
+                };
+                vm.object_wait(r, millis).map(|()| Value::Void)
+            }
+        },
+        ("java/lang/Object", "wait", "(JI)V") => match this {
+            None => Err(throw_exception(vm, "java/lang/NullPointerException")),
+            Some(r) => {
+                // nanos 仅亚毫秒取整(JDK 侧 wait(JI) 归并到毫秒);rustj 忽略 nanos 用 millis。
+                let millis = match args.first().copied() {
+                    Some(Value::Long(m)) => m,
+                    _ => 0,
+                };
+                vm.object_wait(r, millis).map(|()| Value::Void)
+            }
+        },
 
         // Object.getClass()Ljava/lang/Class; —— Object.java:68 public final native
         // (HotSpot 为 intrinsic)。返接收者运行时类的 Class 镜像(intern:同类恒同引用,使

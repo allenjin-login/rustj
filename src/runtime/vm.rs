@@ -112,27 +112,45 @@ impl ThreadContext {
 
 /// 对象管程(对应 HotSpot `ObjectMonitor` 的 rustj 阻塞子集;Phase B.3a)。每对象惰性分配一个,
 /// `entry` Condvar 在 `monitor_enter` 被他人持有时阻塞等待,owner 归零时 `notify_one` 唤醒等待者。
+/// Phase B.3c:`wait_cvar` 给 `Object.wait` 阻塞用,`notify`/`notifyAll` 推 `wake_seq` 并 `wait_cvar`
+/// 唤醒;`waiters` 记等待者数(`ObjectMonitor::_wait_set` 的 rustj 子集),空集时 notify no-op。
 ///
 /// B.1 起 owner 判定 + 重入计数;B.3a 前重入不阻塞(无 Condvar)→ 真并发丢失更新;B.3a 阻塞至空闲。
 pub(crate) struct JavaMonitor {
-    /// 锁态:`owner` = 持有者 Thread 镜像句柄(`None` = 空闲)、`count` = 重入计数。
+    /// 锁态:`owner` = 持有者 Thread 镜像句柄(`None` = 空闲)、`count` = 重入计数、`waiters` = wait
+    /// 等待者数(B.3c)、`wake_seq` = notify/notifyAll 推进的唤醒序号(B.3c:wait_timeout_while 谓词)。
     pub(crate) inner: Mutex<MonitorInner>,
     /// 入口条件变量:被他人持有时 `wait`,owner 释放时 `notify_one`。
     pub(crate) entry: Condvar,
+    /// `Object.wait` 条件变量(B.3c):waiter 释管程后在此阻塞;notify/notifyAll 推 `wake_seq` 后唤醒。
+    pub(crate) wait_cvar: Condvar,
 }
 
-/// 管程锁态(`JavaMonitor::inner` 的载荷)。`owner`/`count` 经 `inner` Mutex 保护。
+/// 管程锁态(`JavaMonitor::inner` 的载荷)。`owner`/`count`/`waiters`/`wake_seq` 经 `inner` Mutex 保护。
 pub(crate) struct MonitorInner {
     pub(crate) owner: Option<Reference>,
     pub(crate) count: u64,
+    /// `Object.wait` 等待者计数(B.3c)。`ObjectMonitor::_wait_set` 大小的 rustj 子集;notify/notifyAll
+    /// 据 `>0` 判是否有等待者(空集 → no-op,objectMonitor.cpp:2111/2139)。
+    pub(crate) waiters: u64,
+    /// 唤醒序号(B.3c):每次 notify/notifyAll 自增。waiter 入 wait 时记当前值作谓词,
+    /// `wait_cvar.wait_timeout_while(guard, |i| i.wake_seq == my_seq)` —— 抗 spurious wakeup
+    ///(谓词真=未被 notify→ 继续等;notify 推序号→ 谓词假→ 唤醒)。
+    pub(crate) wake_seq: u64,
 }
 
 impl JavaMonitor {
-    /// 构造空闲管程(`owner=None`、`count=0`)。
+    /// 构造空闲管程(`owner=None`、`count=0`、`waiters=0`、`wake_seq=0`)。
     pub(crate) fn new() -> Self {
         Self {
-            inner: Mutex::new(MonitorInner { owner: None, count: 0 }),
+            inner: Mutex::new(MonitorInner {
+                owner: None,
+                count: 0,
+                waiters: 0,
+                wake_seq: 0,
+            }),
             entry: Condvar::new(),
+            wait_cvar: Condvar::new(),
         }
     }
 }
@@ -516,5 +534,192 @@ mod concurrent_monitor_tests {
             2 * ITERS,
             "阻塞管程须串行化并发自增(无丢失更新)"
         );
+    }
+}
+
+#[cfg(test)]
+mod concurrent_wait_tests {
+    //! Phase B.3c:`Object.wait/notify/notifyAll` 真阻塞语义闸门。移植 `ObjectSynchronizer::wait`
+    //!(synchronizer.cpp:514)+`ObjectMonitor::wait`(objectMonitor.cpp:1732)与 `notify`/`notifyAll`
+    //!(2108/2136):`object_wait` 释管程(owner/count 归零、entry.notify_one)→ `wait_cvar.wait_timeout_while`
+    //! 阻塞(抗 spurious wakeup:`wake_seq` 谓词)→ 唤醒后重获管程(恢复重入计数);`object_notify[_all]`
+    //! 推 `wake_seq` 并 `wait_cvar.notify_one[_all]`。CHECK_OWNER→IMSE、millis<0→IAE、null→NPE、无等待者→no-op。
+    use super::*;
+    use crate::oops::{ClassRegistry, InstanceOop, Oop};
+    use crate::runtime::VmError;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// 分配一个裸 `Lock` Instance 作管程锁对象(`monitor_enter`/`object_wait` 据 `main_thread` 解析 owner)。
+    fn lock_obj(vm: &mut Vm) -> Reference {
+        vm.heap_mut()
+            .alloc(Oop::Instance(InstanceOop::new("Lock".into(), vec![])))
+    }
+
+    /// **RED→GREEN**:wait(millis>0) 须真阻塞约 millis。RED:旧 4.13 no-op wait 立返 → elapsed < 75ms。
+    /// GREEN:真 `wait_cvar.wait_timeout_while(150ms)` 阻塞满超时(`wake_seq` 谓词抗 spurious 唤醒)。
+    #[test]
+    fn object_wait_blocks_for_timeout() {
+        let mut vm = Vm::new(ClassRegistry::new());
+        let lock = lock_obj(&mut vm);
+        vm.monitor_enter(lock).expect("monitor_enter");
+        let start = Instant::now();
+        vm.object_wait(lock, 150).expect("wait(150) 须 owner==本线程");
+        let elapsed = start.elapsed();
+        vm.monitor_exit(lock).expect("monitor_exit");
+        assert!(
+            elapsed >= Duration::from_millis(75),
+            "wait(150) 须阻塞 ~150ms,实际 {elapsed:?}(no-op wait 立返 < 75ms)"
+        );
+    }
+
+    /// notifier 循环 notify(每 10ms)直到 waiter 报完成——保证 waiter 一旦进入 wait 即被唤醒(无丢信号)。
+    /// GREEN:waiter 在 < 2s 内被唤醒;notify 失效 → waiter 等 5000ms 超时 → elapsed > 2s。
+    #[test]
+    fn object_notify_wakes_waiting_thread() {
+        let mut vm = Vm::new(ClassRegistry::new());
+        let lock = lock_obj(&mut vm);
+        let shared = vm.shared_arc();
+        let done = Arc::new(AtomicU64::new(0));
+
+        let (s_wait, d_wait) = (Arc::clone(&shared), Arc::clone(&done));
+        let waiter = thread::spawn(move || {
+            let mut vm = Vm::from_shared(s_wait);
+            vm.monitor_enter(lock).expect("waiter enter");
+            vm.object_wait(lock, 5000).expect("waiter wait");
+            vm.monitor_exit(lock).expect("waiter exit");
+            d_wait.store(1, Ordering::SeqCst);
+        });
+        // 给 waiter 进入 wait 一点时间(释管程、阻塞于 wait_cvar)。
+        thread::sleep(Duration::from_millis(100));
+        let (s_not, d_not) = (Arc::clone(&shared), Arc::clone(&done));
+        let notifier = thread::spawn(move || {
+            let mut vm = Vm::from_shared(s_not);
+            while d_not.load(Ordering::SeqCst) == 0 {
+                vm.monitor_enter(lock).expect("notifier enter");
+                vm.object_notify(lock).expect("notifier notify");
+                vm.monitor_exit(lock).expect("notifier exit");
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let start = Instant::now();
+        waiter.join().expect("waiter 未 panic");
+        notifier.join().expect("notifier 未 panic");
+        let elapsed = start.elapsed();
+        assert_eq!(done.load(Ordering::SeqCst), 1, "waiter 须被唤醒并报完成");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "waiter 须被 notify 唤醒(<2s),实际 {elapsed:?}(notify 失效→等满 5s 超时)"
+        );
+    }
+
+    /// notifyAll 唤醒**全部**等待者。两 waiter,notifier 循环 notify_all 直到两 waiter 都报完成。
+    #[test]
+    fn object_notify_all_wakes_all_waiters() {
+        let mut vm = Vm::new(ClassRegistry::new());
+        let lock = lock_obj(&mut vm);
+        let shared = vm.shared_arc();
+        let done = Arc::new(AtomicU64::new(0));
+
+        let spawn_waiter = |shared: Arc<VmShared>, done: Arc<AtomicU64>| {
+            thread::spawn(move || {
+                let mut vm = Vm::from_shared(shared);
+                vm.monitor_enter(lock).expect("waiter enter");
+                vm.object_wait(lock, 5000).expect("waiter wait");
+                vm.monitor_exit(lock).expect("waiter exit");
+                done.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let w1 = spawn_waiter(Arc::clone(&shared), Arc::clone(&done));
+        thread::sleep(Duration::from_millis(50));
+        let w2 = spawn_waiter(Arc::clone(&shared), Arc::clone(&done));
+        thread::sleep(Duration::from_millis(100));
+        let (s_not, d_not) = (Arc::clone(&shared), Arc::clone(&done));
+        let notifier = thread::spawn(move || {
+            let mut vm = Vm::from_shared(s_not);
+            while d_not.load(Ordering::SeqCst) < 2 {
+                vm.monitor_enter(lock).expect("notifier enter");
+                vm.object_notify_all(lock).expect("notifier notifyAll");
+                vm.monitor_exit(lock).expect("notifier exit");
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let start = Instant::now();
+        w1.join().expect("w1 未 panic");
+        w2.join().expect("w2 未 panic");
+        notifier.join().expect("notifier 未 panic");
+        let elapsed = start.elapsed();
+        assert_eq!(done.load(Ordering::SeqCst), 2, "notifyAll 须唤醒两 waiter");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "两 waiter 须被 notifyAll 唤醒(<2s),实际 {elapsed:?}"
+        );
+    }
+
+    /// 未持有管程调 wait → IllegalMonitorStateException(`ObjectSynchronizer::wait` CHECK_OWNER)。
+    #[test]
+    fn object_wait_without_monitor_throws_imse() {
+        let mut vm = Vm::new(ClassRegistry::new());
+        let lock = lock_obj(&mut vm);
+        let err = vm.object_wait(lock, 0).unwrap_err();
+        let VmError::ThrownException(r) = err else {
+            panic!("期望 ThrownException,得 {err:?}");
+        };
+        let heap = vm.heap();
+        let Some(Oop::Instance(i)) = heap.get(r) else {
+            panic!("IMSE 应为异常实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/IllegalMonitorStateException");
+    }
+
+    /// 未持有管程调 notify → IllegalMonitorStateException(`ObjectSynchronizer::notify` CHECK_OWNER)。
+    #[test]
+    fn object_notify_without_monitor_throws_imse() {
+        let mut vm = Vm::new(ClassRegistry::new());
+        let lock = lock_obj(&mut vm);
+        let err = vm.object_notify(lock).unwrap_err();
+        let VmError::ThrownException(r) = err else {
+            panic!("期望 ThrownException,得 {err:?}");
+        };
+        let heap = vm.heap();
+        let Some(Oop::Instance(i)) = heap.get(r) else {
+            panic!("IMSE 应为异常实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/IllegalMonitorStateException");
+    }
+
+    /// wait(null) → NullPointerException(jvm.cpp `JVM_MonitorWait`:handle==nullptr)。
+    #[test]
+    fn object_wait_null_throws_npe() {
+        let mut vm = Vm::new(ClassRegistry::new());
+        let err = vm.object_wait(Reference::null(), 0).unwrap_err();
+        let VmError::ThrownException(r) = err else {
+            panic!("期望 ThrownException,得 {err:?}");
+        };
+        let heap = vm.heap();
+        let Some(Oop::Instance(i)) = heap.get(r) else {
+            panic!("NPE 应为异常实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/NullPointerException");
+    }
+
+    /// wait(负 timeout) → IllegalArgumentException(`ObjectSynchronizer::wait`:516 millis<0)。
+    #[test]
+    fn object_wait_negative_timeout_throws_iae() {
+        let mut vm = Vm::new(ClassRegistry::new());
+        let lock = lock_obj(&mut vm);
+        vm.monitor_enter(lock).unwrap();
+        let err = vm.object_wait(lock, -1).unwrap_err();
+        vm.monitor_exit(lock).unwrap();
+        let VmError::ThrownException(r) = err else {
+            panic!("期望 ThrownException,得 {err:?}");
+        };
+        let heap = vm.heap();
+        let Some(Oop::Instance(i)) = heap.get(r) else {
+            panic!("IAE 应为异常实例");
+        };
+        assert_eq!(i.class_name(), "java/lang/IllegalArgumentException");
     }
 }

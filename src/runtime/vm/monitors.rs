@@ -1,12 +1,14 @@
-//! 对象管程(`monitorenter`/`monitorexit`/`holdsLock`)。移植自 HotSpot
-//! `ObjectSynchronizer::enter/exit`(`ObjectMonitor` 的 rustj 阻塞子集)。
+//! 对象管程(`monitorenter`/`monitorexit`/`holdsLock` + `Object.wait/notify/notifyAll`)。移植自
+//! HotSpot `ObjectSynchronizer::enter/exit/wait/notify/notifyall` 与 `ObjectMonitor::*`(rustj 阻塞子集)。
 //!
 //! Phase B.1:重入 owner/count;Phase B.3a:**真阻塞**——`monitor_enter` 被他人持有时经
 //! `entry: Condvar` 阻塞至 owner 空闲再获取,`monitor_exit` 归零时 `notify_one` 唤醒等待者。
+//! Phase B.3c:`object_wait` 释管程后 `wait_cvar` 阻塞,`object_notify[_all]` 推 `wake_seq` 唤醒。
 //! 共享态 `VmShared.monitors`(`HashMap<Reference, Arc<JavaMonitor>>`,per-object 惰性分配);
 //! owner = 当前线程 Thread 镜像句柄(`main_thread`,经 [`super::threads`])。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::runtime::{Reference, Vm, VmError};
 
@@ -97,6 +99,130 @@ impl Vm {
         let Some(mon) = mon else { return Ok(false) };
         let guard = mon.inner.lock().unwrap();
         Ok(guard.owner == Some(owner) && guard.count > 0)
+    }
+
+    /// `Object.wait(long)`(JLS §17.2.1;移植 `ObjectSynchronizer::wait` synchronizer.cpp:514 +
+    /// `ObjectMonitor::wait` objectMonitor.cpp:1732)。null → NPE;`millis<0` → IllegalArgumentException
+    ///(synchronizer.cpp:516);未持有管程(无条目或 owner≠本线程)→ IMSE(`CHECK_OWNER`)。
+    /// 语义:保存重入计数 → 释管程(`owner=None`/`count=0`/`waiters+1`/`entry.notify_one` 唤醒入口等待者)
+    /// → 记 `wake_seq` → `wait_cvar.wait[_timeout]_while(guard, |i| i.wake_seq==my_seq)` 阻塞
+    ///(`millis==0` 永久;`>0` 超时;谓词抗 spurious wakeup)→ 唤醒后 `waiters-1` → 重获管程
+    ///(可能被他人抢占 → `entry.wait` 循环)→ 恢复原重入计数。释表锁后再锁 inner(drop-before-recurse)。
+    pub(crate) fn object_wait(&mut self, obj: Reference, millis: i64) -> Result<(), VmError> {
+        if obj.is_null() {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/NullPointerException",
+            ));
+        }
+        if millis < 0 {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/IllegalArgumentException",
+            ));
+        }
+        let owner = self.main_thread();
+        // 锁表取 Arc clone(无该对象 → 未持有 → IMSE)。先提取 owned Option<Arc>、释表 guard,
+        // 再 IMSE(throw_exception 须 &mut self,不能持表 guard)。
+        let mon = self.shared.monitors.lock().unwrap().get(&obj).cloned();
+        let Some(mon) = mon else {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/IllegalMonitorStateException",
+            ));
+        };
+        let mut guard = mon.inner.lock().unwrap();
+        // CHECK_OWNER(objectMonitor.cpp:1741):owner 须为当前线程。
+        if guard.owner != Some(owner) {
+            drop(guard);
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/IllegalMonitorStateException",
+            ));
+        }
+        let saved_count = guard.count;
+        // 释管程:owner/count 归零、waiters+1、唤醒 entry 等待者(使其能进入管程)。
+        guard.owner = None;
+        guard.count = 0;
+        guard.waiters += 1;
+        let my_seq = guard.wake_seq;
+        // 持 inner guard 调 entry.notify_one(std 允许;waiter 须重获 inner,blocked 至 wait_cvar.wait 释)。
+        mon.entry.notify_one();
+        // wait_cvar 阻塞:释 inner 锁、唤醒重获。wait[_timeout]_while 谓词真(wake_seq 未变)→ 继续等
+        //(抗 spurious wakeup);notify/notifyAll 推 wake_seq → 谓词假 → 返回(或超时到)。
+        let mut guard = if millis == 0 {
+            mon.wait_cvar
+                .wait_while(guard, |inner| inner.wake_seq == my_seq)
+                .unwrap()
+        } else {
+            mon.wait_cvar
+                .wait_timeout_while(guard, Duration::from_millis(millis as u64), |inner| {
+                    inner.wake_seq == my_seq
+                })
+                .unwrap()
+                .0
+        };
+        // 唤醒后:waiters-1、重获管程(可能被他人抢占 → entry 等待循环)、恢复重入计数。
+        guard.waiters -= 1;
+        while guard.owner.is_some() && guard.owner != Some(owner) {
+            guard = mon.entry.wait(guard).unwrap();
+        }
+        guard.owner = Some(owner);
+        guard.count = saved_count;
+        Ok(())
+    }
+
+    /// `Object.notify()`(JLS §17.2.2;移植 `ObjectSynchronizer::notify` synchronizer.cpp:543 +
+    /// `ObjectMonitor::notify` objectMonitor.cpp:2108)。null → NPE;未持有 → IMSE(`CHECK_OWNER`);
+    /// 无等待者(`_wait_set==nullptr`)→ no-op(objectMonitor.cpp:2111);否则推 `wake_seq` +
+    /// `wait_cvar.notify_one`(唤醒一个等待者)。
+    pub(crate) fn object_notify(&mut self, obj: Reference) -> Result<(), VmError> {
+        self.object_notify_common(obj, false)
+    }
+
+    /// `Object.notifyAll()`(JLS §17.2.3;移植 `ObjectSynchronizer::notifyall` synchronizer.cpp:556 +
+    /// `ObjectMonitor::notifyAll` objectMonitor.cpp:2136)。同 notify,但 `wait_cvar.notify_all`(唤醒全部)。
+    pub(crate) fn object_notify_all(&mut self, obj: Reference) -> Result<(), VmError> {
+        self.object_notify_common(obj, true)
+    }
+
+    /// notify/notifyAll 共用核(null→NPE、未持有→IMSE、waiters>0 推 wake_seq 并唤醒)。`all` 控全部。
+    /// 推 wake_seq 后**先释 inner guard 再 notify**(标准做法:让被唤醒 waiter 即刻重获 inner)。
+    fn object_notify_common(&mut self, obj: Reference, all: bool) -> Result<(), VmError> {
+        if obj.is_null() {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/NullPointerException",
+            ));
+        }
+        let owner = self.main_thread();
+        let mon = self.shared.monitors.lock().unwrap().get(&obj).cloned();
+        let Some(mon) = mon else {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/IllegalMonitorStateException",
+            ));
+        };
+        let mut guard = mon.inner.lock().unwrap();
+        // CHECK_OWNER(objectMonitor.cpp:2109/2137):owner 须为当前线程。
+        if guard.owner != Some(owner) {
+            drop(guard);
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/IllegalMonitorStateException",
+            ));
+        }
+        // wait_set 空 → no-op(objectMonitor.cpp:2111/2139);否则推 wake_seq、释 guard、唤醒。
+        if guard.waiters > 0 {
+            guard.wake_seq += 1;
+            drop(guard);
+            if all {
+                mon.wait_cvar.notify_all();
+            } else {
+                mon.wait_cvar.notify_one();
+            }
+        }
+        Ok(())
     }
 }
 

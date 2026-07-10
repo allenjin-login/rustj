@@ -146,6 +146,12 @@ pub(super) fn dispatch(
             "putIntVolatile",
             "(Ljava/lang/Object;JI)V",
         ) => put_int_volatile(vm, args),
+        // jdk.internal.misc.Unsafe.getLongVolatile(Object,long)J —— Unsafe.java:2439 native。
+        // **Phase B.4a**:o=null + NEXT_THREAD_ID_OFFSET → 堆外「下一 tid」计数器
+        //(ThreadIdentifiers.next()→getAndAddLong 路径);否则 Instance=ord 读 long 槽(单线程 volatile=plain)。
+        ("jdk/internal/misc/Unsafe", "getLongVolatile", "(Ljava/lang/Object;J)J") => {
+            get_long_volatile(vm, args)
+        }
         (
             "jdk/internal/misc/Unsafe",
             "compareAndSetLong",
@@ -525,6 +531,25 @@ fn put_int_volatile(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     Ok(Value::Void)
 }
 
+/// `Unsafe.getLongVolatile(Object o, long offset)J` —— Unsafe.java:2439 native。单线程 volatile=plain。
+/// **o=null + [`NEXT_THREAD_ID_OFFSET`]** → 堆外「下一线程 tid」计数器(ThreadIdentifiers.next 路径,
+/// 由 `Thread.getNextThreadIdOffset` 返回此哨兵;HotSpot 该计数器 off-heap,rustj 以
+/// `ThreadManager.next_tid` 承载);否则 Instance=ord 读 long 槽(经 [`read_slot`]),非 long 槽 → 0。
+/// 数组 long 读取走 `getLong`(array_le_bytes);本原生仅实例/静态-哨兵(B.4a 仅此路径被构造器触及)。
+fn get_long_volatile(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset) = match (args.first(), args.get(1)) {
+        (Some(Value::Reference(o)), Some(Value::Long(off))) => (*o, *off),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    if o.is_null() && offset == crate::runtime::vm::NEXT_THREAD_ID_OFFSET {
+        return Ok(Value::Long(vm.read_next_thread_id()));
+    }
+    Ok(match read_slot(vm, o, offset) {
+        Some(Slot::Long(v)) => Value::Long(v),
+        _ => Value::Long(0),
+    })
+}
+
 /// `Unsafe.compareAndSetLong(Object o, long offset, long expected, long x)Z` —— Unsafe.java:2061
 /// native。经 [`read_slot`] 读 long 槽 == expected → [`write_slot`] 写 x 返 true,否则 false。
 /// 镜像 `compare_and_set_int` 的 long 版(CHM.transfer 的 transferIndex CAS 走此)。仅 `Slot::Long`;
@@ -539,6 +564,10 @@ fn compare_and_set_long(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
         ) => (*o, *off, *e, *x),
         _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
     };
+    // 堆外「下一 tid」哨兵(getAndAddLong 循环的 CAS 步;ThreadIdentifiers.next 路径)。
+    if o.is_null() && offset == crate::runtime::vm::NEXT_THREAD_ID_OFFSET {
+        return Ok(Value::Int(if vm.cas_next_thread_id(expected, x) { 1 } else { 0 }));
+    }
     let matches = matches!(read_slot(vm, o, offset), Some(Slot::Long(cur)) if cur == expected);
     if matches {
         write_slot(vm, o, offset, Slot::Long(x))?;

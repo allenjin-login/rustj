@@ -29,6 +29,14 @@ mod threads;
 /// 可经 [`Vm::with_stack_limit`] 调整(SOE 测试用小值快速触发)。
 pub const DEFAULT_STACK_LIMIT: u32 = 512;
 
+/// **哨兵"偏移"**:堆外「下一线程 tid」计数器,由 `Thread.getNextThreadIdOffset()`
+/// (Thread.java:2628)返回。HotSpot 把该计数器放堆外(注释:"off-heap and shared with the VM");
+/// rustj 以 [`super::vm::threads::ThreadManager`] 的 `next_tid` 承载。`Unsafe.getLongVolatile(null, 此值)`
+/// 与 `compareAndSetLong(null, 此值, ..)`(jdk_internal.rs)特判路由至此——解锁 `ThreadIdentifiers.next()`
+/// = `getAndAddLong(null, NEXT_TID_OFFSET, 1)`(Thread 构造器 tid 分配)。负值避开实例 ord(小正)
+/// 与数组偏移(≥ ARRAY_BYTE_BASE_OFFSET=16)的命名空间。
+pub(crate) const NEXT_THREAD_ID_OFFSET: i64 = i64::MIN + 7;
+
 /// 一个 Java 栈帧的身份切片(供栈轨迹):声明类内部名 + 方法名 + 抛出点 bci。
 ///
 /// `pc` = 当前指令起始字节码偏移(`run()` 分派前写入);抛出时即抛点 bci,

@@ -517,6 +517,15 @@ pub(super) fn dispatch(
             vm.start_thread(this_ref).map(|()| Value::Void)
         }
 
+        // Thread.getNextThreadIdOffset()J —— Thread.java:2628 `private static native`。返回「下一
+        // 线程 tid」计数器的地址(HotSpot 注释:"off-heap and shared with the VM")。rustj 无堆外内存,
+        // 故返回**哨兵偏移** [`NEXT_THREAD_ID_OFFSET`](vm.rs);`Unsafe.getLongVolatile(null, 此值)` /
+        // `compareAndSetLong(null, 此值, ..)`(jdk_internal.rs)特判路由至 `ThreadManager.next_tid`。
+        // 解锁 `ThreadIdentifiers.next()` = `getAndAddLong(null, NEXT_TID_OFFSET, 1)`(Thread 构造器 tid 分配)。
+        ("java/lang/Thread", "getNextThreadIdOffset", "()J") => {
+            Ok(Value::Long(crate::runtime::vm::NEXT_THREAD_ID_OFFSET))
+        }
+
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }

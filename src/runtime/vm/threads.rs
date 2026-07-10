@@ -18,14 +18,18 @@ pub(crate) struct ThreadManager {
     /// handle 经此表显式 join(防 detach;进程退出时未 join 的 Arc<VmShared> 由末存者释)。
     pub(crate) handles:
         std::sync::Mutex<std::collections::HashMap<Reference, std::thread::JoinHandle<()>>>,
+    /// 系统 ThreadGroup 单例(B.4a;main 线程 holder.group,`new Thread(r)` 构造器复用之)。
+    /// 惰性分配;`system_thread_group` 首调置位。对应 HotSpot `Threads::create_vm` 创建的顶层组。
+    pub(crate) system_group: std::sync::Mutex<Option<Reference>>,
 }
 
 impl ThreadManager {
-    /// 构造(tid 起始 1,故 main 线程 tid=1;空 JoinHandle 表)。
+    /// 构造(tid 起始 1,故 main 线程 tid=1;空 JoinHandle 表;未分配系统组)。
     pub(crate) fn new() -> Self {
         Self {
             next_tid: std::sync::Mutex::new(1),
             handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+            system_group: std::sync::Mutex::new(None),
         }
     }
 }
@@ -52,6 +56,9 @@ impl Vm {
     /// 即得。无注册表 / Thread 未预载 → 返 null。借用:先借注册表取 `&'a LoadedClass` + `new_instance`
     /// (§6 `'a` 不绑 `&self`),出块后 `heap_mut` 分配,再 `set_instance_field_by_name` 置字段
     ///(`set_instance_field_by_name` 在 [`super::mirrors`]。
+    ///
+    /// **B.4a**:额外置 `holder` 字段([`Self::bootstrap_main_holder`])——main 线程作 `parent` 时,
+    /// `new Thread(r)` 构造器读 `parent.getThreadGroup()`/`getPriority()`/`isDaemon()`(均经 holder)。
     fn alloc_main_thread(&mut self) -> Reference {
         let inst = {
             let Some(reg) = self.shared.registry.as_ref() else {
@@ -73,7 +80,104 @@ impl Vm {
             self.set_instance_field_by_name(r, "java/lang/Thread", "name", Slot::Reference(name_ref));
         }
         self.set_instance_field_by_name(r, "java/lang/Thread", "tid", Slot::Long(tid as i64));
+        // B.4a:holder 引导(FieldHolder + 系统 ThreadGroup;真运行场景类已加载)。
+        self.bootstrap_main_holder(r);
         r
+    }
+
+    /// 系统 ThreadGroup 单例(惰性;B.4a)。对应 HotSpot 顶层 "system"/"main" 组(`Threads::create_vm`)。
+    /// 命中缓存即返;否则 [`Self::alloc_system_thread_group`] 分配并缓存。未加载 ThreadGroup → null。
+    pub(crate) fn system_thread_group(&mut self) -> Reference {
+        if let Some(r) = *self.shared.threads.system_group.lock().unwrap() {
+            return r;
+        }
+        let r = self.alloc_system_thread_group();
+        if !r.is_null() {
+            *self.shared.threads.system_group.lock().unwrap() = Some(r);
+        }
+        r
+    }
+
+    /// 分配系统 ThreadGroup(`new_instance` 不跑 `<init>`),按名置 `name="main"`、
+    /// `maxPriority=Thread.MAX_PRIORITY(10)`(ThreadGroup.java:102 私有 `<init>` 的 VM 引导等价)。
+    /// `new Thread(r)` 构造器经 `parent.getThreadGroup()` 复用此组。未加载 → null。
+    fn alloc_system_thread_group(&mut self) -> Reference {
+        let inst = {
+            let Some(reg) = self.shared.registry.as_ref() else {
+                return Reference::null();
+            };
+            let Some(lc) = reg.get("java/lang/ThreadGroup") else {
+                return Reference::null();
+            };
+            reg.new_instance(lc)
+        };
+        let r = self.heap_mut().alloc(Oop::Instance(inst));
+        if r.is_null() {
+            return r;
+        }
+        if let Ok(name_ref) = crate::runtime::interpreter::string::intern(self, "main") {
+            self.set_instance_field_by_name(r, "java/lang/ThreadGroup", "name", Slot::Reference(name_ref));
+        }
+        // maxPriority=10(Thread.MAX_PRIORITY;ThreadGroup.java:105)。getMaxPriority 真字节码读此字段。
+        self.set_instance_field_by_name(r, "java/lang/ThreadGroup", "maxPriority", Slot::Int(10));
+        r
+    }
+
+    /// 置 main 线程 `holder` 字段(VM 引导,非跑 `<init>`;B.4a 对应 D2)。分配 `Thread$FieldHolder` 实例,
+    /// 按名置 `holder.{group=系统组, priority=NORM_PRIORITY(5), daemon=false, threadStatus=0(NEW),
+    /// stackSize=0}`(task 默认 null)。使 `new Thread(r)` 构造器的 `parent.getThreadGroup()`/
+    /// `getPriority()`/`isDaemon()`/`isTerminated()`(均经 holder)可用。FieldHolder/ThreadGroup 未加载
+    ///(单测最小设置)→ 静默跳过(保既有 main_thread 无 holder 行为,不破坏既有测试)。
+    fn bootstrap_main_holder(&mut self, main: Reference) {
+        let group = self.system_thread_group();
+        if group.is_null() {
+            return;
+        }
+        let holder = {
+            let Some(reg) = self.shared.registry.as_ref() else {
+                return;
+            };
+            let Some(lc) = reg.get("java/lang/Thread$FieldHolder") else {
+                return;
+            };
+            let inst = reg.new_instance(lc);
+            self.heap_mut().alloc(Oop::Instance(inst))
+        };
+        if holder.is_null() {
+            return;
+        }
+        self.set_instance_field_by_name(
+            holder,
+            "java/lang/Thread$FieldHolder",
+            "group",
+            Slot::Reference(group),
+        );
+        self.set_instance_field_by_name(
+            holder,
+            "java/lang/Thread$FieldHolder",
+            "priority",
+            Slot::Int(5),
+        );
+        self.set_instance_field_by_name(
+            holder,
+            "java/lang/Thread$FieldHolder",
+            "daemon",
+            Slot::Int(0),
+        );
+        self.set_instance_field_by_name(
+            holder,
+            "java/lang/Thread$FieldHolder",
+            "threadStatus",
+            Slot::Int(0),
+        );
+        self.set_instance_field_by_name(
+            holder,
+            "java/lang/Thread$FieldHolder",
+            "stackSize",
+            Slot::Long(0),
+        );
+        // task 默认 null(无需显式置)。holder 入 main 线程。
+        self.set_instance_field_by_name(main, "java/lang/Thread", "holder", Slot::Reference(holder));
     }
 
     /// 取并递增下一线程 tid(供 Thread 镜像 tid 字段;main 线程取首值 1,后续递增)。
@@ -83,6 +187,24 @@ impl Vm {
         let v = *tid;
         *tid += 1;
         v
+    }
+
+    /// 读堆外「下一线程 tid」计数器(`Unsafe.getLongVolatile(null, NEXT_THREAD_ID_OFFSET)`,
+    /// 经 `ThreadIdentifiers.next()→getAndAddLong`)。返回当前值(自增前)。见 [`Vm::next_thread_tid`]。
+    pub(crate) fn read_next_thread_id(&self) -> i64 {
+        *self.shared.threads.next_tid.lock().unwrap() as i64
+    }
+
+    /// CAS 堆外「下一线程 tid」计数器(`Unsafe.compareAndSetLong(null, NEXT_THREAD_ID_OFFSET, e, x)`)。
+    /// 当前 == expected → 写 new 返 true,否则 false。单线程构造期首 CAS 必中。供 `getAndAddLong` 循环。
+    pub(crate) fn cas_next_thread_id(&self, expected: i64, new: i64) -> bool {
+        let mut g = self.shared.threads.next_tid.lock().unwrap();
+        if *g as i64 == expected {
+            *g = new as u64;
+            true
+        } else {
+            false
+        }
     }
 
     /// `Thread.start0` 真起线程(Phase B.3b;移植 `JVM_StartThread`,jvm.cpp)。`this` = Thread
@@ -179,5 +301,29 @@ impl Vm {
     /// 真实 Thread(已加载)上写;桩(bootstrap)无此字段则静默跳过(同 [`Vm::alloc_main_thread`]。
     pub(crate) fn set_eetop(&mut self, this: Reference, val: i64) {
         self.set_instance_field_by_name(this, "java/lang/Thread", "eetop", Slot::Long(val));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 锁定堆外「下一线程 tid」计数器的 read/CAS 往返语义(B.4a)。
+    /// `ThreadIdentifiers.next()` = 字节码 `getAndAddLong(null, NEXT_TID_OFFSET, 1)` 循环 =
+    /// `read_next_thread_id` + `cas_next_thread_id` —— 构造器闸门只经构造器间接走一次 CAS,
+    /// 本测直接钉住 round-trip(成功 CAS 写新值;失配 CAS 不改值返 false),防回归。
+    #[test]
+    fn next_thread_id_cas_round_trip() {
+        let mut vm = Vm::default();
+        let initial = vm.read_next_thread_id();
+        // 当前 == initial → 写 initial+1,返 true。
+        assert!(vm.cas_next_thread_id(initial, initial + 1));
+        assert_eq!(vm.read_next_thread_id(), initial + 1);
+        // 当前(initial+1)!= initial → 失配,不改值,返 false。
+        assert!(!vm.cas_next_thread_id(initial, initial + 5));
+        assert_eq!(vm.read_next_thread_id(), initial + 1);
+        // next_thread_tid 走同一计数器(递增取值):此后取值 == initial+1,计数器 → initial+2。
+        assert_eq!(vm.next_thread_tid(), (initial + 1) as u64);
+        assert_eq!(vm.read_next_thread_id(), initial + 2);
     }
 }

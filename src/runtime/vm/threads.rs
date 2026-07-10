@@ -7,19 +7,25 @@
 use crate::oops::Oop;
 use crate::runtime::{Reference, Slot, Vm};
 
-/// 线程管理器(B.2.3b T7)。当前仅持 tid 分配器;B.3b 增线程表(句柄→Thread 上下文)、
-/// 调度顺延。对应 HotSpot `Threads` 表的 rustj 侧子集。字段 `pub(crate)`:`VmShared`
-///(`super::vm`)按值持有 + `next_thread_tid` 跨模块(本模块)访问。
+/// 线程管理器(B.2.3b T7)。当前持 tid 分配器;B.3b 增 JoinHandle 表(已启动线程的 OS
+/// 句柄),给 `join_thread` 阻塞至子完。对应 HotSpot `Threads` 表(持各 `JavaThread` 的
+/// join 句柄)的 rustj 侧子集。main 线程单例、tid 分配、`Thread` 镜像字段填充归此。
 pub(crate) struct ThreadManager {
     /// 下一线程 tid(`Thread.tid` 递增;main 线程取首值 1,后续递增)。
     pub(crate) next_tid: std::sync::Mutex<u64>,
+    /// 已启动线程的 JoinHandle 表(B.3b;键 = Thread 实例句柄)。`start_thread` spawn 后插入;
+    /// `join_thread` 取出 join(阻塞至子完)。线程结束/未在表 → 空。子线程 `run()` 完即终止,
+    /// handle 经此表显式 join(防 detach;进程退出时未 join 的 Arc<VmShared> 由末存者释)。
+    pub(crate) handles:
+        std::sync::Mutex<std::collections::HashMap<Reference, std::thread::JoinHandle<()>>>,
 }
 
 impl ThreadManager {
-    /// 构造(tid 起始 1,故 main 线程 tid=1)。
+    /// 构造(tid 起始 1,故 main 线程 tid=1;空 JoinHandle 表)。
     pub(crate) fn new() -> Self {
         Self {
             next_tid: std::sync::Mutex::new(1),
+            handles: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -77,5 +83,101 @@ impl Vm {
         let v = *tid;
         *tid += 1;
         v
+    }
+
+    /// `Thread.start0` 真起线程(Phase B.3b;移植 `JVM_StartThread`,jvm.cpp)。`this` = Thread
+    /// 实例。null → NPE。取 `Arc::clone(&self.shared)` → `std::thread::spawn` 子 OS 线程:子
+    /// `Vm::from_shared` 派生(共享堆/注册表/管程;独立调用栈)→ 置 `thread_ref = this`(子线程
+    /// 身份)→ 置 `eetop` 非 0(标记 alive)→ 跑虚分派 `run()V` → 终止置 `eetop=0`。
+    /// `JoinHandle` 存 `ThreadManager.handles`(键=this);[`Vm::join_thread`] 阻塞 join。
+    ///
+    /// spawn 闭包 move 捕获 `shared`(`Arc<VmShared>: 'static`,B.3.0)+ `this`(`Reference: Copy`)。
+    /// 子线程 `run_thread_body` 的异常顺延(B.4:子线程未捕获异常处理 / `Thread.dispatchUncaughtException`)。
+    pub(crate) fn start_thread(&mut self, this: Reference) -> Result<(), crate::runtime::VmError> {
+        if this.is_null() {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/NullPointerException",
+            ));
+        }
+        let shared = self.shared_arc();
+        let handle = std::thread::spawn(move || {
+            let mut child = Self::from_shared(shared);
+            // 子线程身份 = 此 Thread 实例(`currentThread()` 返它;管程 owner 据此区分线程)。
+            child.thread.thread_ref = Some(this);
+            // 标记 alive:eetop 非 0(VM 管理字段;Thread.java:265,`alive()` = eetop!=0)。
+            child.set_eetop(this, 1);
+            // 跑 Thread.run()V(虚分派;override 优先)。异常丢弃(B.4 顺延)。
+            let res = child.run_thread_body(this);
+            // 终止:eetop=0(`isAlive()`=false)。B.3c 增 `notifyAll`(Thread.exit → join 唤醒)。
+            child.set_eetop(this, 0);
+            let _ = res;
+        });
+        self.shared
+            .threads
+            .handles
+            .lock()
+            .unwrap()
+            .insert(this, handle);
+        Ok(())
+    }
+
+    /// 阻塞至 `this` 线程结束(Phase B.3b;取 `ThreadManager.handles` 的 JoinHandle → `join`)。
+    /// 供 Rust 侧测试 / 未来 native 桥确认子线程完成。未在表(未 start / 已 join)→ 空操作。
+    /// **注意**:真 Java `Thread.join()` 走 `synchronized + wait(0)` 循环(B.3c Object.wait/notify),
+    /// 非本 Rust 直 join;本方法为 VM 内部确定性等待(测试用)。
+    #[allow(dead_code)] // 仅 #[cfg(test)] 闸门引用 → 非 test lib 构建视为 dead。
+    pub(crate) fn join_thread(&self, this: Reference) {
+        if let Some(h) = self.shared.threads.handles.lock().unwrap().remove(&this) {
+            let _ = h.join();
+        }
+    }
+
+    /// 子线程体(B.3b):虚分派解析 `run()V`(按 `this` 运行时类——子类 override 优先),建帧
+    ///(`locals[0] = this`),经解释器跑真字节码。移植 HotSpot `JavaThread::run` → `thread_entry`
+    /// → `call_virtual(run)`。不经 `run_with_depth`(其在私有 `interpreter::invoke` 模块,vm 不可
+    /// 达);顶层入口帧 frame_depth 不 +1(无害 off-by-one;嵌套 invoke 自带 depth)。
+    fn run_thread_body(&mut self, this: Reference) -> Result<(), crate::runtime::VmError> {
+        use crate::runtime::{Frame, Interpreter, Value, VmError};
+        // this 运行时类(owned;后续 &mut self 须先释 heap guard)。
+        let runtime_class = {
+            let heap = self.heap();
+            match heap.get(this) {
+                Some(Oop::Instance(i)) => i.class_name().to_string(),
+                _ => return Err(VmError::BadConstant("start0:this 须为 Instance")),
+            }
+        };
+        let reg = self
+            .registry()
+            .ok_or(VmError::BadConstant("start0 须类注册表"))?;
+        let (target_lc, target_method) = match reg.resolve_dispatch(&runtime_class, "run", "()V") {
+            Some(x) => x,
+            None => {
+                return Err(crate::runtime::interpreter::throw_exception(
+                    self,
+                    "java/lang/AbstractMethodError",
+                ))
+            }
+        };
+        let Some(code) = target_method.code.as_ref() else {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/AbstractMethodError",
+            ));
+        };
+        let interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
+            .with_exception_table(&code.exception_table);
+        let mut frame = Frame::new(code.max_locals, code.max_stack);
+        frame.locals.set_reference(0, this)?;
+        match interp.interpret_with(&mut frame, self)? {
+            Value::Void => Ok(()),
+            _ => Err(VmError::BadConstant("Thread.run 须 void")),
+        }
+    }
+
+    /// 置 `Thread.eetop` 字段(VM 管理字段;Thread.java:265)。`set_instance_field_by_name` 在
+    /// 真实 Thread(已加载)上写;桩(bootstrap)无此字段则静默跳过(同 [`Vm::alloc_main_thread`]。
+    pub(crate) fn set_eetop(&mut self, this: Reference, val: i64) {
+        self.set_instance_field_by_name(this, "java/lang/Thread", "eetop", Slot::Long(val));
     }
 }

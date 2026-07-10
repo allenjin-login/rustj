@@ -463,9 +463,13 @@ pub(super) fn dispatch(
         }
 
         // Thread.start0()V —— Thread.java:1507 `private native`(实例)。移植 `JVM_StartThread`
-        // (os::create_thread):创建新 OS 线程跑 target.run()。**B.1 单线程桩:空操作**(不并发);
-        // B.3 升级为 `std::thread::spawn` 跑 holder.task.run() + JoinHandle 生命周期管理。
-        ("java/lang/Thread", "start0", "()V") => Ok(Value::Void),
+        // (os::create_thread):创建新 OS 线程跑虚分派 `run()V`(子类 override 优先)。**Phase B.3b
+        // 真起线程**:`Vm::start_thread`(threads.rs)取 `Arc::clone(&shared)` → `std::thread::spawn`
+        // 子线程 `Vm::from_shared` 派生 + 跑 `run()V` + eetop 生命周期 + JoinHandle 入表。
+        ("java/lang/Thread", "start0", "()V") => {
+            let this_ref = this.unwrap_or_else(Reference::null);
+            vm.start_thread(this_ref).map(|()| Value::Void)
+        }
 
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
@@ -1040,6 +1044,118 @@ mod tests {
             .ok()
             .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
             .filter(|p| p.exists())
+    }
+
+    /// javac 是否可用(PATH)。B.3b 闸门编译真 Java `Worker extends Thread`。
+    fn javac_available() -> bool {
+        std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// javac 编译单个 public 类到临时目录,返回该目录。
+    fn compile_dir(source: &str, public_name: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rustj-b3b-{n}-{}-{public_name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join(format!("{public_name}.java"));
+        std::fs::write(&src, source).unwrap();
+        let out = std::process::Command::new("javac")
+            .arg("-d")
+            .arg(&dir)
+            .arg(&src)
+            .output()
+            .expect("javac 执行失败");
+        assert!(
+            out.status.success(),
+            "javac 失败:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir
+    }
+
+    /// 读 `class.name` 静态 int 字段(经 `static_storage`,跨线程经其 Mutex 可见)。
+    fn read_static_int(vm: &Vm, class: &str, name: &str) -> i32 {
+        use crate::metadata::descriptor::FieldType;
+        let reg = vm.registry().expect("须注册表");
+        let (lc, ord) = reg
+            .resolve_static_field(class, name, &FieldType::Int)
+            .unwrap_or_else(|| panic!("静态字段 {class}.{name} 未找到"));
+        match lc.static_storage.lock().unwrap()[ord] {
+            Slot::Int(i) => i,
+            s => panic!("期望 Slot::Int,得 {s:?}"),
+        }
+    }
+
+    /// **RED→GREEN**(Phase B.3b):`Thread.start0()V`(Thread.java:1507 `private native` 实例)。
+    /// 移植 `JVM_StartThread`:取 `this`(Thread 实例)→ `std::thread::spawn` 子 OS 线程跑虚分派
+    /// `run()V`(子类 override 优先)→ 子线程 `putstatic Worker.v = 42`。主线程 `join_thread` 阻塞
+    /// 至子完,读 `Worker.v` == 42(跨线程经 static_storage Mutex 可见)。
+    ///
+    /// 闸门不经由 Java `Thread.start()`(其 `holder.threadStatus` 路径需 main 线程 holder/ThreadGroup
+    /// 引导,顺延),而是直调 start0 native 分派 + `Vm::join_thread`——隔离测「spawn + 子线程跑
+    /// 真字节码 + 跨线程共享静态」核心语义(同 B.3a 用 `std::thread` 直测管程阻塞)。
+    ///
+    /// RED:start0 当前空操作桩(`Ok(Value::Void)`)→ 不 spawn → `Worker.v` 留 0(且 `join_thread`
+    /// 未实现 → 编译失败:方法缺失 = 特性缺失 RED)。GREEN:start0 spawn + join。
+    #[test]
+    fn start0_spawns_thread_running_overridden_run() {
+        if !javac_available() {
+            eprintln!("跳过:无 javac");
+            return;
+        }
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+
+        // Worker extends Thread,override run() 写静态 v(不经 lambda/FieldHolder,缩窄闸门面)。
+        const SRC: &str = r#"
+public class Worker extends Thread {
+    public static int v;
+    public void run() { v = 42; }
+}
+"#;
+        // 1) javac 编译 Worker;载入注册表。
+        let dir = compile_dir(SRC, "Worker");
+        let mut registry = ClassRegistry::new();
+        let wcf = crate::classfile::parse(&std::fs::read(dir.join("Worker.class")).unwrap()).unwrap();
+        registry.load(wcf).unwrap();
+        // 2) 真 Thread 从 jmod 载入(Worker extends Thread,须 Thread + 传递依赖)。
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
+        let mut vm = Vm::new(registry);
+
+        // 3) 分配 Worker 实例(不跑 <init> — override run() 不读实例字段)。
+        let w = {
+            let reg = vm.registry().expect("须注册表");
+            let lc = reg.get("Worker").expect("Worker 须已加载");
+            let inst = reg.new_instance(lc);
+            vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
+        };
+
+        // 4) start0 经 native 分派 → spawn 子线程跑 Worker.run()V(虚分派 override)。
+        super::super::invoke(&mut vm, "java/lang/Thread", "start0", "()V", Some(w), &[])
+            .expect("start0 应非抛");
+
+        // 5) join 子线程(阻塞至 run() 完)。
+        vm.join_thread(w);
+
+        // 6) Worker.v → 42(子线程 putstatic;跨线程经 static_storage Mutex 可见)。
+        assert_eq!(
+            read_static_int(&vm, "Worker", "v"),
+            42,
+            "start0 须起子线程跑 run() 写 v=42"
+        );
     }
 
     /// 取实例 `referent` 字段序号(声明于 Reference;子类扁平布局同序)。

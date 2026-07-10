@@ -235,7 +235,6 @@ impl Vm {
     /// 从既有共享态派生新 Vm(B.3b 真线程:每线程各持 `Arc::clone` 的共享态 + 独立 `ThreadContext`)。
     /// 调用方先 [`Vm::shared_arc`] 取 `Arc::clone(&vm.shared)`,再经本方法构造派生线程的 Vm。
     /// 共享态(堆/池/管程/镜像表)跨线程共享;线程隔离态(调用栈/帧深度/线程镜像)各独立。
-    #[allow(dead_code)] // B.3b 真线程将用(派生线程 Vm);当前仅 #[test] 引用 → 非 test lib 构建视为 dead。
     pub(crate) fn from_shared(shared: Arc<VmShared>) -> Self {
         Self {
             shared,
@@ -244,8 +243,7 @@ impl Vm {
     }
 
     /// 取共享态的 `Arc::clone`(供 [`Vm::from_shared`] 派生线程 Vm;`shared` 字段私有)。
-    /// B.3.0:返 `Arc<VmShared>`(`'static`),B.3b 可 `move` 进 `thread::spawn` 闭包。
-    #[allow(dead_code)] // B.3b 真线程将用(派生前 Arc::clone 共享态);当前仅 #[test] 引用 → 非 test lib 构建视为 dead。
+    /// B.3.0:返 `Arc<VmShared>`(`'static`),B.3b `start_thread` `move` 进 `thread::spawn` 闭包。
     pub(crate) fn shared_arc(&self) -> Arc<VmShared> {
         Arc::clone(&self.shared)
     }

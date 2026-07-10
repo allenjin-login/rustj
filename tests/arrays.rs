@@ -73,7 +73,7 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
         .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
 }
 
-fn run(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
+fn run(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
     let lc = registry
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -84,7 +84,7 @@ fn run(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Va
         .unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
@@ -145,6 +145,7 @@ fn sum_int_array() {
         return;
     }
     let reg = compile_and_load_all(SOURCE, "Arrays");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "Arrays", "sumInts", "()I"), Value::Int(15));
 }
 
@@ -155,6 +156,7 @@ fn byte_array_sign_extension() {
         return;
     }
     let reg = compile_and_load_all(SOURCE, "Arrays");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "Arrays", "byteRoundTrip", "()I"), Value::Int(-56));
 }
 
@@ -165,6 +167,7 @@ fn char_array_zero_extension() {
         return;
     }
     let reg = compile_and_load_all(SOURCE, "Arrays");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(
         run(&reg, "Arrays", "charRoundTrip", "()I"),
         Value::Int(65535)
@@ -178,6 +181,7 @@ fn long_array_sum() {
         return;
     }
     let reg = compile_and_load_all(SOURCE, "Arrays");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "Arrays", "sumLongs", "()J"), Value::Long(30));
 }
 
@@ -188,6 +192,7 @@ fn double_array_sum() {
         return;
     }
     let reg = compile_and_load_all(SOURCE, "Arrays");
+    let reg = std::sync::Arc::new(reg);
     match run(&reg, "Arrays", "sumDoubles", "()D") {
         Value::Double(v) => assert!((v - 4.0).abs() < 1e-9, "got {v}"),
         other => panic!("期望 double,得到 {other:?}"),
@@ -201,6 +206,7 @@ fn reference_array_round_trip() {
         return;
     }
     let reg = compile_and_load_all(SOURCE, "Arrays");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "Arrays", "refArray", "()I"), Value::Int(3));
 }
 
@@ -211,5 +217,6 @@ fn array_length() {
         return;
     }
     let reg = compile_and_load_all(SOURCE, "Arrays");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "Arrays", "lengthOf", "()I"), Value::Int(7));
 }

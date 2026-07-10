@@ -20,7 +20,7 @@ use super::super::throw_exception;
 
 /// `java/io/*` native 分派。未登记 → `UnsatisfiedLinkError`。
 pub(super) fn dispatch(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class: &str,
     name: &str,
     desc: &str,
@@ -73,7 +73,7 @@ pub(super) fn dispatch(
 ///
 /// **失败**:`std::fs::canonicalize` 要求路径存在;不存在 / 无权限 → `IOException`(对应
 /// `Java_java_io_..._canonicalize0` 失败时 `JNU_ThrowIOExceptionWithLastError`)。
-fn canonicalize0(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+fn canonicalize0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     // 取 path 实参(Java String → Rust String)。非 Reference / null → NPE(JNI 解引用 jstring)。
     let path = match args.first().copied() {
         Some(Value::Reference(r)) if !r.is_null() => {
@@ -114,7 +114,7 @@ fn strip_verbatim_prefix(s: &str) -> String {
 /// 最终目标(HotSpot `GetFinalPathNameByHandle`)。`canonicalize`(jdk-25.0.2 wrapper)在 `canonicalize0`
 /// 后无条件调之,IOException → 回退 `canonicalize0` 结果。rustj 的 `canonicalize0` 已用
 /// `std::fs::canonicalize` 全解析(含符号链接 → 最终目标),故此处再解析冗余 → **恒等返原输入**。
-fn get_final_path_0(_vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+fn get_final_path_0(_vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     Ok(match args.first().copied() {
         Some(v @ Value::Reference(_)) => v,
         _ => Value::Reference(Reference::null()),
@@ -125,7 +125,7 @@ fn get_final_path_0(_vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> 
 /// `std::fs::metadata`(=HotSpot `getFinalAttributes`/`GetFileAttributesEx`)→ 返位掩码:
 /// `BA_EXISTS=0x01`(存在)/`BA_REGULAR=0x02`(普通文件)/`BA_DIRECTORY=0x04`(目录)/`BA_HIDDEN=0x08`;
 /// 不存在(Err,=INVALID_FILE_ATTRIBUTES)→ 0。File 类名常量 `FileSystem.java:123-126`。
-fn get_boolean_attributes_0(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+fn get_boolean_attributes_0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     const BA_EXISTS: i32 = 0x01;
     const BA_REGULAR: i32 = 0x02;
     const BA_DIRECTORY: i32 = 0x04;
@@ -155,7 +155,7 @@ fn get_boolean_attributes_0(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, Vm
 
 /// 读 `java/io/File` 实例 `path` 字段(String)的文本。非 File 实例 / 字段缺失 / null path → `None`。
 /// 沿用 `install_system_props` 的 `flattened_instance_fields().position(name)` 模式定位字段全局序号。
-fn file_path_text(vm: &Vm<'_>, file_ref: Reference) -> Result<Option<String>, VmError> {
+fn file_path_text(vm: &Vm, file_ref: Reference) -> Result<Option<String>, VmError> {
     use crate::oops::Oop;
     use crate::runtime::Slot;
 
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn init_ids_returns_void() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let r = super::super::invoke(
             &mut vm,
             "java/io/WinNTFileSystem",
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn file_descriptor_init_ids_returns_void() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let r = super::super::invoke(
             &mut vm,
             "java/io/FileDescriptor",
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn file_descriptor_get_handle_and_get_append_return_placeholders() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         // getHandle(0/1/2) → 0/1/2(placeholder;非 -1 即非 invalid handle)。
         for fd in [0i32, 1, 2] {
             let h = super::super::invoke(
@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn unbound_java_io_native_throws_ule() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let err = super::super::invoke(
             &mut vm,
             "java/io/WinNTFileSystem",

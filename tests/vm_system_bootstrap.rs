@@ -69,11 +69,9 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
 }
 
 /// 解释执行一个**无参静态方法**(共用传入 Vm)。抛 Java 异常时把类名带出,便于定位下一缺口。
-fn run_static_int(vm: &mut Vm<'_>, class: &str, name: &str) -> Result<i32, String> {
-    let lc = vm
-        .registry()
-        .and_then(|r| r.get(class))
-        .unwrap_or_else(|| panic!("类 {class} 未加载"));
+fn run_static_int(vm: &mut Vm, class: &str, name: &str) -> Result<i32, String> {
+    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表"));
+    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc.cf.methods.iter().find(|m| {
         use rustj::constant_pool::ConstantPoolEntry;
         let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
@@ -151,7 +149,7 @@ fn initialize_system_class_sets_system_props() {
     load_closure(&mut registry, &cp, "java/util/Properties").unwrap();
     load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     // 3) VM 原生 Phase 1 引导 —— 现含 System.props 构造(本层新增)。
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
 
@@ -203,7 +201,7 @@ fn initialize_system_class_populates_launcher_props() {
     load_closure(&mut registry, &cp, "java/util/Properties").unwrap();
     load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
 
     // file.separator 首字符 = MAIN_SEPARATOR(Windows=\,Unix=/);修前返 -1(null→charAt NPE 前兆)。
@@ -247,7 +245,7 @@ fn initialize_system_class_bootstraps_saved_props() {
     load_closure(&mut registry, &cp, "java/lang/String").unwrap();
     assert!(!registry.get("java/lang/Integer").unwrap().is_synthetic_stub(), "Integer 须为真类");
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
 
     // 3) **VM 原生 Phase 1 引导**(替代旧 RustjBootstrap.init()):savedProps 置空 HashMap、initLevel(1)。
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
@@ -255,7 +253,8 @@ fn initialize_system_class_bootstraps_saved_props() {
     // 4) VM.initLevel() = 1(Phase 1 完成);VM.getSavedProperty("x") = null(非 IllegalStateException)。
     assert_eq!(run_static_int(&mut vm, "jdk/internal/misc/VM", "initLevel"), Ok(1), "initLevel 须为 1");
     // getSavedProperty(String) 返 String;未设键 → null。返 null 表示 savedProps 已就绪(否则抛异常)。
-    let lc = vm.registry().and_then(|r| r.get("jdk/internal/misc/VM")).expect("VM 须已加载");
+    let reg = vm.registry().expect("类注册表");
+    let lc = reg.get("jdk/internal/misc/VM").expect("VM 须已加载");
     let get_prop = lc.cf.methods.iter().find(|m| {
         use rustj::constant_pool::ConstantPoolEntry;
         let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "getSavedProperty");

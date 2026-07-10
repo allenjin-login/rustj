@@ -76,7 +76,7 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
 }
 
 /// 运行 `class_name.name(desc)`,带其**异常表**(同帧 try/catch 与跨帧捕获的调用者表)。
-fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
+fn run(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -89,14 +89,14 @@ fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
     // 入口解释器必须带上本方法异常表:同帧 athrow 靠它找处理者;跨帧时它作为
     // 调用者表供 invoke 的 finish_invoke 扫描。
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(reg));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
 }
 
 /// 运行并断言失败:捕获未处理的用户异常以 `ThrownException` 上传。
-fn run_err(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> VmError {
+fn run_err(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> VmError {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -107,7 +107,7 @@ fn run_err(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> VmE
         .unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(reg));
     interp
         .interpret_with(&mut frame, &mut vm)
         .expect_err("期望失败")
@@ -265,6 +265,7 @@ fn caught_exact_type() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtExact", "()I")), 1);
 }
 
@@ -275,6 +276,7 @@ fn caught_supertype() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtSuper", "()I")), 2);
 }
 
@@ -285,6 +287,7 @@ fn caught_after_skipping_non_matching() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtAfterSkip", "()I")), 3);
 }
 
@@ -295,6 +298,7 @@ fn caught_cross_frame_via_invoke() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtCrossFrame", "()I")), 4);
 }
 
@@ -305,6 +309,7 @@ fn caught_finally_catch_all() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtFinally", "()I")), 5);
 }
 
@@ -315,6 +320,7 @@ fn uncaught_propagates_as_thrown_exception() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert!(is_thrown(run_err(&reg, "ThrowGate", "uncaught", "()I")));
 }
 
@@ -327,6 +333,7 @@ fn jvm_thrown_npe_is_caught() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchNpe", "()I")), 1);
 }
 
@@ -337,6 +344,7 @@ fn jvm_thrown_arithmetic_is_caught() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchArithmetic", "()I")), 1);
 }
 
@@ -347,6 +355,7 @@ fn jvm_thrown_aioobe_is_caught() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchAioobe", "()I")), 1);
 }
 
@@ -357,6 +366,7 @@ fn jvm_thrown_cce_is_caught() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchCce", "()I")), 1);
 }
 
@@ -367,6 +377,7 @@ fn jvm_thrown_npe_caught_by_supertype_exception() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchNpeAsException", "()I")), 1);
 }
 
@@ -377,5 +388,6 @@ fn jvm_thrown_npe_caught_by_throwable() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ThrowGate");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchNpeAsThrowable", "()I")), 1);
 }

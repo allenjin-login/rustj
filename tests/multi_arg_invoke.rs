@@ -72,14 +72,14 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
 }
 
 /// 运行 `MultiArg.name(desc)`(无参静态方法)。抛 Java 异常时带出类名便于诊断。
-fn run(reg: &ClassRegistry, name: &str, desc: &str) -> Value {
+fn run(reg: &std::sync::Arc<ClassRegistry>, name: &str, desc: &str) -> Value {
     let lc = reg.get("MultiArg").unwrap();
     let m = find_method(&lc.cf, name, desc);
     let code = m.code.as_ref().unwrap();
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp =
         Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(reg));
     match interp.interpret_with(&mut frame, &mut vm) {
         Ok(v) => v,
         Err(rustj::runtime::VmError::ThrownException(r)) => {
@@ -140,6 +140,7 @@ fn invokespecial_two_args_keep_order() {
         return;
     }
     let reg = compile_and_load();
+    let reg = std::sync::Arc::new(reg);
     // 正确 70;若 invokespecial 漏 reverse → ctor 把 b 写入 x、a 写入 y → -70。
     assert_eq!(as_int(run(&reg, "ctorOrder", "()I")), 70);
 }
@@ -151,6 +152,7 @@ fn invokevirtual_three_args_keep_order() {
         return;
     }
     let reg = compile_and_load();
+    let reg = std::sync::Arc::new(reg);
     // 正确 10305;若 invokevirtual 漏 reverse → 实参倒置入局部变量 → 900。
     assert_eq!(as_int(run(&reg, "callOrder", "()I")), 10305);
 }

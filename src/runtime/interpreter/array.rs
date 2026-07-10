@@ -23,7 +23,7 @@ pub(super) enum ArrayKind {
 }
 
 /// `newarray`:弹 count,按 atype 造默认元素数组,入堆,压引用。
-pub(super) fn new_array(frame: &mut Frame, vm: &mut Vm<'_>, atype: u8) -> Result<(), VmError> {
+pub(super) fn new_array(frame: &mut Frame, vm: &mut Vm, atype: u8) -> Result<(), VmError> {
     let count = frame.operands.pop_int()?;
     if count < 0 {
         return Err(throw_exception(vm, "java/lang/NegativeArraySizeException"));
@@ -62,7 +62,7 @@ fn array_descriptor(component: &str) -> String {
 pub(super) fn a_new_array(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class_index: u16,
 ) -> Result<(), VmError> {
     let component = resolve_class_name(interp.cp(), class_index)?;
@@ -105,7 +105,7 @@ fn parse_array_descriptor(desc: &str) -> Result<(usize, Slot), VmError> {
 /// 最后一层:`dims == ndim` 填叶子默认值;`dims < ndim` 填 null(余下维度未分配)。
 /// `desc` 为全描述符(如 `[[I`);本层(第 `depth` 级)描述符 = 去掉 depth 个前导 `[`。
 fn alloc_multi(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     counts: &[i32],
     depth: usize,
     ndim: usize,
@@ -139,7 +139,7 @@ fn alloc_multi(
 pub(super) fn multi_new_array(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class_index: u16,
     dims: u8,
 ) -> Result<(), VmError> {
@@ -162,7 +162,7 @@ pub(super) fn multi_new_array(
 }
 
 /// `arraylength`:弹 arrayref,null 检查,压长度。
-pub(super) fn array_length(frame: &mut Frame, vm: &mut Vm<'_>) -> Result<(), VmError> {
+pub(super) fn array_length(frame: &mut Frame, vm: &mut Vm) -> Result<(), VmError> {
     let arrayref = frame.operands.pop_reference()?;
     if arrayref.is_null() {
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
@@ -184,7 +184,7 @@ pub(super) fn array_length(frame: &mut Frame, vm: &mut Vm<'_>) -> Result<(), VmE
 /// `*aload`:弹 index、弹 arrayref,null + 越界检查,按种类压值(byte/char/short 扩展)。
 pub(super) fn array_load(
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     kind: ArrayKind,
 ) -> Result<(), VmError> {
     let index = frame.operands.pop_int()?;
@@ -282,7 +282,7 @@ fn push_array_value(frame: &mut Frame, kind: ArrayKind, slot: Slot) -> Result<()
 /// byte/char/short 存原始 int(扩展统一推迟到加载侧,与符号/零扩展等价)。
 pub(super) fn array_store(
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     kind: ArrayKind,
 ) -> Result<(), VmError> {
     let value = pop_array_value(frame, kind)?;
@@ -333,7 +333,7 @@ pub(super) fn array_store(
                 _ => return Err(VmError::BadConstant("aastore 目标非数组")),
             };
             let elem_comp = super::arraycopy::element_component(vm, *elem)?;
-            !super::arraycopy::component_assignable(&elem_comp, &array_comp, reg)
+            !super::arraycopy::component_assignable(&elem_comp, &array_comp, &reg)
         };
         if not_assignable {
             return Err(throw_exception(vm, "java/lang/ArrayStoreException"));

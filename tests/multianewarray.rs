@@ -71,7 +71,7 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
         .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
 }
 
-fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
+fn run(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -82,7 +82,7 @@ fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
         .unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(reg));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
@@ -124,6 +124,7 @@ fn full_allocation_write_and_read() {
         return;
     }
     let reg = compile_and_load(SOURCE, "MultiArray");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "MultiArray", "fullAlloc", "()I"), Value::Int(16));
 }
 
@@ -134,6 +135,7 @@ fn multi_dimension_lengths() {
         return;
     }
     let reg = compile_and_load(SOURCE, "MultiArray");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "MultiArray", "lengths", "()I"), Value::Int(6));
 }
 
@@ -144,6 +146,7 @@ fn partial_dimension_is_null() {
         return;
     }
     let reg = compile_and_load(SOURCE, "MultiArray");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "MultiArray", "partialIsNull", "()I"), Value::Int(1));
 }
 
@@ -154,6 +157,7 @@ fn three_dim_partial_inner_null() {
         return;
     }
     let reg = compile_and_load(SOURCE, "MultiArray");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(
         run(&reg, "MultiArray", "threeDimPartial", "()I"),
         Value::Int(1)

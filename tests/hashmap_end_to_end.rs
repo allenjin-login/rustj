@@ -66,11 +66,9 @@ fn compile_dir(source: &str, public_name: &str, extra: &[&str]) -> PathBuf {
     dir
 }
 
-fn run_static_in(vm: &mut Vm<'_>, class: &str, name: &str, desc: &str) -> Result<Value, String> {
-    let lc = vm
-        .registry()
-        .and_then(|r| r.get(class))
-        .unwrap_or_else(|| panic!("类 {class} 未加载"));
+fn run_static_in(vm: &mut Vm, class: &str, name: &str, desc: &str) -> Result<Value, String> {
+    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表"));
+    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc
         .cf
         .methods
@@ -172,7 +170,7 @@ fn real_hashmap_end_to_end() {
         load_closure(&mut registry, &cp, cls).unwrap();
     }
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     run_static_in(&mut vm, "RustjBootstrap", "init", "()V").expect("引导不应抛异常");
 
     assert_eq!(

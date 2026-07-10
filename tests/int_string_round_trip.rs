@@ -51,9 +51,10 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
     dir
 }
 
-fn run_int(vm: &mut Vm<'_>, name: &str) -> Result<i32, VmError> {
+fn run_int(vm: &mut Vm, name: &str) -> Result<i32, VmError> {
     use rustj::constant_pool::ConstantPoolEntry;
-    let lc = vm.registry().and_then(|r| r.get("IntStr")).expect("IntStr 须已加载");
+    let reg = vm.registry().expect("类注册表");
+    let lc = reg.get("IntStr").expect("IntStr 须已加载");
     let method = lc.cf.methods.iter().find(|m| {
         let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
         let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()I");
@@ -88,7 +89,7 @@ fn int_string_round_trip() {
     load_closure(&mut registry, &cp, "java/lang/StringBuilder").unwrap();
     load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     let n = run_int(&mut vm, "sbToStringLen").unwrap_or_else(|e| panic!("sbToStringLen 失败:{e:?}"));
     assert_eq!(n, 3, "append(123).toString() → \"123\" 长度 3");
     let v = run_int(&mut vm, "valueOfLen").unwrap_or_else(|e| panic!("valueOfLen 失败:{e:?}"));

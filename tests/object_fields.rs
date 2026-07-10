@@ -88,13 +88,13 @@ enum Arg {
 }
 
 /// 执行静态方法,返回结果值(失败则 panic)。
-fn run(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str, args: &[Arg]) -> Value {
+fn run(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str, args: &[Arg]) -> Value {
     run_result(registry, class_name, name, desc, args).unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
 }
 
 /// 执行静态方法,返回 `Result`(供断言异常路径)。
 fn run_result(
-    registry: &ClassRegistry,
+    registry: &std::sync::Arc<ClassRegistry>,
     class_name: &str,
     name: &str,
     desc: &str,
@@ -122,12 +122,12 @@ fn run_result(
     }
 
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     interp.interpret_with(&mut frame, &mut vm)
 }
 
 /// 执行方法,断言其抛出运行时异常(统一为 `ThrownException`),返回异常对象的类内部名。
-fn run_thrown_class(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> String {
+fn run_thrown_class(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> String {
     let lc = registry
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -135,7 +135,7 @@ fn run_thrown_class(registry: &ClassRegistry, class_name: &str, name: &str, desc
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     let err = interp
         .interpret_with(&mut frame, &mut vm)
         .expect_err("期望抛出异常");
@@ -215,6 +215,7 @@ fn new_and_instance_int_fields_round_trip() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Objects");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "makeAndSum", "(II)I", &[Arg::I(3), Arg::I(4)]),
         Value::Int(7)
@@ -232,6 +233,7 @@ fn instance_long_field_round_trip() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Objects");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "tagRoundTrip", "(J)J", &[Arg::L(123_456_789_012)]),
         Value::Long(123_456_789_012)
@@ -245,6 +247,7 @@ fn static_int_field_round_trip_and_accumulate() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Objects");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "staticRoundTrip", "(I)I", &[Arg::I(42)]),
         Value::Int(42)
@@ -262,6 +265,7 @@ fn static_long_field_accumulate() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Objects");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "staticLongAccumulate", "(I)J", &[Arg::I(100)]),
         Value::Long(100)
@@ -275,6 +279,7 @@ fn reference_field_cross_object_access() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Objects");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "viaHolder", "(I)I", &[Arg::I(7)]),
         Value::Int(7)
@@ -288,6 +293,7 @@ fn new_object_has_default_zero_fields() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Objects");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "defaultField", "()I", &[]),
         Value::Int(0)
@@ -301,6 +307,7 @@ fn getfield_on_null_is_nullpointer() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Objects");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run_thrown_class(&registry, "Objects", "nullField", "()I"),
         "java/lang/NullPointerException"

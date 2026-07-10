@@ -79,7 +79,7 @@ enum Arg {
 
 /// 执行静态方法(支持 `invokestatic`):在注册表中定位方法,按实参类型与槽位约定
 /// 写入局部变量,返回结果值。`Vm` 持同一注册表,递归调用共享之。
-fn run(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str, args: &[Arg]) -> Value {
+fn run(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str, args: &[Arg]) -> Value {
     let lc = registry
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -110,7 +110,7 @@ fn run(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str, args:
     }
 
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
@@ -145,6 +145,7 @@ public class Recursion {
 }
 "#;
     let registry = compile_and_load(source, "Recursion");
+    let registry = std::sync::Arc::new(registry);
 
     // 递归 invokestatic(单 int 实参/返回)
     assert_eq!(run(&registry, "Recursion", "factorial", "(I)I", &[Arg::I(0)]), Value::Int(1));
@@ -199,6 +200,7 @@ public class Mixed {
 }
 "#;
     let registry = compile_and_load(source, "Mixed");
+    let registry = std::sync::Arc::new(registry);
 
     // pow(2, 10) = 1024:long 在 slot 0-1,int 在 slot 2
     assert_eq!(run(&registry, "Mixed", "pow", "(JI)J", &[Arg::L(2), Arg::I(10)]), Value::Long(1024));

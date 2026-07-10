@@ -73,13 +73,13 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
 }
 
 /// 执行无参静态方法,返回结果值(失败则 panic,打印 VmError 便于定位缺口)。
-fn run(registry: &ClassRegistry, name: &str, desc: &str) -> Value {
+fn run(registry: &std::sync::Arc<ClassRegistry>, name: &str, desc: &str) -> Value {
     let lc = registry.get("DupGate").expect("DupGate 须已加载");
     let method = find_method(&lc.cf, name, desc);
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("DupGate.{name}{desc} 执行失败:{e}"))
@@ -135,6 +135,7 @@ fn dup_family_real_bytecode() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "DupGate");
+    let registry = std::sync::Arc::new(registry);
 
     assert_eq!(run(&registry, "bumpArr", "()I"), Value::Int(15), "a[0]+=5");
     assert_eq!(run(&registry, "chainArr", "()I"), Value::Int(14), "a[0]=a[1]=7");

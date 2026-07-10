@@ -10,7 +10,7 @@ use crate::runtime::{Frame, Reference, Vm};
 
 /// 取 objectref(非 null)的(是否数组, 运行时类名)。own 字符串避免借用纠缠。
 /// 数组取其类型描述符(`[B` / `[Ljava/lang/String;`),实例取类内部名。
-fn object_type(vm: &Vm<'_>, objref: Reference) -> Result<(bool, Option<String>), VmError> {
+fn object_type(vm: &Vm, objref: Reference) -> Result<(bool, Option<String>), VmError> {
     let heap = vm.heap();
     let obj = heap
         .get(objref)
@@ -79,7 +79,7 @@ pub(super) fn array_instanceof(sub: &str, target: &str, reg: &crate::oops::Class
 /// 类注册表的 `is_instance`(超类链 ∪ 接口闭包)。
 fn matches(
     interp: &Interpreter<'_>,
-    vm: &Vm<'_>,
+    vm: &Vm,
     objref: Reference,
     index: u16,
 ) -> Result<bool, VmError> {
@@ -89,7 +89,7 @@ fn matches(
         .registry()
         .ok_or(VmError::BadConstant("checkcast/instanceof 需类注册表"))?;
     Ok(if is_array {
-        array_instanceof(class_name.as_deref().unwrap_or(""), &target, reg)
+        array_instanceof(class_name.as_deref().unwrap_or(""), &target, &reg)
     } else {
         reg.is_instance(class_name.as_deref().unwrap_or(""), &target)
     })
@@ -99,7 +99,7 @@ fn matches(
 pub(super) fn check_cast(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     index: u16,
 ) -> Result<(), VmError> {
     let objref = frame.operands.pop_reference()?;
@@ -120,7 +120,7 @@ pub(super) fn check_cast(
 pub(super) fn instance_of(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     index: u16,
 ) -> Result<(), VmError> {
     let objref = frame.operands.pop_reference()?;
@@ -181,7 +181,8 @@ mod tests {
     #[test]
     fn instanceof_shape_on_square_returns_one() {
         let (reg, cp) = build();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         let square_lc = reg.get("Square").unwrap();
         let inst = vm
             .heap_mut()
@@ -205,7 +206,8 @@ mod tests {
     #[test]
     fn instanceof_null_returns_zero() {
         let (reg, cp) = build();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         let code = [
             Opcode::AconstNull as u8,
             Opcode::Instanceof as u8,
@@ -224,7 +226,8 @@ mod tests {
     #[test]
     fn checkcast_shape_on_square_passes() {
         let (reg, cp) = build();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         let square_lc = reg.get("Square").unwrap();
         let inst = vm
             .heap_mut()
@@ -249,7 +252,8 @@ mod tests {
     #[test]
     fn checkcast_own_class_passes() {
         let (reg, cp) = build();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         let square_lc = reg.get("Square").unwrap();
         let inst = vm
             .heap_mut()

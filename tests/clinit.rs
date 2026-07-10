@@ -76,18 +76,18 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
 
 /// 运行 `class_name.name(desc)` 至返回;异常则 panic。各调用自带新 `Vm`(同一 `reg`,
 /// 故 `<clinit>` 状态跨调用保留),`<clinit>` 仅在首次 active use 触发。
-fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
+fn run(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
     let (result, _vm) = run_result(reg, class_name, name, desc);
     result.unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
 }
 
 /// 同 [`run`] 但保留结果(含 `Err`)+ 产出 `Vm`(供读堆上异常对象)。
-fn run_result<'a>(
-    reg: &'a ClassRegistry,
+fn run_result(
+    reg: &std::sync::Arc<ClassRegistry>,
     class_name: &str,
     name: &str,
     desc: &str,
-) -> (Result<Value, VmError>, Vm<'a>) {
+) -> (Result<Value, VmError>, Vm) {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -100,7 +100,7 @@ fn run_result<'a>(
     let interp =
         Interpreter::new(&code.code, &lc.cf.constant_pool)
             .with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(reg));
     let result = interp.interpret_with(&mut frame, &mut vm);
     (result, vm)
 }
@@ -113,7 +113,7 @@ fn as_int(v: Value) -> i32 {
 }
 
 /// 断言结果为 `ThrownException`,其堆对象类名 == `expected`。
-fn assert_throws_class(result: Result<Value, VmError>, vm: &Vm<'_>, expected: &str) {
+fn assert_throws_class(result: Result<Value, VmError>, vm: &Vm, expected: &str) {
     let Err(VmError::ThrownException(exc)) = result else {
         panic!("期望抛 ThrownException({expected}),得 {result:?}");
     };
@@ -162,6 +162,7 @@ fn static_initializer_runs_on_first_use() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ClinitGate");
+    let reg = std::sync::Arc::new(reg);
     // <clinit> 执行前 getstatic 会读默认 0;此处经 invokestatic getV 触发初始化 → 42。
     assert_eq!(as_int(run(&reg, "ClinitGate", "getV", "()I")), 42);
 }
@@ -173,6 +174,7 @@ fn static_block_runs_and_field_refs_resolve() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ClinitGate");
+    let reg = std::sync::Arc::new(reg);
     // derived = base + 5 = 15(<clinit> 内 getstatic base + 常量 + putstatic)。
     assert_eq!(as_int(run(&reg, "ClinitGate", "getDerived", "()I")), 15);
 }
@@ -184,6 +186,7 @@ fn clinit_runs_exactly_once() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ClinitGate");
+    let reg = std::sync::Arc::new(reg);
     // 多次 active use:<clinit> 仍只跑一次(counter 仅自增一次)。
     assert_eq!(as_int(run(&reg, "ClinitGate", "getV", "()I")), 42);
     assert_eq!(as_int(run(&reg, "ClinitGate", "getCounter", "()I")), 1);
@@ -197,6 +200,7 @@ fn superclass_clinit_runs_before_subclass() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ClinitGate");
+    let reg = std::sync::Arc::new(reg);
     // Sub.s = b + 1;须先初始化 Base(b=100)→ s = 101。
     assert_eq!(as_int(run(&reg, "Sub", "getS", "()I")), 101);
 }
@@ -208,6 +212,7 @@ fn failing_clinit_throws_exception_in_initializer_error() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ClinitGate");
+    let reg = std::sync::Arc::new(reg);
     // Bad.<clinit> → boom() 抛 ArithmeticException → 包成 ExceptionInInitializerError。
     {
         let (r, vm) = run_result(&reg, "Bad", "getX", "()I");

@@ -34,7 +34,7 @@ use super::super::{string, throw_exception};
 
 /// `jdk/internal/loader/*` native 分派。未登记 → `UnsatisfiedLinkError`。
 pub(super) fn dispatch(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class: &str,
     name: &str,
     desc: &str,
@@ -88,7 +88,7 @@ pub(super) fn dispatch(
 }
 
 /// 取实例的声明类内部名(写回字段时按类反查扁平布局序号)。
-fn instance_class_name(vm: &Vm<'_>, r: Reference) -> Option<String> {
+fn instance_class_name(vm: &Vm, r: Reference) -> Option<String> {
     match vm.heap().get(r) {
         Some(Oop::Instance(i)) => Some(i.class_name().to_string()),
         _ => None,
@@ -97,7 +97,7 @@ fn instance_class_name(vm: &Vm<'_>, r: Reference) -> Option<String> {
 
 /// 按字段名查它在声明类扁平实例布局中的序号(ord)。flattened_instance_fields 含继承字段;
 /// NativeLibraryImpl 的 handle/jniVersion 声明在自身(NativeLibrary 父类无实例字段)。
-fn named_field_ord(vm: &Vm<'_>, class_name: &str, field_name: &str) -> Option<usize> {
+fn named_field_ord(vm: &Vm, class_name: &str, field_name: &str) -> Option<usize> {
     vm.registry().and_then(|reg| {
         reg.get(class_name).and_then(|lc| {
             reg.flattened_instance_fields(lc)
@@ -115,7 +115,7 @@ fn named_field_ord(vm: &Vm<'_>, class_name: &str, field_name: &str) -> Option<us
 /// - 失败 + throwExceptionIfFail → 抛 `UnsatisfiedLinkError`;否则返 0。
 ///
 /// JNI 版本取 0x00010001(NativeLibraries.c:130 "无 OnLoad 符号"分支;rustj 无 JNIEnv 不调 OnLoad)。
-fn native_load(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+fn native_load(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     let (impl_ref, name_ref, is_builtin, throw_if_fail) =
         match (args.first(), args.get(1), args.get(2), args.get(3)) {
             (
@@ -163,7 +163,7 @@ fn native_load(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
 
 /// `NativeLibraries.unload(name, isBuiltin, handle)V` 的实现。!isBuiltin 时 `os::dll_unload`。
 /// 不调 JNI_OnUnload(rustj 无 JNIEnv);恒空操作返回 Void。
-fn native_unload(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+fn native_unload(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     let (name_ref, is_builtin, handle) = match (args.first(), args.get(1), args.get(2)) {
         (Some(Value::Reference(n)), Some(Value::Int(b)), Some(Value::Long(h))) => (*n, *b != 0, *h),
         _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
@@ -177,7 +177,7 @@ fn native_unload(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
 }
 
 /// `NativeLibrary.findEntry0(handle, name)J` = `os::dll_lookup`。未找到 → 0(null 指针)。
-fn find_entry0(vm: &mut Vm<'_>, args: &[Value]) -> Result<Value, VmError> {
+fn find_entry0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     let (handle, name_ref) = match (args.first(), args.get(1)) {
         (Some(Value::Long(h)), Some(Value::Reference(n))) => (*h, *n),
         _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
@@ -216,7 +216,7 @@ mod tests {
     }
 
     /// 读实例 Long 字段(按名定位 ord)——用于断言 native_load 写回了 handle。
-    fn read_long_field(vm: &Vm<'_>, r: Reference, field_name: &str) -> Option<i64> {
+    fn read_long_field(vm: &Vm, r: Reference, field_name: &str) -> Option<i64> {
         let cn = match vm.heap().get(r)? {
             Oop::Instance(i) => i.class_name().to_string(),
             _ => return None,
@@ -232,7 +232,7 @@ mod tests {
     }
 
     /// 读实例 Int 字段——用于断言 native_load 写回了 jniVersion(= JNI 1.1)。
-    fn read_int_field(vm: &Vm<'_>, r: Reference, field_name: &str) -> Option<i32> {
+    fn read_int_field(vm: &Vm, r: Reference, field_name: &str) -> Option<i32> {
         let cn = match vm.heap().get(r)? {
             Oop::Instance(i) => i.class_name().to_string(),
             _ => return None,
@@ -248,7 +248,7 @@ mod tests {
     }
 
     /// 构造一个 bare `NativeLibraryImpl` 实例(load native 只写 handle/jniVersion,不读其他字段)。
-    fn new_native_library_impl(vm: &mut Vm<'_>) -> Reference {
+    fn new_native_library_impl(vm: &mut Vm) -> Reference {
         let inst = {
             let reg = vm.registry().expect("须有注册表");
             let lc = reg
@@ -286,7 +286,7 @@ mod tests {
             load_closure(&mut registry, &cp, c).unwrap();
         }
 
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let impl_ref = new_native_library_impl(&mut vm);
         let name_ref = string::intern(&mut vm, "kernel32.dll").expect("intern 路径名");
 
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn bootloader_set_unnamed_module_returns_void() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let r = super::super::invoke(
             &mut vm,
             "jdk/internal/loader/BootLoader",

@@ -23,7 +23,7 @@ use super::super::throw_exception;
 
 /// `sun/nio/fs/*` native 分派。未登记 → `UnsatisfiedLinkError`。
 pub(super) fn dispatch(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class: &str,
     name: &str,
     desc: &str,
@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn windows_native_dispatcher_init_ids_returns_void() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let r = super::super::invoke(
             &mut vm,
             "sun/nio/fs/WindowsNativeDispatcher",

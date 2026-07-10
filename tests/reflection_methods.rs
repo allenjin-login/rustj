@@ -67,10 +67,10 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
     dir
 }
 
-fn run_static_int(vm: &mut Vm<'_>, class: &str, name: &str) -> Result<i32, String> {
-    let lc = vm
-        .registry()
-        .and_then(|r| r.get(class))
+fn run_static_int(vm: &mut Vm, class: &str, name: &str) -> Result<i32, String> {
+    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表缺失"));
+    let lc = reg
+        .get(class)
         .unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc.cf.methods.iter().find(|m| {
         use rustj::constant_pool::ConstantPoolEntry;
@@ -168,7 +168,7 @@ fn class_declared_methods0_constructs_method_array() {
         load_closure(&mut registry, &cp, c).unwrap();
     }
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
     bootstrap_module_system(&mut vm).expect("Phase 2 引导应成功");
 

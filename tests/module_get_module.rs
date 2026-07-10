@@ -69,11 +69,9 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
 }
 
 /// 解释执行一个无参静态 int 方法(共用传入 Vm)。抛 Java 异常时把类名带出。
-fn run_static_int(vm: &mut Vm<'_>, class: &str, name: &str) -> Result<i32, String> {
-    let lc = vm
-        .registry()
-        .and_then(|r| r.get(class))
-        .unwrap_or_else(|| panic!("类 {class} 未加载"));
+fn run_static_int(vm: &mut Vm, class: &str, name: &str) -> Result<i32, String> {
+    let reg = vm.registry().expect("类注册表");
+    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc.cf.methods.iter().find(|m| {
         use rustj::constant_pool::ConstantPoolEntry;
         let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
@@ -146,7 +144,7 @@ fn class_get_module_returns_real_module() {
     load_closure(&mut registry, &cp, "java/lang/String").unwrap();
     load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     // Phase 1(savedProps 引导,4.13)→ Integer 等 <clinit> 可跑。
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
 

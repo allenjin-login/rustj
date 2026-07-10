@@ -40,8 +40,9 @@ public class PathProbe {
 }
 "#;
 
-fn run_static_int(vm: &mut Vm<'_>, class: &str, name: &str) -> Result<i32, String> {
-    let lc = vm.registry().and_then(|r| r.get(class)).unwrap_or_else(|| panic!("类 {class} 未加载"));
+fn run_static_int(vm: &mut Vm, class: &str, name: &str) -> Result<i32, String> {
+    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表缺失"));
+    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc.cf.methods.iter().find(|m| {
         use rustj::constant_pool::ConstantPoolEntry;
         let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
@@ -90,7 +91,7 @@ fn static_property_encodings_populated_enables_path_of() {
     load_closure(&mut registry, &cp, "java/util/Properties").unwrap();
     load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
     assert_eq!(
         run_static_int(&mut vm, "PathProbe", "make"),

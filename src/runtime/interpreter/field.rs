@@ -133,7 +133,7 @@ fn push_field_value(frame: &mut Frame, ft: &FieldType, slot: Slot) -> Result<(),
 pub(super) fn new_instance(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class_index: u16,
 ) -> Result<(), VmError> {
     let class_name = resolve_class_name(interp.cp(), class_index)?;
@@ -155,7 +155,7 @@ pub(super) fn new_instance(
 pub(super) fn get_field(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     fieldref_index: u16,
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
@@ -194,7 +194,7 @@ pub(super) fn get_field(
 pub(super) fn put_field(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     fieldref_index: u16,
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
@@ -231,7 +231,7 @@ pub(super) fn put_field(
 pub(super) fn get_static(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     fieldref_index: u16,
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
@@ -259,7 +259,7 @@ pub(super) fn get_static(
 pub(super) fn put_static(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     fieldref_index: u16,
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;

@@ -54,11 +54,9 @@ public class AttrProbe {
 }
 "#;
 
-fn run_static_int(vm: &mut Vm<'_>, class: &str, name: &str) -> Result<i32, String> {
-    let lc = vm
-        .registry()
-        .and_then(|r| r.get(class))
-        .unwrap_or_else(|| panic!("类 {class} 未加载"));
+fn run_static_int(vm: &mut Vm, class: &str, name: &str) -> Result<i32, String> {
+    let reg = vm.registry().expect("类注册表");
+    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc.cf.methods.iter().find(|m| {
         use rustj::constant_pool::ConstantPoolEntry;
         let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
@@ -133,7 +131,7 @@ fn get_boolean_attributes0_reports_dir_file_missing() {
     load_closure(&mut registry, &cp, "java/util/Properties").unwrap();
     load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
 
     // cwd 是目录:isDirectory=1,isFile=0(BA_DIRECTORY 置位、BA_REGULAR 不置位)。

@@ -23,7 +23,7 @@ use super::super::throw_exception;
 
 /// `jdk/internal/reflect/*` native 分派。未登记 → `UnsatisfiedLinkError`。
 pub(super) fn dispatch(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class: &str,
     name: &str,
     desc: &str,
@@ -60,7 +60,7 @@ pub(super) fn dispatch(
 /// - **原语**(`int`/`long`/…)→ `ACC_PUBLIC|ACC_ABSTRACT|ACC_FINAL` = 0x0411(javadoc:原语 → 此组合)。
 ///
 /// null 参 / 非 Class 镜像 → `NullPointerException`(`JVM_GetClassAccessFlags` 对 null Class 的处置)。
-fn get_class_access_flags(vm: &mut Vm<'_>, args: &[Value]) -> Result<i32, VmError> {
+fn get_class_access_flags(vm: &mut Vm, args: &[Value]) -> Result<i32, VmError> {
     // class_arg_name 借 &vm 返 owned String,出 match 即释放 → 后续 throw_exception(&mut vm)/
     // registry() 无借用冲突。
     let internal = match super::class_arg_name(vm, args) {
@@ -75,10 +75,14 @@ fn get_class_access_flags(vm: &mut Vm<'_>, args: &[Value]) -> Result<i32, VmErro
         return Ok(0x0411);
     }
     // 普通类:读 class-file access_flags 低 13 位。类未加载(异常态)→ 0 兜底。
+    // `.map` 须嵌在 `and_then(|r| …)` 内:`r`(owned Arc)仅闭包内活,`&LoadedClass` 借之;
+    // 嵌套则 `.map` 在 `r` 存活时产 owned i32,避免返引用悬垂(B.3.0 Arc 局部寿命)。
     let bits = vm
         .registry()
-        .and_then(|r| r.get(&internal))
-        .map(|lc| lc.cf.access_flags.bits() as i32 & 0x1FFF)
+        .and_then(|r| {
+            r.get(&internal)
+                .map(|lc| lc.cf.access_flags.bits() as i32 & 0x1FFF)
+        })
         .unwrap_or(0);
     Ok(bits)
 }
@@ -126,7 +130,7 @@ mod tests {
         // 闭包预载 Object(传递性载 Class)→ intern_class_mirror 可分配真 Class Instance。
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         // 底帧:调用者(期望返回其 Class)。顶帧:调用 getCallerClass 的方法。
         vm.push_frame("java/lang/Object", "testCaller");
         vm.push_frame("java/lang/String", "run");
@@ -160,7 +164,7 @@ mod tests {
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         // 仅一帧(无调用者的调用者)→ invoke 推 getCallerClass 后栈深 = 2 < 3 → null。
         vm.push_frame("java/lang/String", "run");
         let r = super::super::invoke(
@@ -195,7 +199,7 @@ mod tests {
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
 
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let mirror = vm.intern_class_mirror("java/lang/Integer");
         let r = super::super::invoke(
             &mut vm,
@@ -209,14 +213,14 @@ mod tests {
         let Value::Int(flags) = r else {
             panic!("getClassAccessFlags 须返 int,得 {r:?}");
         };
+        // `.map` 嵌在 `and_then(|r| …)` 内:`r`(owned Arc)仅闭包内活,`&LoadedClass` 借之。
         let expected = vm
             .registry()
-            .and_then(|r| r.get("java/lang/Integer"))
-            .expect("Integer 须已加载")
-            .cf
-            .access_flags
-            .bits() as i32
-            & 0x1FFF;
+            .and_then(|r| {
+                r.get("java/lang/Integer")
+                    .map(|lc| lc.cf.access_flags.bits() as i32 & 0x1FFF)
+            })
+            .expect("Integer 须已加载");
         assert_eq!(
             flags, expected,
             "getClassAccessFlags 须 = cf.access_flags.bits() & 0x1FFF"
@@ -240,7 +244,7 @@ mod tests {
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let mirror = vm.intern_class_mirror("[B");
         let r = super::super::invoke(
             &mut vm,
@@ -271,7 +275,7 @@ mod tests {
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let mirror = vm.intern_class_mirror("int");
         let r = super::super::invoke(
             &mut vm,
@@ -293,7 +297,7 @@ mod tests {
     #[test]
     fn get_class_access_flags_null_arg_throws_npe() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let err = super::super::invoke(
             &mut vm,
             "jdk/internal/reflect/Reflection",
@@ -318,7 +322,7 @@ mod tests {
     #[test]
     fn unbound_reflection_native_throws_ule() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(&registry);
+        let mut vm = Vm::new(registry);
         let err = super::super::invoke(
             &mut vm,
             "jdk/internal/reflect/Reflection",

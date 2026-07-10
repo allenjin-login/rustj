@@ -73,13 +73,13 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
 
 /// 执行无参静态方法,返回结果值(失败则 panic,打印 VmError 便于定位缺口)。
 /// invokedynamic 解析 BootstrapMethods 须有方法身份(声明类)→ `with_identity`。
-fn run(registry: &ClassRegistry, name: &str, desc: &str) -> Value {
+fn run(registry: &std::sync::Arc<ClassRegistry>, name: &str, desc: &str) -> Value {
     let lc = registry.get("LambdaGate").expect("LambdaGate 须已加载");
     let method = find_method(&lc.cf, name, desc);
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool).with_identity("LambdaGate", name);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("LambdaGate.{name}{desc} 执行失败:{e}"))
@@ -112,6 +112,7 @@ fn lambda_real_bytecode() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "LambdaGate");
+    let registry = std::sync::Arc::new(registry);
 
     assert_eq!(run(&registry, "noCapture", "()I"), Value::Int(42), "x->x*2 applyAsInt(21)");
     assert_eq!(run(&registry, "capturing", "()I"), Value::Int(12), "x->x+base(base=7) apply(5)");

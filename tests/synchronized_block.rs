@@ -75,7 +75,7 @@ fn find_method<'a>(
 }
 
 /// 解释执行一个无参静态方法(带异常表——synchronized 块的 monitorexit 释放依赖异常表)。
-fn run_static(registry: &ClassRegistry, vm: &mut Vm<'_>, class: &str, name: &str, desc: &str) -> Result<Value, VmError> {
+fn run_static(registry: &std::sync::Arc<ClassRegistry>, vm: &mut Vm, class: &str, name: &str, desc: &str) -> Result<Value, VmError> {
     let lc = registry.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = find_method(&lc.cf, &lc.cf.constant_pool, name, desc);
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
@@ -161,7 +161,8 @@ fn synchronized_block_uses_real_monitor_semantics() {
     for cls in ["java/lang/Object", "java/lang/Thread", "java/lang/RuntimeException", "java/lang/String"] {
         load_closure(&mut registry, &cp, cls).unwrap();
     }
-    let mut vm = Vm::new(&registry);
+    let registry = std::sync::Arc::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(&registry));
 
     // 基本:块体执行并返回 42。
     assert_eq!(

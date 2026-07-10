@@ -74,9 +74,10 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
     dir
 }
 
-fn run_int(vm: &mut Vm<'_>, name: &str) -> i32 {
+fn run_int(vm: &mut Vm, name: &str) -> i32 {
     use rustj::constant_pool::ConstantPoolEntry;
-    let lc = vm.registry().and_then(|r| r.get("IndyConcat")).expect("IndyConcat 须已加载");
+    let reg = vm.registry().expect("IndyConcat 须已加载");
+    let lc = reg.get("IndyConcat").expect("IndyConcat 须已加载");
     let method = lc
         .cf
         .methods
@@ -128,7 +129,7 @@ fn invokedynamic_make_concat_with_constants() {
     cp.add("java.base.jmod", &bytes).unwrap();
     load_closure(&mut registry, &cp, "java/lang/String").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     assert_eq!(run_int(&mut vm, "selfConcatLength"), 6, "(s+s).length() 须为 6");
     assert_eq!(run_int(&mut vm, "mixedConcat"), 3, "(\"n=\"+7).length() 须为 3");
 }

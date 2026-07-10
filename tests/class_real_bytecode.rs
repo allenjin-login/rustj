@@ -66,11 +66,9 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
     dir
 }
 
-fn run_static_in(vm: &mut Vm<'_>, name: &str) -> Result<Value, String> {
-    let lc = vm
-        .registry()
-        .and_then(|r| r.get("Cb"))
-        .expect("Cb 须已加载");
+fn run_static_in(vm: &mut Vm, name: &str) -> Result<Value, String> {
+    let reg = vm.registry().expect("类注册表");
+    let lc = reg.get("Cb").expect("Cb 须已加载");
     let method = lc.cf.methods.iter().find(|m| {
         use rustj::constant_pool::ConstantPoolEntry;
         let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
@@ -171,7 +169,7 @@ fn real_class_bytecode_on_real_mirror() {
         "java/lang/Class 须为真类(退役前提)"
     );
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
 
     // 3) 每法断言:正数=成功。
     assert_eq!(run_static_in(&mut vm, "nameOk"), Ok(Value::Int(1)), "getName 真字节码");

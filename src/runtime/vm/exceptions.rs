@@ -25,7 +25,7 @@ pub(super) struct ExceptionMeta {
     pub(super) message: Option<String>,
 }
 
-impl<'a> Vm<'a> {
+impl Vm {
     /// 在抛出点快照当前调用链,绑定到异常句柄(此刻 `call_stack` 满)。
     /// 等价 HotSpot `Throwable.fillInStackTrace` 捕获语义——stub 异常不经真 `<init>`,
     /// 故 `throw_exception` 直接调之;`fillInStackTrace` native 亦调之(为真 Throwable 预留)。
@@ -56,7 +56,7 @@ impl<'a> Vm<'a> {
     /// `pc` 落在 `code` 长度内(重载按 pc 范围消歧)→ 其 `LineNumberTable` 取最大
     /// `start_pc ≤ pc` 的 `line_number`;配合 `SourceFile` 文件名。文件名与行号**须同时**
     /// 可得(对齐 HotSpot:无文件则不印行);否则 `None`。镜像 `Method::line_number_from_bci`。
-    pub(crate) fn frame_source(&self, f: &CallFrame) -> Option<(&str, u16)> {
+    pub(crate) fn frame_source(&self, f: &CallFrame) -> Option<(String, u16)> {
         use crate::classfile::attributes::LineNumberEntry;
         use crate::constant_pool::ConstantPoolEntry;
         let reg = self.registry()?;
@@ -90,7 +90,7 @@ impl<'a> Vm<'a> {
             }
         }
         match (file, best.map(|(_, line)| line)) {
-            (Some(f_name), Some(line)) => Some((f_name, line)),
+            (Some(f_name), Some(line)) => Some((f_name.to_string(), line)),
             _ => None,
         }
     }

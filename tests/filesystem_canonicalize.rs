@@ -102,13 +102,13 @@ fn canonicalize0_resolves_cwd() {
     load_closure(&mut registry, &cp, "java/util/Properties").unwrap();
     load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
 
     // 运行 CanonProbe.cwdLen():返 cwd 规范路径长度。修前抛 UnsatisfiedLinkError(canonicalize0 未登记)。
-    let lc = vm
-        .registry()
-        .and_then(|r| r.get("CanonProbe"))
+    let reg = vm.registry().expect("类注册表");
+    let lc = reg
+        .get("CanonProbe")
         .expect("CanonProbe 须加载");
     let method = lc.cf.methods.iter().find(|m| {
         use rustj::constant_pool::ConstantPoolEntry;

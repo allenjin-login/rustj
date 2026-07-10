@@ -94,8 +94,9 @@ public class Cm {
 }
 "#;
 
-fn run_int(vm: &mut Vm<'_>, name: &str) -> i32 {
-    let lc = vm.registry().and_then(|r| r.get("Cm")).expect("Cm 须已加载");
+fn run_int(vm: &mut Vm, name: &str) -> i32 {
+    let reg = vm.registry().expect("类注册表");
+    let lc = reg.get("Cm").expect("Cm 须已加载");
     let m = find_method(lc, name, "()I");
     let code = m.code.as_ref().expect("{name} 须有 Code");
     let mut frame = Frame::new(code.max_locals, code.max_stack);
@@ -140,7 +141,7 @@ fn class_mirrors_are_canonical() {
     load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
     assert!(!registry.get("java/lang/Object").unwrap().is_synthetic_stub(), "Object 须为真类");
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
 
     // 3) 三法:1=两次 ldc 同引用;2=getClass==字面量;3=异类异镜像。
     assert_eq!(run_int(&mut vm, "literalTwice"), 1, "Cm.class 两次 ldc 须为同一 Class 镜像(intern)");

@@ -45,7 +45,7 @@ pub(super) enum InvokeFlow {
 fn finish_invoke(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     caller_pc: usize,
     result: Result<Value, VmError>,
     return_type: ReturnDescriptor,
@@ -86,8 +86,8 @@ fn finish_invoke(
 /// `frame_depth >= stack_limit` 时直接抛 `java/lang/StackOverflowError`
 /// ([`VmError::ThrownException`]),不进入 `f`。
 pub(crate) fn run_with_depth<R>(
-    vm: &mut Vm<'_>,
-    f: impl FnOnce(&mut Vm<'_>) -> Result<R, VmError>,
+    vm: &mut Vm,
+    f: impl FnOnce(&mut Vm) -> Result<R, VmError>,
 ) -> Result<R, VmError> {
     if vm.thread.frame_depth >= vm.thread.stack_limit {
         return Err(throw_exception(vm, "java/lang/StackOverflowError"));
@@ -283,7 +283,7 @@ fn pop_args(frame: &mut Frame, params: &[FieldType]) -> Result<Vec<Arg>, VmError
 fn dispatch_native(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     caller_pc: usize,
     class: &str,
     name: &str,
@@ -307,7 +307,7 @@ fn dispatch_native(
 fn run_callee(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     caller_pc: usize,
     target_lc: &LoadedClass,
     target_method: &MethodInfo,
@@ -355,7 +355,7 @@ fn run_callee(
 fn dispatch_lambda(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     caller_pc: usize,
     lambda: LambdaOop,
     args: Vec<Arg>,
@@ -493,7 +493,7 @@ fn arg_from_value(v: Value) -> Result<Arg, VmError> {
 pub(super) fn invoke_dynamic(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -616,7 +616,7 @@ fn resolve_recipe(cp: &ConstantPool, bsm_args: &[u16]) -> Result<String, VmError
 /// `` 占位取下一个实参按其类型字符串化;其它字符字面量拼入;``(常量占位)
 /// 少见于简单拼接,本层 best-effort 跳过(记债)。结果经 `string::intern` 规范化。
 fn concat_with_recipe(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     recipe: &str,
     args: &[Arg],
     param_types: &[FieldType],
@@ -645,7 +645,7 @@ fn concat_with_recipe(
 
 /// 把单个动态实参按其字段类型字符串化,追加到 `out`(对应 Java `String.valueOf` 语义)。
 /// float/double 用 Rust `{:?}` 格式(**非 Java 精确**:NaN/无穷/定点规则,独立债,后续)。
-fn stringify_arg(vm: &Vm<'_>, arg: &Arg, ft: &FieldType, out: &mut String) {
+fn stringify_arg(vm: &Vm, arg: &Arg, ft: &FieldType, out: &mut String) {
     use std::fmt::Write;
     match (ft, arg) {
         // 引用:null → "null"(Java 语义);非 null String → 读文本(非 String 罕见,best-effort 跳过)。
@@ -683,7 +683,7 @@ fn stringify_arg(vm: &Vm<'_>, arg: &Arg, ft: &FieldType, out: &mut String) {
 /// 取实现身份。捕获 = 已按 factoryType 形参弹出的动态实参(`pop_args` 结果)。
 /// 结果为新分配的 `Oop::Lambda` 引用,按调用点返回类型(函数式接口)回填。
 fn build_lambda(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     cp: &ConstantPool,
     bsm_args: &[u16],
     factory_return: &ReturnDescriptor,
@@ -705,7 +705,7 @@ fn build_lambda(
 pub(super) fn invoke_static(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     methodref_index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -766,7 +766,7 @@ pub(super) fn invoke_static(
 pub(super) fn invoke_special(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     methodref_index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -847,7 +847,7 @@ pub(super) fn invoke_special(
 pub(super) fn invoke_virtual(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     methodref_index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -941,7 +941,7 @@ pub(super) fn invoke_virtual(
 pub(super) fn invoke_interface(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     methodref_index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -1076,7 +1076,7 @@ mod tests {
         // limit=2:外层→depth1,中层→depth2,内层 depth>=limit → 抛 StackOverflowError;
         // 异常路径仍对称归零。
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg).with_stack_limit(2);
+        let mut vm = crate::runtime::Vm::new(reg).with_stack_limit(2);
         let r = super::run_with_depth(&mut vm, |vm| {
             super::run_with_depth(vm, |vm| super::run_with_depth(vm, |_| Ok(())))
         });

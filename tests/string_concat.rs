@@ -96,6 +96,7 @@ fn string_concat_end_to_end() {
     load_closure(&mut registry, &cp, "java/lang/String").unwrap();
     load_closure(&mut registry, &cp, "java/lang/StringBuilder").unwrap();
 
+    let registry = std::sync::Arc::new(registry);
     let lc = registry.get("StringConcat").unwrap();
     let method = lc
         .cf
@@ -112,7 +113,7 @@ fn string_concat_end_to_end() {
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp =
         Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(&registry));
 
     match interp.interpret_with(&mut frame, &mut vm) {
         Ok(rustj::runtime::Value::Int(n)) => {

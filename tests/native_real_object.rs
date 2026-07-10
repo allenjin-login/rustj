@@ -69,13 +69,13 @@ fn find_method<'a>(cf: &'a rustj::metadata::ClassFile, cp: &rustj::constant_pool
 }
 
 /// 解释执行一个静态方法。
-fn run_static(registry: &ClassRegistry, class: &str, name: &str, desc: &str) -> Result<Value, VmError> {
+fn run_static(registry: &std::sync::Arc<ClassRegistry>, class: &str, name: &str, desc: &str) -> Result<Value, VmError> {
     let lc = registry.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = find_method(&lc.cf, &lc.cf.constant_pool, name, desc);
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     interp.interpret_with(&mut frame, &mut vm)
 }
 
@@ -120,6 +120,7 @@ fn real_object_hashcode_runs_via_native_dispatch() {
         .expect("Object 须在 jmod 内")
         .0;
     registry.load_or_replace(real_obj).unwrap();
+    let registry = std::sync::Arc::new(registry);
 
     // 3) 真 Object.hashCode 须为 ACC_NATIVE(桩无 hashCode → 证覆盖成功)。
     let obj_lc = registry.get("java/lang/Object").unwrap();

@@ -80,7 +80,7 @@ fn thrown_exception_carries_call_chain() {
         eprintln!("跳过:无 javac");
         return;
     }
-    let reg = compile_and_load();
+    let reg = std::sync::Arc::new(compile_and_load());
     let lc = reg.get("Trace").unwrap();
     let m = find_method(&lc.cf, "top", "()I");
     let code = m.code.as_ref().unwrap();
@@ -88,7 +88,7 @@ fn thrown_exception_carries_call_chain() {
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
         .with_exception_table(&code.exception_table)
         .with_identity(lc.name(), "top");
-    let mut vm = Vm::new(&reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(&reg));
 
     let err = interp
         .interpret_with(&mut frame, &mut vm)

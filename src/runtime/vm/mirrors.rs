@@ -7,7 +7,7 @@
 use crate::oops::Oop;
 use crate::runtime::{Reference, Slot, Vm};
 
-impl<'a> Vm<'a> {
+impl Vm {
     /// Class 镜像 intern(4.10t 起;4.12 退役 `Oop::Class`):同一内部类名恒返回同一 Class
     /// 镜像引用(对应 HotSpot 每 `Klass` 的单一 `_java_mirror`)。镜像现为**真 `java/lang/Class`
     /// Instance**——首次 `new_instance` 分配,置 VM 字段(`componentType`/`primitive`),并登记

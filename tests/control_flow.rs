@@ -70,7 +70,7 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
         .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
 }
 
-fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
+fn run(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -78,7 +78,7 @@ fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
     let code = m.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(reg));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
@@ -129,6 +129,7 @@ fn ifnull_returns_element_when_nonnull() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ControlFlow");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "ControlFlow", "nullCheck", "()I"), Value::Int(1));
 }
 
@@ -139,6 +140,7 @@ fn if_acmpeq_same_reference() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ControlFlow");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "ControlFlow", "sameRef", "()I"), Value::Int(1));
 }
 
@@ -149,6 +151,7 @@ fn dense_switch_hits_case_2() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ControlFlow");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "ControlFlow", "denseSwitch", "()I"), Value::Int(102));
 }
 
@@ -159,5 +162,6 @@ fn sparse_switch_hits_case_100() {
         return;
     }
     let reg = compile_and_load(SOURCE, "ControlFlow");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(run(&reg, "ControlFlow", "sparseSwitch", "()I"), Value::Int(2));
 }

@@ -42,7 +42,7 @@ mod sun_nio_fs;
 /// native"),按声明类路由到包子模块 `dispatch`,出口**配对 pop**(覆盖所有 Ok/Err 路径)。
 /// 返回值须匹配 `desc` 返回类型(void → [`Value::Void`])。
 pub(super) fn invoke(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class: &str,
     name: &str,
     desc: &str,
@@ -59,7 +59,7 @@ pub(super) fn invoke(
 /// 已注册);`java/lang/*` → [`java_lang`];`jdk/internal/misc/*` → [`jdk_internal`];
 /// 其余 → `UnsatisfiedLinkError`(`nativeLookup.cpp` 解析失败的对应物)。
 fn dispatch(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class: &str,
     name: &str,
     desc: &str,
@@ -101,7 +101,7 @@ fn is_primitive_name(name: &str) -> bool {
 /// 取第 0 参(Class 镜像)的内部名(如 `[B`);非 Class 镜像 / 悬空 → `None`。
 /// 供 `Unsafe.arrayIndexScale(Class)` 按数组组件类型定刻度。镜像现为 `java/lang/Class`
 /// Instance,所表示的类型经 `Vm::mirror_internal_name` 反查(4.12)。
-fn class_arg_name(vm: &Vm<'_>, args: &[Value]) -> Option<String> {
+fn class_arg_name(vm: &Vm, args: &[Value]) -> Option<String> {
     let Value::Reference(r) = args.first().copied()? else {
         return None;
     };
@@ -166,7 +166,7 @@ mod tests {
     fn runtime_available_processors_returns_positive() {
         // 须注册表:未登记臂走 throw_exception 须有引导桩(RED 阶段);GREEN 后本臂不触之。
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         match invoke(&mut vm, "java/lang/Runtime", "availableProcessors", "()I", None, &[]).unwrap() {
             Value::Int(n) => assert!(n >= 1, "availableProcessors 须 ≥1,得 {n}"),
             other => panic!("期望 Int,得 {other:?}"),
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn get_primitive_class_missing_arg_throws_npe() {
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         let err = invoke(
             &mut vm,
             "java/lang/Class",
@@ -301,7 +301,7 @@ mod tests {
     fn unbound_native_throws_unsatisfied_link_error() {
         // 未登记的 native → UnsatisfiedLinkError(须有注册表:throw_exception 取引导桩)。
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         let err = invoke(&mut vm, "java/lang/Foo", "bar", "()V", None, &[]).unwrap_err();
         let crate::runtime::VmError::ThrownException(exc) = err else {
             panic!("未登记 native 应抛 ThrownException,得 {err:?}");

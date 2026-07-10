@@ -96,7 +96,7 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
 }
 
 /// 运行 `class_name.name(desc)`(无参静态方法,带异常表)。抛 Java 异常时带出类名便于诊断。
-fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
+fn run(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -108,7 +108,7 @@ fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp =
         Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(reg));
     match interp.interpret_with(&mut frame, &mut vm) {
         Ok(v) => v,
         Err(rustj::runtime::VmError::ThrownException(r)) => {
@@ -199,6 +199,7 @@ fn greet_length_via_real_string_bytecode() {
     let jmod = find_javabase_jmod().unwrap();
     let mut reg = compile_and_load(SOURCE, "StringGate");
     load_real_string(&mut reg, &jmod);
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "StringGate", "greetLength", "()I")), 5);
 }
 
@@ -211,6 +212,7 @@ fn same_literal_is_equal() {
     let jmod = find_javabase_jmod().unwrap();
     let mut reg = compile_and_load(SOURCE, "StringGate");
     load_real_string(&mut reg, &jmod);
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "StringGate", "sameLiteral", "()Z")), 1);
 }
 
@@ -223,6 +225,7 @@ fn same_literal_via_local_is_equal() {
     let jmod = find_javabase_jmod().unwrap();
     let mut reg = compile_and_load(SOURCE, "StringGate");
     load_real_string(&mut reg, &jmod);
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "StringGate", "sameViaLocal", "()Z")), 1);
 }
 
@@ -235,6 +238,7 @@ fn different_literals_are_not_equal() {
     let jmod = find_javabase_jmod().unwrap();
     let mut reg = compile_and_load(SOURCE, "StringGate");
     load_real_string(&mut reg, &jmod);
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "StringGate", "diffLiteral", "()Z")), 0);
 }
 
@@ -247,6 +251,7 @@ fn real_string_equals_via_bytecode() {
     let jmod = find_javabase_jmod().unwrap();
     let mut reg = compile_and_load(SOURCE, "StringGate");
     load_real_string(&mut reg, &jmod);
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "StringGate", "selfEquals", "()Z")), 1);
 }
 
@@ -261,6 +266,7 @@ fn real_string_equals_distinct_ref() {
     let jmod = find_javabase_jmod().unwrap();
     let mut reg = compile_and_load(SOURCE, "StringGate");
     load_real_string(&mut reg, &jmod);
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "StringGate", "distinctRefEquals", "()Z")), 1);
 }
 
@@ -273,5 +279,6 @@ fn real_string_hashcode_matches_java() {
     let jmod = find_javabase_jmod().unwrap();
     let mut reg = compile_and_load(SOURCE, "StringGate");
     load_real_string(&mut reg, &jmod);
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "StringGate", "abcHashCode", "()I")), ABC_HASH);
 }

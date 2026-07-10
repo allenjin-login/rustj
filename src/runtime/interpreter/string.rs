@@ -23,7 +23,7 @@ const STRING: &str = "java/lang/String";
 ///
 /// `pub(crate)`:供 `Vm` 在模块镜像(`Vm::intern_named_module` 置 `Module.name`)等场景
 /// 构造真 String 实例(同 native 字符串 native 的复用)。
-pub(crate) fn intern(vm: &mut Vm<'_>, text: &str) -> Result<Reference, VmError> {
+pub(crate) fn intern(vm: &mut Vm, text: &str) -> Result<Reference, VmError> {
     if let Some(&r) = vm.string_pool().get(text) {
         return Ok(r);
     }
@@ -34,7 +34,7 @@ pub(crate) fn intern(vm: &mut Vm<'_>, text: &str) -> Result<Reference, VmError> 
 
 /// 在堆上构造一个真 `java/lang/String` 实例:`value` 编码为 Latin1(全码元 ≤ 0xFF)或
 /// UTF-16(大端),设 `value`/`coder` 字段;`hash`/`hashIsZero` 取默认 0/false(与 Java 一致)。
-fn build(vm: &mut Vm<'_>, text: &str) -> Result<Reference, VmError> {
+fn build(vm: &mut Vm, text: &str) -> Result<Reference, VmError> {
     clinit::ensure_class_initialized(vm, STRING)?;
     let (bytes, coder) = encode(text);
 
@@ -76,7 +76,7 @@ fn build(vm: &mut Vm<'_>, text: &str) -> Result<Reference, VmError> {
 
 /// 读回 `r` 所指 String 实例的文本;非 String 实例 / 悬空 / 损坏 → `None`。
 /// 供 `Class.getPrimitiveClass` 取原语名、`String.intern()` native 取文本键。
-pub(super) fn read_text(vm: &Vm<'_>, r: Reference) -> Result<Option<String>, VmError> {
+pub(super) fn read_text(vm: &Vm, r: Reference) -> Result<Option<String>, VmError> {
     let value_ft = FieldType::Array(Box::new(FieldType::Byte));
     let coder_ft = FieldType::Byte;
 

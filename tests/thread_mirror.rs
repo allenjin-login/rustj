@@ -75,13 +75,13 @@ fn find_method<'a>(
 }
 
 /// 解释执行一个静态方法(无参)。
-fn run_static(registry: &ClassRegistry, class: &str, name: &str, desc: &str) -> Result<Value, VmError> {
+fn run_static(registry: &std::sync::Arc<ClassRegistry>, class: &str, name: &str, desc: &str) -> Result<Value, VmError> {
     let lc = registry.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = find_method(&lc.cf, &lc.cf.constant_pool, name, desc);
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     interp.interpret_with(&mut frame, &mut vm)
 }
 
@@ -120,6 +120,7 @@ fn main_thread_mirror_has_name_main_and_tid_one() {
     let mut cp = ClassPath::new();
     cp.add("java.base.jmod", &bytes).unwrap();
     load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
+    let registry = std::sync::Arc::new(registry);
 
     // 3) threadId() → 1L(alloc_main_thread 置 tid 字段)。
     assert_eq!(

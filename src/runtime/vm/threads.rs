@@ -24,7 +24,7 @@ impl ThreadManager {
     }
 }
 
-impl<'a> Vm<'a> {
+impl Vm {
     /// main 线程单例(惰性,4.40):`Thread.currentThread()` 返此实例。rustj 单线程 → 唯一 "main"
     /// 线程。`new_instance`(**不跑 `<init>`**)构造——默认字段(tid=0/name=null/threadLocals=null/
     /// …),`Thread.<clinit>` 仅 `registerNatives()` 空操作故无重初始化负担。无注册表/Thread 未预载
@@ -48,7 +48,7 @@ impl<'a> Vm<'a> {
     ///(`set_instance_field_by_name` 在 [`super::mirrors`]。
     fn alloc_main_thread(&mut self) -> Reference {
         let inst = {
-            let Some(reg) = self.shared.registry else {
+            let Some(reg) = self.shared.registry.as_ref() else {
                 return Reference::null();
             };
             let Some(lc) = reg.get("java/lang/Thread") else {

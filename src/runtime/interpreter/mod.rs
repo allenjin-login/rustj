@@ -52,7 +52,7 @@ pub(super) enum Step {
 ///
 /// 沿用 4.2 的 `'a` 借用技巧:[`Vm::registry`] 返回 `&'a ClassRegistry`(寿命不绑 `&self`),
 /// 故取出 `&'a LoadedClass` 后仍可 `&mut vm` 写堆。
-pub(super) fn throw_exception(vm: &mut Vm<'_>, class_name: &str) -> VmError {
+pub(super) fn throw_exception(vm: &mut Vm, class_name: &str) -> VmError {
     use crate::oops::Oop;
     let reg = vm
         .registry()
@@ -72,7 +72,7 @@ pub(super) fn throw_exception(vm: &mut Vm<'_>, class_name: &str) -> VmError {
 /// 如 `ArithmeticException("/ by zero")`)。HotSpot 各抛出点经 `THROW_MSG(vm Symbols::…, msg)`
 /// 构造消息异常;rustj 在 `record_message` 镜像之。
 pub(super) fn throw_exception_with_message(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class_name: &str,
     message: &str,
 ) -> VmError {
@@ -105,7 +105,7 @@ pub(super) fn throw_exception_with_message(
 /// `initStackTraceElements(ste, this, depth)` 能据 `this` 回填帧。桩 Throwable(无
 /// `backtrace`/`depth` 字段,未经真 `<init>`)→ 仅 `record_trace`,其 getStackTrace 路径
 /// 另走。`fillInStackTrace` native 与 [`throw_exception`] 均调之。
-pub(super) fn capture_backtrace(vm: &mut Vm<'_>, exc: Reference) {
+pub(super) fn capture_backtrace(vm: &mut Vm, exc: Reference) {
     use crate::metadata::descriptor::FieldType;
     use crate::runtime::Slot;
     vm.record_trace(exc);
@@ -140,7 +140,7 @@ pub(super) fn capture_backtrace(vm: &mut Vm<'_>, exc: Reference) {
 /// 同步到真字段,补齐 JVM 自动抛出(不经真 `<init>`)的缺口。失败不影响 `format_trace`
 /// (其读 `exception_meta` 的并行镜像)。
 pub(super) fn set_throwable_field(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     exc: Reference,
     name: &str,
     ft: crate::metadata::descriptor::FieldType,
@@ -282,7 +282,7 @@ impl<'a> Interpreter<'a> {
         // (idiv/irem 除零 → ArithmeticException),故构造 registry 而非空 Vm,让
         // throw_exception 有类可分配、有堆可入——避免"无注册表却需抛异常"的 panic。
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = Vm::new(&reg);
+        let mut vm = Vm::new(reg);
         self.interpret_with(frame, &mut vm)
     }
 
@@ -290,7 +290,7 @@ impl<'a> Interpreter<'a> {
     ///
     /// 包裹 [`Self::run`]:入/出口 push/pop 一个 Java 栈帧(若有身份),供栈轨迹捕获;
     /// 顶层(`frame_depth == 0`)未捕获的 Java 异常自动 `eprintln` 栈轨迹,方便调试。
-    pub fn interpret_with(&self, frame: &mut Frame, vm: &mut Vm<'_>) -> Result<Value, VmError> {
+    pub fn interpret_with(&self, frame: &mut Frame, vm: &mut Vm) -> Result<Value, VmError> {
         let pushed = match &self.identity {
             Some(id) => {
                 vm.push_frame(id.class, id.name);
@@ -318,7 +318,7 @@ impl<'a> Interpreter<'a> {
     }
 
     /// 字节码主循环(由 [`Self::interpret_with`] 包裹,勿直接调——绕过栈帧 push/pop)。
-    fn run(&self, frame: &mut Frame, vm: &mut Vm<'_>) -> Result<Value, VmError> {
+    fn run(&self, frame: &mut Frame, vm: &mut Vm) -> Result<Value, VmError> {
         let mut pc: usize = 0;
         loop {
             if pc >= self.code.len() {
@@ -358,7 +358,7 @@ impl<'a> Interpreter<'a> {
         &self,
         op: Opcode,
         frame: &mut Frame,
-        vm: &mut Vm<'_>,
+        vm: &mut Vm,
         pc_slot: &mut usize,
     ) -> Result<Step, VmError> {
         let mut pc = *pc_slot;
@@ -1344,7 +1344,7 @@ impl<'a> Interpreter<'a> {
     fn load_constant(
         &self,
         frame: &mut Frame,
-        vm: &mut Vm<'_>,
+        vm: &mut Vm,
         index: u16,
     ) -> Result<(), VmError> {
         match self.cp.get(index)? {
@@ -1585,7 +1585,7 @@ mod tests {
     ///
     /// 运行时异常(NPE/CCE/ArithmeticException/AIOOBE 等)统一为 `ThrownException(Reference)`,
     /// 异常对象由引导桩分配在堆上。`vm` 须带注册表(装好引导桩)以备查类名。
-    fn assert_throws(result: Result<Value, VmError>, vm: &Vm<'_>, expected_class: &str) {
+    fn assert_throws(result: Result<Value, VmError>, vm: &Vm, expected_class: &str) {
         let Err(VmError::ThrownException(exc)) = result else {
             panic!("应抛 ThrownException({expected_class}), 实得 {result:?}");
         };
@@ -1799,7 +1799,7 @@ mod tests {
         let interp = Interpreter::new(&code, &cp);
         let mut frame = Frame::new(0, 2);
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         assert_throws(
             interp.interpret_with(&mut frame, &mut vm),
             &vm,
@@ -1814,7 +1814,7 @@ mod tests {
         let interp = Interpreter::new(&code, &cp);
         let mut frame = Frame::new(0, 2);
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         assert_throws(
             interp.interpret_with(&mut frame, &mut vm),
             &vm,
@@ -1831,7 +1831,7 @@ mod tests {
         let interp = Interpreter::new(&code, &cp);
         let mut frame = Frame::new(0, 2);
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         let err = interp.interpret_with(&mut frame, &mut vm).unwrap_err();
         let VmError::ThrownException(r) = err else {
             panic!("须 ThrownException,得 {err:?}");
@@ -1946,7 +1946,7 @@ mod tests {
         let interp = Interpreter::new(&code, &cp);
         let mut frame = Frame::new(0, 4);
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         assert_throws(
             interp.interpret_with(&mut frame, &mut vm),
             &vm,
@@ -2052,7 +2052,8 @@ mod tests {
     fn athrow_caught_jumps_to_handler() {
         use crate::classfile::attributes::ExceptionTableEntry;
         let (reg, cp) = athrow_setup();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = crate::runtime::Vm::new(std::sync::Arc::clone(&reg));
         let lc = reg.get("SubExc").unwrap();
         let inst = vm
             .heap_mut()
@@ -2082,7 +2083,8 @@ mod tests {
     #[test]
     fn athrow_uncaught_propagates() {
         let (reg, cp) = athrow_setup();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = crate::runtime::Vm::new(std::sync::Arc::clone(&reg));
         let lc = reg.get("SubExc").unwrap();
         let inst = vm
             .heap_mut()
@@ -2100,7 +2102,8 @@ mod tests {
     #[test]
     fn athrow_null_throws_nullpointer() {
         let (reg, cp) = athrow_setup();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = crate::runtime::Vm::new(std::sync::Arc::clone(&reg));
         let code = [Opcode::AconstNull as u8, Opcode::Athrow as u8];
         let mut frame = Frame::new(0, 2);
         let interp = Interpreter::new(&code, &cp).with_exception_table(&[]);
@@ -2155,7 +2158,7 @@ mod tests {
         }];
         let interp = Interpreter::new(&code, &cp).with_exception_table(&table);
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         let mut frame = Frame::new(0, 2);
         assert_eq!(
             interp.interpret_with(&mut frame, &mut vm).unwrap(),
@@ -2816,7 +2819,7 @@ mod tests {
         let cp = empty_cp();
         let mut frame = Frame::new(0, 1);
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         let interp = Interpreter::new(&code, &cp);
         assert_throws(
             interp.interpret_with(&mut frame, &mut vm),
@@ -2835,7 +2838,7 @@ mod tests {
         let cp = empty_cp();
         let mut frame = Frame::new(0, 1);
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         let interp = Interpreter::new(&code, &cp);
         assert_throws(
             interp.interpret_with(&mut frame, &mut vm),
@@ -2904,7 +2907,7 @@ mod tests {
         use crate::oops::{ArrayOop, Oop};
         use crate::runtime::Slot;
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         let arr = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(
             "[I".to_string(),
             vec![Slot::Int(0)],
@@ -3002,7 +3005,7 @@ mod tests {
         let cp = empty_cp();
         let mut frame = Frame::new(1, 3);
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(&reg);
+        let mut vm = crate::runtime::Vm::new(reg);
         let interp = Interpreter::new(&code, &cp);
         assert_throws(
             interp.interpret_with(&mut frame, &mut vm),

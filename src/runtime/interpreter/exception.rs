@@ -11,7 +11,7 @@ use crate::runtime::{Reference, Vm};
 
 /// 取异常对象(非 null)的运行时类名(own String 避免借用纠缠)。
 /// athrow 对象必为实例(数组不能 throw);悬空 / 数组 → `BadConstant`。
-fn runtime_class_name(vm: &Vm<'_>, exc: Reference) -> Result<String, VmError> {
+fn runtime_class_name(vm: &Vm, exc: Reference) -> Result<String, VmError> {
     use crate::oops::Oop;
     let heap = vm.heap();
     let obj = heap
@@ -29,7 +29,7 @@ fn runtime_class_name(vm: &Vm<'_>, exc: Reference) -> Result<String, VmError> {
 /// `catch_type == 0` → catch-all;否则解析目标类名,`is_instance(运行时类, 目标)`。
 pub(super) fn find_handler(
     interp: &Interpreter<'_>,
-    vm: &Vm<'_>,
+    vm: &Vm,
     table: &[ExceptionTableEntry],
     pc: usize,
     exc: Reference,
@@ -102,7 +102,7 @@ mod tests {
         (reg, mk_cp())
     }
 
-    fn sub_instance(reg: &ClassRegistry, vm: &mut Vm<'_>) -> Reference {
+    fn sub_instance(reg: &ClassRegistry, vm: &mut Vm) -> Reference {
         let lc = reg.get("SubExc").unwrap();
         vm.heap_mut().alloc(Oop::Instance(reg.new_instance(lc)))
     }
@@ -123,7 +123,8 @@ mod tests {
     #[test]
     fn find_exact_type_matches() {
         let (reg, cp) = build();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm);
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 7)]; // catch SubExc(#7)
@@ -133,7 +134,8 @@ mod tests {
     #[test]
     fn find_out_of_range_no_match() {
         let (reg, cp) = build();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm);
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 7)];
@@ -143,7 +145,8 @@ mod tests {
     #[test]
     fn find_supertype_matches() {
         let (reg, cp) = build();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm); // SubExc 实例
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 6)]; // catch BaseExc(#6)
@@ -153,7 +156,8 @@ mod tests {
     #[test]
     fn find_unrelated_no_match() {
         let (reg, cp) = build();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm);
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 8)]; // catch OtherExc(#8)
@@ -163,7 +167,8 @@ mod tests {
     #[test]
     fn find_catch_all_matches_anything() {
         let (reg, cp) = build();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm);
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 0)]; // catch_type 0 = catch-all

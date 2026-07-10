@@ -9,7 +9,7 @@ use crate::runtime::{Reference, Vm, VmError};
 
 use super::MonitorState;
 
-impl<'a> Vm<'a> {
+impl Vm {
     /// `monitorenter`(JVMS §6.5):进入 `obj` 管程。null → NPE;owner = 当前线程(`main_thread`);
     /// 未锁 → 记 owner/count=1;已持 → count+1(重入)。单线程下 owner 恒为当前线程、无争用
     /// (Phase B.3 真并发:被他人持有时阻塞至释放;rustj 当前单线程直接重入)。

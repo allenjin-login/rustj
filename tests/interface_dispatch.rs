@@ -72,7 +72,7 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
 
 /// 以给定深度上限执行 static 方法,返回结果。
 fn run_with_limit(
-    registry: &ClassRegistry,
+    registry: &std::sync::Arc<ClassRegistry>,
     class_name: &str,
     name: &str,
     desc: &str,
@@ -85,13 +85,13 @@ fn run_with_limit(
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry).with_stack_limit(stack_limit);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry)).with_stack_limit(stack_limit);
     interp.interpret_with(&mut frame, &mut vm)
 }
 
 /// 执行方法(给定深度上限),断言其抛出运行时异常(统一为 `ThrownException`),返回异常类名。
 fn run_thrown_class_with_limit(
-    registry: &ClassRegistry,
+    registry: &std::sync::Arc<ClassRegistry>,
     class_name: &str,
     name: &str,
     desc: &str,
@@ -104,7 +104,7 @@ fn run_thrown_class_with_limit(
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry).with_stack_limit(stack_limit);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry)).with_stack_limit(stack_limit);
     let err = interp
         .interpret_with(&mut frame, &mut vm)
         .expect_err("期望抛出异常");
@@ -117,7 +117,7 @@ fn run_thrown_class_with_limit(
     }
 }
 
-fn run(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
+fn run(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
     run_with_limit(registry, class_name, name, desc, DEFAULT_STACK_LIMIT)
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
 }
@@ -183,6 +183,7 @@ fn invokeinterface_is_polymorphic() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(run(&registry, "Vm", "ifacePoly", "()I"), Value::Int(32));
 }
 
@@ -193,6 +194,7 @@ fn invokeinterface_hits_default_method() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(run(&registry, "Vm", "defaultOnIface", "()I"), Value::Int(201));
 }
 
@@ -203,6 +205,7 @@ fn invokevirtual_falls_through_to_default() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(run(&registry, "Vm", "defaultViaClass", "()I"), Value::Int(301));
 }
 
@@ -213,6 +216,7 @@ fn invokespecial_super_inherited() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(run(&registry, "Vm", "superInherited", "()I"), Value::Int(10));
 }
 
@@ -223,6 +227,7 @@ fn infinite_recursion_is_stackoverflow() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run_thrown_class_with_limit(&registry, "Vm", "infinite", "()I", 16),
         "java/lang/StackOverflowError"
@@ -236,6 +241,7 @@ fn invokeinterface_on_null_is_nullpointer() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run_thrown_class_with_limit(&registry, "Vm", "nullIface", "()I", DEFAULT_STACK_LIMIT),
         "java/lang/NullPointerException"

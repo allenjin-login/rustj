@@ -69,7 +69,7 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
         .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
 }
 
-fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
+fn run(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -80,14 +80,14 @@ fn run(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
         .unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(reg));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
 }
 
 /// 执行方法,断言其抛出运行时异常(统一为 `ThrownException`),返回异常对象的类内部名。
-fn run_thrown_class(reg: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> String {
+fn run_thrown_class(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> String {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -98,7 +98,7 @@ fn run_thrown_class(reg: &ClassRegistry, class_name: &str, name: &str, desc: &st
         .unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(reg);
+    let mut vm = Vm::new(std::sync::Arc::clone(reg));
     let err = interp
         .interpret_with(&mut frame, &mut vm)
         .expect_err("期望抛出异常");
@@ -167,6 +167,7 @@ fn instanceof_class_match() {
         return;
     }
     let reg = compile_and_load(SOURCE, "CheckCast");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(bool_to_int(run(&reg, "CheckCast", "squareIsShape", "()Z")), 1);
 }
 
@@ -177,6 +178,7 @@ fn instanceof_interface_match() {
         return;
     }
     let reg = compile_and_load(SOURCE, "CheckCast");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(bool_to_int(run(&reg, "CheckCast", "circleIsDrawable", "()Z")), 1);
 }
 
@@ -187,6 +189,7 @@ fn instanceof_no_match() {
         return;
     }
     let reg = compile_and_load(SOURCE, "CheckCast");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(bool_to_int(run(&reg, "CheckCast", "squareIsCircle", "()Z")), 0);
 }
 
@@ -197,6 +200,7 @@ fn instanceof_null_is_zero() {
         return;
     }
     let reg = compile_and_load(SOURCE, "CheckCast");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(bool_to_int(run(&reg, "CheckCast", "nullIsShape", "()Z")), 0);
 }
 
@@ -207,6 +211,7 @@ fn checkcast_passes() {
         return;
     }
     let reg = compile_and_load(SOURCE, "CheckCast");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(bool_to_int(run(&reg, "CheckCast", "castOk", "()I")), 1);
 }
 
@@ -217,6 +222,7 @@ fn checkcast_fails_with_classcastexception() {
         return;
     }
     let reg = compile_and_load(SOURCE, "CheckCast");
+    let reg = std::sync::Arc::new(reg);
     assert_eq!(
         run_thrown_class(&reg, "CheckCast", "castFail", "()I"),
         "java/lang/ClassCastException"

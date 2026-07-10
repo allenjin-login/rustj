@@ -22,7 +22,7 @@ use crate::runtime::{Frame, Interpreter, Reference, Vm, VmError};
 ///
 /// **前置**:注册表须已闭包预载 `jdk/internal/misc/VM` + `java/util/HashMap`
 /// (Integer 等闭包会传递性载入 VM;HashMap 须显式预载,4.10h/real_integer.rs 同此)。
-pub fn initialize_system_class(vm: &mut Vm<'_>) -> Result<(), VmError> {
+pub fn initialize_system_class(vm: &mut Vm) -> Result<(), VmError> {
     // 构造空 HashMap 实例:table=null 默认,HashMap.get 经 `table==null` 短路返 null
     //(等价旧 RustjBootstrap 的 `new HashMap<>()` 不跑 <init>;saveProperties 仅 .get 键)。
     let map_ref = {
@@ -79,7 +79,7 @@ pub fn initialize_system_class(vm: &mut Vm<'_>) -> Result<(), VmError> {
 ///
 /// **前置**:`java/lang/System` 已预载(由 `install_system_props` 保证;其内已 `get("java/lang/System")`)。
 /// System 未预载 → 静默跳过(保旧测试兼容,同 `install_system_props` 防御)。
-fn install_java_lang_access(vm: &mut Vm<'_>) -> Result<(), VmError> {
+fn install_java_lang_access(vm: &mut Vm) -> Result<(), VmError> {
     let has_system = vm
         .registry()
         .map(|r| r.get("java/lang/System").is_some())
@@ -104,7 +104,7 @@ fn install_java_lang_access(vm: &mut Vm<'_>) -> Result<(), VmError> {
 ///
 /// `java/util/Properties` 或 `java/lang/System` 未预载 → 静默跳过(保 `vm_system_bootstrap` 旧闸门:
 /// 仅预载 Integer/HashMap/String,无 Properties/System 时仍绿)。
-fn install_system_props(vm: &mut Vm<'_>) -> Result<(), VmError> {
+fn install_system_props(vm: &mut Vm) -> Result<(), VmError> {
     use crate::metadata::descriptor::FieldType;
     use crate::runtime::Slot;
 
@@ -161,7 +161,7 @@ fn install_system_props(vm: &mut Vm<'_>) -> Result<(), VmError> {
 /// `initPhase1`,故在此直接 `Properties.put` 真字节码逐项写入(委派 `map.put` → HashMap.put)。
 /// 值从 OS 派生:`file.separator`=MAIN_SEPARATOR、`user.dir`=current_dir、… —— 解锁
 /// `WinNTFileSystem.<init>:95` 等读 `file.separator`/`path.separator`/`user.dir` 的代码。
-fn populate_launcher_props(vm: &mut Vm<'_>, props_ref: Reference) -> Result<(), VmError> {
+fn populate_launcher_props(vm: &mut Vm, props_ref: Reference) -> Result<(), VmError> {
     let is_win = std::path::MAIN_SEPARATOR == '\\';
     let sep = std::path::MAIN_SEPARATOR.to_string();
     let path_sep = if is_win { ";" } else { ":" }.to_string();
@@ -218,7 +218,7 @@ fn populate_launcher_props(vm: &mut Vm<'_>, props_ref: Reference) -> Result<(), 
 /// 委派 `map.put` → HashMap.put(单线程后盾)。&'a 引用(reg/lc/m/code/CP)不绑 &self(§6)→
 /// 出块后 `interpret_with(&mut vm)` 可独占。
 fn put_property(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     props_ref: Reference,
     key: &str,
     value: &str,
@@ -287,7 +287,7 @@ fn find_method_by_sig<'a>(
 ///
 /// **前置**:注册表须已闭包预载 `java/lang/ModuleLayer`、`java/lang/System`、
 /// `jdk/internal/misc/VM`。Phase 1(`initialize_system_class`)须已跑(`initLevel` 单调 1→2)。
-pub fn bootstrap_module_system(vm: &mut Vm<'_>) -> Result<(), VmError> {
+pub fn bootstrap_module_system(vm: &mut Vm) -> Result<(), VmError> {
     use crate::metadata::descriptor::FieldType;
     use crate::runtime::Slot;
 
@@ -307,13 +307,13 @@ pub fn bootstrap_module_system(vm: &mut Vm<'_>) -> Result<(), VmError> {
     // 2) System.bootLayer = layer(对应 `bootLayer = ModuleBootstrap.boot();`)。沿超类链
     //    解析(声明类,序号)——bootLayer 声明于 System 本身;经 Mutex 写其 static_storage。
     let ft = FieldType::Class("java/lang/ModuleLayer".to_string());
-    let (sys_lc, boot_layer_ord) = {
-        let reg = vm
-            .registry()
-            .ok_or(VmError::BadConstant("Phase 2 引导需要类注册表"))?;
-        reg.resolve_static_field("java/lang/System", "bootLayer", &ft)
-            .ok_or(VmError::BadConstant("Phase 2:System.bootLayer 静态字段未找到"))?
-    };
+    // `reg`(owned Arc,B.3.0)须留域内:`sys_lc: &LoadedClass` 借之,下句 static_storage 用之。
+    let reg = vm
+        .registry()
+        .ok_or(VmError::BadConstant("Phase 2 引导需要类注册表"))?;
+    let (sys_lc, boot_layer_ord) = reg
+        .resolve_static_field("java/lang/System", "bootLayer", &ft)
+        .ok_or(VmError::BadConstant("Phase 2:System.bootLayer 静态字段未找到"))?;
     sys_lc.static_storage.lock().unwrap()[boot_layer_ord] = Slot::Reference(layer_ref);
 
     // 3) invokestatic VM.initLevel(I)V —— 置 2(MODULE_SYSTEM_INITED)。Phase 1 已置 1,
@@ -331,7 +331,7 @@ pub fn bootstrap_module_system(vm: &mut Vm<'_>) -> Result<(), VmError> {
 ///
 /// **借用**(`Vm::registry` 返 `&'a ClassRegistry`,`'a` 不绑定本次 `&self`,CLAUDE.md §6):
 /// 故取出 `&'a LoadedClass`/`&'a ConstantPool`/`&'a [u8]` 后仍可再 `&mut vm` 跑 `interpret_with`。
-fn invoke_static_void<F>(vm: &mut Vm<'_>, class: &str, name: &str, setup: F) -> Result<(), VmError>
+fn invoke_static_void<F>(vm: &mut Vm, class: &str, name: &str, setup: F) -> Result<(), VmError>
 where
     F: FnOnce(&mut Frame) -> Result<(), crate::runtime::FrameError>,
 {

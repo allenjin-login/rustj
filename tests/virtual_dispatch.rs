@@ -77,12 +77,12 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
         .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
 }
 
-fn run(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> Value {
+fn run(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
     run_result(registry, class_name, name, desc).unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
 }
 
 fn run_result(
-    registry: &ClassRegistry,
+    registry: &std::sync::Arc<ClassRegistry>,
     class_name: &str,
     name: &str,
     desc: &str,
@@ -95,12 +95,12 @@ fn run_result(
 
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     interp.interpret_with(&mut frame, &mut vm)
 }
 
 /// 执行方法,断言其抛出运行时异常(统一为 `ThrownException`),返回异常对象的类内部名。
-fn run_thrown_class(registry: &ClassRegistry, class_name: &str, name: &str, desc: &str) -> String {
+fn run_thrown_class(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> String {
     let lc = registry
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -108,7 +108,7 @@ fn run_thrown_class(registry: &ClassRegistry, class_name: &str, name: &str, desc
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(registry);
+    let mut vm = Vm::new(std::sync::Arc::clone(registry));
     let err = interp
         .interpret_with(&mut frame, &mut vm)
         .expect_err("期望抛出异常");
@@ -187,6 +187,7 @@ fn invokevirtual_is_polymorphic() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(run(&registry, "Vm", "polyKind", "()I"), Value::Int(12));
 }
 
@@ -197,6 +198,7 @@ fn inherited_fields_and_multi_level_override() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Vm", "inheritedFieldAndOverride", "()I"),
         Value::Int(32)
@@ -214,6 +216,7 @@ fn exact_class_dispatch_without_override() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(run(&registry, "Vm", "exactClassNoOverride", "()I"), Value::Int(64));
 }
 
@@ -224,6 +227,7 @@ fn new_subclass_defaults_inherited_fields() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Vm", "defaultInheritedFields", "()I"),
         Value::Int(0)
@@ -237,6 +241,7 @@ fn invokevirtual_on_null_is_nullpointer() {
         return;
     }
     let registry = compile_and_load_all(SOURCE, "Vm");
+    let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run_thrown_class(&registry, "Vm", "nullVirtual", "()I"),
         "java/lang/NullPointerException"

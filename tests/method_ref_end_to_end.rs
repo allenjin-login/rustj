@@ -82,8 +82,9 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
 }
 
 /// 执行无参静态方法。`invokedynamic` 须方法身份 → `with_identity`。
-fn run(vm: &mut Vm<'_>, class: &str, name: &str, desc: &str) -> Value {
-    let lc = vm.registry().and_then(|r| r.get(class)).unwrap_or_else(|| panic!("类 {class} 未加载"));
+fn run(vm: &mut Vm, class: &str, name: &str, desc: &str) -> Value {
+    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表"));
+    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = find_method(&lc.cf, name, desc);
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
@@ -163,7 +164,7 @@ fn instance_method_reference_real_bytecode() {
     cp.add("java.base.jmod", &bytes).unwrap();
     load_closure(&mut registry, &cp, "java/util/Objects").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     assert_eq!(run(&mut vm, "MethodRefGate", "unbound", "()I"), Value::Int(42), "Box::get apply(new Box(42))");
     assert_eq!(run(&mut vm, "MethodRefGate", "unboundArg", "()I"), Value::Int(15), "Box::plus apply(new Box(10),5)");
     assert_eq!(run(&mut vm, "MethodRefGate", "bound", "()I"), Value::Int(7), "b::get(b=new Box(7))");

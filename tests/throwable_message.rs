@@ -108,8 +108,9 @@ public class Tm {
 "#;
 
 /// 跑 `Tm.<name>()I`(无参静态)→ 返回 int 值;抛 Java 异常则 panic(给出诊断)。
-fn run_int(vm: &mut Vm<'_>, name: &str) -> i32 {
-    let lc = vm.registry().and_then(|r| r.get("Tm")).expect("Tm 须已加载");
+fn run_int(vm: &mut Vm, name: &str) -> i32 {
+    let reg = vm.registry().expect("Tm 须已加载");
+    let lc = reg.get("Tm").expect("Tm 须已加载");
     let m = find_method(lc, name, "()I");
     let code = m.code.as_ref().expect("{name} 须有 Code");
     let mut frame = Frame::new(code.max_locals, code.max_stack);
@@ -164,7 +165,7 @@ fn get_message_and_get_cause_via_real_fields() {
     let gc = find_method(thr, "getCause", "()Ljava/lang/Throwable;");
     assert!(!gc.access_flags.is_native(), "Throwable.getCause 须为真字节码");
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
 
     // 4) 三法逐一断言:1=自动抛出 detailMessage 回填,2=用户 <init>(String),3=<init>(String,Throwable)。
     assert_eq!(run_int(&mut vm, "autoMessage"), 1, "自动抛出 ArithmeticException 的 getMessage 须为 \"/ by zero\"");

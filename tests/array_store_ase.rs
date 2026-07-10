@@ -78,9 +78,10 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
     dir
 }
 
-fn run_int(vm: &mut Vm<'_>, name: &str) -> i32 {
+fn run_int(vm: &mut Vm, name: &str) -> i32 {
     use rustj::constant_pool::ConstantPoolEntry;
-    let lc = vm.registry().and_then(|r| r.get("AstoreAse")).expect("AstoreAse 须已加载");
+    let reg = vm.registry().expect("类注册表");
+    let lc = reg.get("AstoreAse").expect("AstoreAse 须已加载");
     let method = lc
         .cf
         .methods
@@ -132,7 +133,7 @@ fn aastore_array_store_exception() {
     cp.add("java.base.jmod", &bytes).unwrap();
     load_closure(&mut registry, &cp, "java/lang/String").unwrap();
 
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     assert_eq!(run_int(&mut vm, "okMatch"), 1, "String 入 String[] 须合法");
     assert_eq!(
         run_int(&mut vm, "mismatch"),

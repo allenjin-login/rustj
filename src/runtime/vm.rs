@@ -126,10 +126,13 @@ pub(crate) struct MonitorState {
 /// 各自 Vm、共享并发改写。对应 HotSpot 跨 `JavaThread` 共享的全局结构(`JavaHeap`/
 /// `SystemDictionary`/`StringTable`/`ObjectMonitor` 表等);线程隔离态留 [`Vm::thread`]。
 /// `pub(crate)`:`from_shared` 签名须命名。
-pub(crate) struct VmShared<'a> {
+pub(crate) struct VmShared {
     /// 对象堆(Mutex:Phase B.2.3b 共享态——`Arc<VmShared>` 多线程并发改堆的前置)。
     heap: Mutex<Heap>,
-    registry: Option<&'a ClassRegistry>,
+    /// 类注册表。**B.3.0 移除 `'a`**:owned `Arc<ClassRegistry>`(`load_or_replace` 须 `&mut`,
+    /// 故注册表先 owned 载入完毕、再 `Arc::new` 包后传 [`Vm::new`])。owned clone 经
+    /// [`Vm::registry`] 出借,保 §6 NLL trick(`Arc` 独立 local 绑定,不借 `&self`)。
+    registry: Option<Arc<ClassRegistry>>,
     /// 字符串 intern 池(4.8):文本 → 堆引用,以本 Vm 的堆为后盾。Mutex(B.2.3b 共享态)。
     string_pool: Mutex<StringPool>,
     /// 对象管程(对象句柄 → 锁状态)。跨线程共享态(B.2.3b 加 Mutex);单线程下 owner 恒为当前线程。
@@ -158,10 +161,10 @@ pub(crate) struct VmShared<'a> {
     unnamed_module: Mutex<Option<Reference>>,
 }
 
-impl<'a> VmShared<'a> {
+impl VmShared {
     /// 构造共享态(空堆、空池、空表;tid 起始 1)。`registry` = `Some` 经 [`Vm::new`],
-    /// `None` 经 [`Vm::default`](无注册表纯数值测试)。
-    fn new(registry: Option<&'a ClassRegistry>) -> Self {
+    /// `None` 经 [`Vm::default`](无注册表纯数值测试)。B.3.0:`registry` 为 owned `Arc`(非借用)。
+    fn new(registry: Option<Arc<ClassRegistry>>) -> Self {
         Self {
             heap: Mutex::new(Heap::new()),
             registry,
@@ -183,18 +186,30 @@ impl<'a> VmShared<'a> {
 ///([`thread`](Self.thread))留本结构。B.2.3b:`shared: Arc<VmShared>`,每线程经
 /// [`Vm::from_shared`](`Vm::from_shared(Arc::clone(&vm.shared))`) 派生各自 Vm、共享同一
 /// `Arc<VmShared>`(字段全 Mutex → `VmShared: Send + Sync` → `Arc<VmShared>: Send + Sync`)。
-pub struct Vm<'a> {
+/// 执行上下文:拥有对象堆,共享类注册表,跟踪帧嵌套深度。
+///
+/// Phase B.2.3a:共享字段归入 [`shared`](Self.shared)([`VmShared`]),线程隔离态
+///([`thread`](Self.thread))留本结构。B.2.3b:`shared: Arc<VmShared>`,每线程经
+/// [`Vm::from_shared`](`Vm::from_shared(Arc::clone(&vm.shared))`) 派生各自 Vm、共享同一
+/// `Arc<VmShared>`(字段全 Mutex → `VmShared: Send + Sync` → `Arc<VmShared>: Send + Sync`)。
+/// **B.3.0**:无 `'a` lifetime(`registry` 为 owned `Arc<ClassRegistry>`)→ `VmShared: 'static`
+/// → `Arc<VmShared>: 'static` → B.3b `thread::spawn(move || …)` 跨线程共享 `Arc::clone`。
+pub struct Vm {
     /// 跨线程共享态(堆/注册表/池/管程/镜像表/线程管理器)。`Arc` 共享;字段全 Mutex(`Arc::clone` 派生线程)。
-    shared: Arc<VmShared<'a>>,
+    shared: Arc<VmShared>,
     /// 当前线程隔离态(调用栈/帧深度/线程镜像)。
     pub(crate) thread: ThreadContext,
 }
 
-impl<'a> Vm<'a> {
-    /// 构造带类注册表的 Vm(空堆,默认深度上限)。
-    pub fn new(registry: &'a ClassRegistry) -> Self {
+impl Vm {
+    /// 构造带类注册表的 Vm(空堆,默认深度上限)。**B.3.0**:`registry` 为 owned `Arc<ClassRegistry>`
+    ///(`load_orreplace` 须 `&mut`,故注册表先 owned 载入完毕、再 `Arc::new` 包后传入)。
+    /// 取 `impl Into<Arc<ClassRegistry>>`:调用方可传 owned `ClassRegistry`(`Arc::new` 由本方法包)
+    /// 或既有 `Arc<ClassRegistry>`(B.3b 线程派生 `Arc::clone(&shared_registry)`);`Vm::new(reg)`
+    /// → `Vm::new(reg)`(去 `&`,owned 移交)。
+    pub fn new(registry: impl Into<Arc<ClassRegistry>>) -> Self {
         Self {
-            shared: Arc::new(VmShared::new(Some(registry))),
+            shared: Arc::new(VmShared::new(Some(registry.into()))),
             thread: ThreadContext::new_main(),
         }
     }
@@ -202,8 +217,8 @@ impl<'a> Vm<'a> {
     /// 从既有共享态派生新 Vm(B.3b 真线程:每线程各持 `Arc::clone` 的共享态 + 独立 `ThreadContext`)。
     /// 调用方先 [`Vm::shared_arc`] 取 `Arc::clone(&vm.shared)`,再经本方法构造派生线程的 Vm。
     /// 共享态(堆/池/管程/镜像表)跨线程共享;线程隔离态(调用栈/帧深度/线程镜像)各独立。
-    #[allow(dead_code)] // B.3b 真线程派生用;T6 引入,测试 + B.3b 调用
-    pub(crate) fn from_shared(shared: Arc<VmShared<'a>>) -> Self {
+    #[allow(dead_code)] // B.3b 真线程将用(派生线程 Vm);当前仅 #[test] 引用 → 非 test lib 构建视为 dead。
+    pub(crate) fn from_shared(shared: Arc<VmShared>) -> Self {
         Self {
             shared,
             thread: ThreadContext::new_main(),
@@ -211,8 +226,9 @@ impl<'a> Vm<'a> {
     }
 
     /// 取共享态的 `Arc::clone`(供 [`Vm::from_shared`] 派生线程 Vm;`shared` 字段私有)。
-    #[allow(dead_code)] // B.3b 真线程派生用;T6 引入,测试 + B.3b 调用
-    pub(crate) fn shared_arc(&self) -> Arc<VmShared<'a>> {
+    /// B.3.0:返 `Arc<VmShared>`(`'static`),B.3b 可 `move` 进 `thread::spawn` 闭包。
+    #[allow(dead_code)] // B.3b 真线程将用(派生前 Arc::clone 共享态);当前仅 #[test] 引用 → 非 test lib 构建视为 dead。
+    pub(crate) fn shared_arc(&self) -> Arc<VmShared> {
         Arc::clone(&self.shared)
     }
 
@@ -244,12 +260,12 @@ impl<'a> Vm<'a> {
         self.shared.string_pool.lock().unwrap()
     }
 
-    /// 类注册表(若启用)。
-    ///
-    /// 返回的引用与注册表本身同寿命(`'a`),不依赖本次对 `self` 的借用——
-    /// 这样取出 `&'a LoadedClass` 后仍可再借 `&mut self`(如递归 `interpret_with`)。
-    pub fn registry(&self) -> Option<&'a ClassRegistry> {
-        self.shared.registry
+    /// 类注册表(若启用)。**B.3.0**:返 owned `Arc<ClassRegistry>`(cheap refcount clone)。
+    /// `Arc` 为独立 local 绑定、不借 `&self` —— 取出 `&LoadedClass`(借 `Arc`)后仍可 `&mut self`
+    ///(保 §6 NLL trick:递归 `interpret_with` 等)。`ClassRegistry` 经 deref 透明用(`.get`/…);
+    /// `load_or_replace` 须 `&mut`,故 registry 须**建 Vm 前** owned 载入完毕。
+    pub fn registry(&self) -> Option<Arc<ClassRegistry>> {
+        self.shared.registry.clone()
     }
 
     // ---- 栈帧法(T8 下沉 impl ThreadContext;Vm 薄转发,保调用点零改动)----
@@ -275,7 +291,7 @@ impl<'a> Vm<'a> {
     }
 }
 
-impl Default for Vm<'_> {
+impl Default for Vm {
     fn default() -> Self {
         Self {
             shared: Arc::new(VmShared::new(None)),
@@ -293,7 +309,7 @@ mod monitor_tests {
 
     /// 分配一个锁对象(裸 Instance,类名 "Lock")。owner 经 `main_thread` 解析(无 Thread 预载
     /// 时返 null——单线程下 owner 一致即可测重入/释放/IMSE 机制)。
-    fn lock_obj(vm: &mut Vm<'_>) -> Reference {
+    fn lock_obj(vm: &mut Vm) -> Reference {
         vm.heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("Lock".into(), vec![])))
     }
@@ -303,7 +319,7 @@ mod monitor_tests {
     #[test]
     fn monitor_enter_reentry_and_exit_releases() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(&reg);
+        let mut vm = Vm::new(reg);
         let obj = lock_obj(&mut vm);
         vm.monitor_enter(obj).expect("enter #1");
         vm.monitor_enter(obj).expect("enter #2 (重入)");
@@ -319,7 +335,7 @@ mod monitor_tests {
     #[test]
     fn monitor_exit_unheld_throws_imse() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(&reg);
+        let mut vm = Vm::new(reg);
         let obj = lock_obj(&mut vm);
         let err = vm.monitor_exit(obj).unwrap_err();
         let VmError::ThrownException(r) = err else {
@@ -336,7 +352,7 @@ mod monitor_tests {
     #[test]
     fn monitor_enter_null_throws_npe() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(&reg);
+        let mut vm = Vm::new(reg);
         let err = vm.monitor_enter(Reference::null()).unwrap_err();
         let VmError::ThrownException(r) = err else {
             panic!("期望 ThrownException,得 {err:?}");
@@ -352,7 +368,7 @@ mod monitor_tests {
 #[cfg(test)]
 mod sync_assertions {
     //! Layer 4.42 / Phase B.2.1:`Vm` 须为 `Sync`——B.3 真并发(`Arc<Mutex<VmShared>>:
-    //! Send+Sync`)的前置。当前 `Vm<'a>` 经 `registry: Option<&'a ClassRegistry>` 借注册表,
+    //! Send+Sync`)的前置。当前 `Vm` 经 `registry: Option<&'a ClassRegistry>` 借注册表,
     //! 而 `ClassRegistry`/`LoadedClass` 持 `RefCell`(static_storage/flat_cache/init_state/
     //! class_modules),`RefCell: !Sync` → `Vm: !Sync` → 此断言**编译失败**(RED)。把四处
     //! `RefCell` 改 `Mutex` 后 `ClassRegistry: Sync` → `Vm: Sync` → 编译通过(GREEN)。
@@ -372,24 +388,32 @@ mod sync_assertions {
 
     fn assert_sync<T: ?Sized + Sync>() {}
     fn assert_send<T: ?Sized + Send>() {}
+    fn assert_static<T: 'static>(_: &T) {}
 
-    /// `Vm<'a>: Sync` 蕴含 `&'a ClassRegistry: Sync` → `ClassRegistry: Sync`。
+    /// **B.3.0**:`Arc<VmShared>` 须 `'static` —— B.3b `thread::spawn(move || …)` 跨线程共享
+    /// `Arc::clone(&vm.shared)` 的前置(spawn 闭包须 `'static`)。当前 `VmShared<'a>` 借
+    /// `&'a ClassRegistry`(`'a` 绑本地 `reg`)→ `Arc<VmShared<'a>>` 非 `'static` → 本断言
+    /// **编译失败**(RED:`reg` 寿命不足 `'static`)。移除 `'a`(`registry` → `Arc<ClassRegistry>`)
+    /// → `shared_arc()` 返 `Arc<VmShared>`(`'static`)→ 通过(GREEN)。
     #[test]
-    fn vm_is_sync() {
-        fn check<'a>(_: &'a ClassRegistry) {
-            assert_sync::<Vm<'a>>();
-        }
-        let _ = check;
+    fn vmshared_arc_is_static() {
+        let reg = ClassRegistry::new();
+        let vm = Vm::new(reg);
+        assert_static(&vm.shared_arc());
     }
 
-    /// `Vm<'a>: Send`(B.2.1):B.3 `Arc<Mutex<VmShared>>: Send+Sync` 须 `VmShared: Send`,
-    /// 进而 `Vm: Send`(`registry: &'a ClassRegistry: Send` ⟸ `ClassRegistry: Sync`,B.2.1 已达)。
+    /// `Vm: Sync`(B.2.1):各共享字段全 `Mutex`,registry 为 `Arc<ClassRegistry>`(`ClassRegistry: Sync`)
+    /// → `VmShared: Sync` → `Vm: Sync`。B.3.0 移除 `'a` 后 Vm 无生命周期参数,直接断言即可。
+    #[test]
+    fn vm_is_sync() {
+        assert_sync::<Vm>();
+    }
+
+    /// `Vm: Send`(B.2.1):B.3 `Arc<Mutex<VmShared>>: Send+Sync` 须 `VmShared: Send` → `Vm: Send`
+    ///(`ClassRegistry: Send+Sync`,B.2.1 已达)。B.3.0 后无生命周期参数,直接断言。
     #[test]
     fn vm_is_send() {
-        fn check<'a>(_: &'a ClassRegistry) {
-            assert_send::<Vm<'a>>();
-        }
-        let _ = check;
+        assert_send::<Vm>();
     }
 
     /// **T6**(B.2.3b):`Arc<VmShared<'a>>: Send + Sync`——B.3b `thread::spawn` 跨线程共享 `Arc::clone`
@@ -397,11 +421,9 @@ mod sync_assertions {
     /// `Arc<VmShared>: Send+Sync`。RED(任一字段非 Send/Sync)→ 编译失败。
     #[test]
     fn arc_vmshared_is_send_sync() {
-        fn check<'a>(_: &'a ClassRegistry) {
-            assert_send::<std::sync::Arc<super::VmShared<'a>>>();
-            assert_sync::<std::sync::Arc<super::VmShared<'a>>>();
-        }
-        let _ = check;
+        // B.3.0:VmShared 已无生命周期参数('a 移除——registry 为 owned Arc,不再借外部 ClassRegistry)。
+        assert_send::<std::sync::Arc<super::VmShared>>();
+        assert_sync::<std::sync::Arc<super::VmShared>>();
     }
 
     /// **T6**(B.2.3b):`from_shared(vm.shared_arc())` 派生的 Vm 与原 Vm **共享同一 `Arc<VmShared>`**
@@ -410,7 +432,7 @@ mod sync_assertions {
     fn from_shared_shares_arc_vmshared() {
         use crate::oops::{InstanceOop, Oop};
         let reg = ClassRegistry::new();
-        let vm = Vm::new(&reg);
+        let vm = Vm::new(reg);
         // 在 vm 的共享堆上分配一个对象(无须经注册表/intern)。
         let r = vm
             .heap_mut()

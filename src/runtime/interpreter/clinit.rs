@@ -38,7 +38,7 @@ fn find_clinit(cf: &ClassFile) -> Option<&CodeAttribute> {
 /// 运行 `lc` 的 `<clinit>`(经既有 `interpret_with` + `run_with_depth`)。无 `<clinit>`
 /// 则仅默认初始化(加载期已完成)→ `Ok`。`<clinit>` 为 static void 无参,局部变量
 /// 全默认,无需传参。其内 `putstatic` 经既有 `static_storage` 机制写静态字段。
-fn run_clinit(lc: &LoadedClass, vm: &mut Vm<'_>) -> Result<(), VmError> {
+fn run_clinit(lc: &LoadedClass, vm: &mut Vm) -> Result<(), VmError> {
     let Some(code) = find_clinit(&lc.cf) else {
         return Ok(());
     };
@@ -52,7 +52,7 @@ fn run_clinit(lc: &LoadedClass, vm: &mut Vm<'_>) -> Result<(), VmError> {
 
 /// 异常对象是否已是初始化失败类(`ExceptionInInitializerError` /
 /// `NoClassDefFoundError`)——超类初始化失败已上传此类异常时,本类不再重复包装。
-fn is_init_failure_class(vm: &Vm<'_>, exc: Reference) -> bool {
+fn is_init_failure_class(vm: &Vm, exc: Reference) -> bool {
     let heap = vm.heap();
     let Some(Oop::Instance(i)) = heap.get(exc) else {
         return false;
@@ -71,7 +71,7 @@ fn is_init_failure_class(vm: &Vm<'_>, exc: Reference) -> bool {
 /// `&'a ClassRegistry`(寿命不绑 `&self`),故取出 `&'a LoadedClass` 后仍可 `&mut vm`
 /// 执行 `<clinit>`,并在重入/超类递归中反复再借。
 pub(crate) fn ensure_class_initialized(
-    vm: &mut Vm<'_>,
+    vm: &mut Vm,
     class_name: &str,
 ) -> Result<(), VmError> {
     let Some(registry) = vm.registry() else {
@@ -227,7 +227,8 @@ mod tests {
     fn clinit_runs_and_sets_static() {
         let mut reg = ClassRegistry::new();
         reg.load(cls_with_clinit()).unwrap();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         // <clinit> 执行前:静态字段为默认 0。
         assert_eq!(
             *reg.get("Cls").unwrap().static_storage.lock().unwrap(),
@@ -246,7 +247,8 @@ mod tests {
     fn ensure_class_initialized_is_idempotent() {
         let mut reg = ClassRegistry::new();
         reg.load(cls_with_clinit()).unwrap();
-        let mut vm = Vm::new(&reg);
+        let reg = std::sync::Arc::new(reg);
+        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
         ensure_class_initialized(&mut vm, "Cls").unwrap();
         // 再次触发:Done → 直接返回,不重跑 <clinit>(静态值仍为 5,非 10)。
         ensure_class_initialized(&mut vm, "Cls").unwrap();
@@ -299,7 +301,7 @@ mod tests {
         // ClassRegistry::new() 预装 ArithmeticException / ExceptionInInitializerError 引导桩。
         let mut reg = ClassRegistry::new();
         reg.load(cls_with_throwing_clinit()).unwrap();
-        let mut vm = Vm::new(&reg);
+        let mut vm = Vm::new(reg);
         let err = ensure_class_initialized(&mut vm, "Cls").unwrap_err();
         let VmError::ThrownException(eiie) = err else {
             panic!("须包为 EIIE(ThrownException),得 {err:?}");

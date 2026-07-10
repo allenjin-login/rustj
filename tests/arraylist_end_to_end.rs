@@ -69,11 +69,9 @@ fn compile_dir(source: &str, public_name: &str, extra: &[&str]) -> PathBuf {
 }
 
 /// 解释执行一个**无参静态方法**,共用调用者传入的 `Vm`。Java 异常时把类名带出便于诊断。
-fn run_static_in(vm: &mut Vm<'_>, class: &str, name: &str, desc: &str) -> Result<Value, String> {
-    let lc = vm
-        .registry()
-        .and_then(|r| r.get(class))
-        .unwrap_or_else(|| panic!("类 {class} 未加载"));
+fn run_static_in(vm: &mut Vm, class: &str, name: &str, desc: &str) -> Result<Value, String> {
+    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表"));
+    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc
         .cf
         .methods
@@ -182,7 +180,7 @@ fn real_arraylist_end_to_end() {
     }
 
     // 3) 引导 + 运行须共用同一 Vm(静态字段值是 Vm 堆句柄)。
-    let mut vm = Vm::new(&registry);
+    let mut vm = Vm::new(registry);
     run_static_in(&mut vm, "RustjBootstrap", "init", "()V").expect("引导不应抛异常");
 
     assert_eq!(

@@ -13,7 +13,7 @@
 //! 构造、堆/池/注册表 accessor、栈帧法(T8 下沉 [`ThreadContext`])。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::oops::ClassRegistry;
 use crate::runtime::heap::Heap;
@@ -110,14 +110,31 @@ impl ThreadContext {
     }
 }
 
-/// 对象管程状态(对应 HotSpot 对象头 mark word 的锁态子集;Layer 4.41 / Phase B.1)。
+/// 对象管程(对应 HotSpot `ObjectMonitor` 的 rustj 阻塞子集;Phase B.3a)。每对象惰性分配一个,
+/// `entry` Condvar 在 `monitor_enter` 被他人持有时阻塞等待,owner 归零时 `notify_one` 唤醒等待者。
 ///
-/// `owner` = 持有者线程的 Thread 镜像句柄;`count` = 重入计数(同线程多次 monitorenter
-/// 累加,monitorexit 减,归零释放)。单线程下 owner 恒为当前线程;B.3 真并发后多线程争用。
-#[derive(Clone, Copy)]
-pub(crate) struct MonitorState {
-    pub(crate) owner: Reference,
-    pub(crate) count: u32,
+/// B.1 起 owner 判定 + 重入计数;B.3a 前重入不阻塞(无 Condvar)→ 真并发丢失更新;B.3a 阻塞至空闲。
+pub(crate) struct JavaMonitor {
+    /// 锁态:`owner` = 持有者 Thread 镜像句柄(`None` = 空闲)、`count` = 重入计数。
+    pub(crate) inner: Mutex<MonitorInner>,
+    /// 入口条件变量:被他人持有时 `wait`,owner 释放时 `notify_one`。
+    pub(crate) entry: Condvar,
+}
+
+/// 管程锁态(`JavaMonitor::inner` 的载荷)。`owner`/`count` 经 `inner` Mutex 保护。
+pub(crate) struct MonitorInner {
+    pub(crate) owner: Option<Reference>,
+    pub(crate) count: u64,
+}
+
+impl JavaMonitor {
+    /// 构造空闲管程(`owner=None`、`count=0`)。
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(MonitorInner { owner: None, count: 0 }),
+            entry: Condvar::new(),
+        }
+    }
 }
 
 /// **跨线程共享态**(Phase B.2.3a/b):Vm 持有的「所有线程共享」字段集合——对象堆、类注册表、
@@ -135,8 +152,9 @@ pub(crate) struct VmShared {
     registry: Option<Arc<ClassRegistry>>,
     /// 字符串 intern 池(4.8):文本 → 堆引用,以本 Vm 的堆为后盾。Mutex(B.2.3b 共享态)。
     string_pool: Mutex<StringPool>,
-    /// 对象管程(对象句柄 → 锁状态)。跨线程共享态(B.2.3b 加 Mutex);单线程下 owner 恒为当前线程。
-    pub(crate) monitors: Mutex<HashMap<Reference, MonitorState>>,
+    /// 对象管程表(对象句柄 → per-object `JavaMonitor`)。Phase B.3a:每对象惰性分配一个
+    /// `Arc<JavaMonitor>`(owner/count + `entry` Condvar 阻塞);跨线程共享态。
+    pub(crate) monitors: Mutex<HashMap<Reference, Arc<JavaMonitor>>>,
     /// 线程管理器(tid 分配;B.3b 增线程表)。T7 从顶层 `next_tid` 收编为 [`threads::ThreadManager`]。
     pub(crate) threads: threads::ThreadManager,
     /// 异常 → 元数据(帧 / cause / detailMessage),键 = 异常对象句柄。Mutex(B.2.3b 共享态)。
@@ -446,6 +464,59 @@ mod sync_assertions {
         assert!(
             matches!(oop, Oop::Instance(i) if i.class_name() == "probe"),
             "from_shared 须共享 VmShared 堆(同引用同对象)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod concurrent_monitor_tests {
+    //! Phase B.3a:真阻塞管程闸门。两 OS 线程经 [`Vm::from_shared`](`Arc::clone`)共享同一
+    //! [`VmShared`],对同一锁对象 `monitor_enter/exit` 包夹**非原子**读-改-写共享计数。阻塞管程
+    //! 串行化临界区 → 总数 == 2N;当前重入不阻塞(owner 不判 / 无 Condvar)→ 两线程同时进入临界区
+    //! → 竞态丢失更新 → 总数 < 2N(RED)。GREEN:[`JavaMonitor`] + `Condvar` 阻塞至 owner 空闲。
+    use super::*;
+    use crate::oops::{ClassRegistry, InstanceOop, Oop};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    /// 每线程迭代次数(够大以放大竞态;yield_now 进一步拉宽丢失更新窗口)。
+    const ITERS: u64 = 2000;
+
+    /// worker 线程体:派生共享 Vm,ITERS 次 enter → 非原子 RMW → exit。
+    fn worker(shared: Arc<VmShared>, lock: Reference, counter: &AtomicU64) {
+        let mut vm = Vm::from_shared(shared);
+        for _ in 0..ITERS {
+            vm.monitor_enter(lock).expect("monitor_enter");
+            // 非原子读-改-写:正确性**仅**靠管程串行化保证(yield_now 拉宽竞态窗口)。
+            let v = counter.load(Ordering::Relaxed);
+            thread::yield_now();
+            counter.store(v + 1, Ordering::Relaxed);
+            vm.monitor_exit(lock).expect("monitor_exit");
+        }
+    }
+
+    /// **RED→GREEN**:两线程并发各 ITERS 次自增共享计数,管程须串行化 → 总数 == 2·ITERS。
+    #[test]
+    fn monitor_serializes_concurrent_increment() {
+        let vm = Vm::new(ClassRegistry::new());
+        let shared = vm.shared_arc();
+        let lock = vm
+            .heap_mut()
+            .alloc(Oop::Instance(InstanceOop::new("Lock".into(), vec![])));
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let (c1, c2) = (Arc::clone(&counter), Arc::clone(&counter));
+        let (s1, s2) = (Arc::clone(&shared), Arc::clone(&shared));
+        let t1 = thread::spawn(move || worker(s1, lock, &c1));
+        let t2 = thread::spawn(move || worker(s2, lock, &c2));
+        t1.join().expect("t1 未 panic");
+        t2.join().expect("t2 未 panic");
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2 * ITERS,
+            "阻塞管程须串行化并发自增(无丢失更新)"
         );
     }
 }

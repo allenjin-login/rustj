@@ -1,18 +1,22 @@
-//! 对象管程(`monitorenter`/`monitorexit`/`holdsLock`;Layer 4.41 / Phase B.1,
-//! Phase B.2.3b T7 从 [`super::vm`] 分解)。移植自 HotSpot `ObjectSynchronizer::enter/exit`。
-//! 共享态 `VmShared.monitors`(`HashMap<Reference, MonitorState>`);owner 经 [`Vm::main_thread`]
-//!(`super::threads`)解析。
+//! 对象管程(`monitorenter`/`monitorexit`/`holdsLock`)。移植自 HotSpot
+//! `ObjectSynchronizer::enter/exit`(`ObjectMonitor` 的 rustj 阻塞子集)。
+//!
+//! Phase B.1:重入 owner/count;Phase B.3a:**真阻塞**——`monitor_enter` 被他人持有时经
+//! `entry: Condvar` 阻塞至 owner 空闲再获取,`monitor_exit` 归零时 `notify_one` 唤醒等待者。
+//! 共享态 `VmShared.monitors`(`HashMap<Reference, Arc<JavaMonitor>>`,per-object 惰性分配);
+//! owner = 当前线程 Thread 镜像句柄(`main_thread`,经 [`super::threads`])。
 
-use std::collections::hash_map::Entry;
+use std::sync::Arc;
 
 use crate::runtime::{Reference, Vm, VmError};
 
-use super::MonitorState;
+use super::{JavaMonitor, MonitorInner};
 
 impl Vm {
-    /// `monitorenter`(JVMS §6.5):进入 `obj` 管程。null → NPE;owner = 当前线程(`main_thread`);
-    /// 未锁 → 记 owner/count=1;已持 → count+1(重入)。单线程下 owner 恒为当前线程、无争用
-    /// (Phase B.3 真并发:被他人持有时阻塞至释放;rustj 当前单线程直接重入)。
+    /// `monitorenter`(JVMS §6.5):进入 `obj` 管程。null → NPE;owner = 当前线程(`main_thread`)。
+    /// 取/建该对象的 [`JavaMonitor`](锁表→取 `Arc` clone→**释表**),再锁 `inner`:owner==本线程→重入
+    /// `count+1`;owner==None→占位 `owner+count=1`;owner==他人→`entry.wait` 循环至 owner 空闲/本线程。
+    /// 释表锁后再锁 inner:持 inner 等待时不持表锁 → 不同对象不同 JavaMonitor → 无锁序死锁。
     pub(crate) fn monitor_enter(&mut self, obj: Reference) -> Result<(), VmError> {
         if obj.is_null() {
             return Err(crate::runtime::interpreter::throw_exception(
@@ -21,19 +25,26 @@ impl Vm {
             ));
         }
         let owner = self.main_thread();
-        // 锁 monitors 仅覆盖本 match 块:body 不调 &mut self,guard 出块即释(B.2.3b)。
-        let mut monitors = self.shared.monitors.lock().unwrap();
-        match monitors.entry(obj) {
-            Entry::Occupied(mut e) => e.get_mut().count += 1,
-            Entry::Vacant(e) => {
-                e.insert(MonitorState { owner, count: 1 });
-            }
+        // 锁表取/建 JavaMonitor,克隆 Arc 后即释表 guard(drop-before-recurse;B.2.3b)。
+        let mon = {
+            let mut table = self.shared.monitors.lock().unwrap();
+            Arc::clone(
+                table
+                    .entry(obj)
+                    .or_insert_with(|| Arc::new(JavaMonitor::new())),
+            )
+        };
+        // 锁 inner:被他人持有时阻塞等待至空闲或本线程持有(Condvar 标准用法:wait 释锁、唤醒重获)。
+        let mut guard = mon.inner.lock().unwrap();
+        while guard.owner.is_some() && guard.owner != Some(owner) {
+            guard = mon.entry.wait(guard).unwrap();
         }
+        acquire_or_reenter(&mut guard, owner);
         Ok(())
     }
 
     /// `monitorexit`(JVMS §6.5):退出 `obj` 管程。null → NPE;当前线程持有(count>0)→ count-1
-    /// (归零释放);未持有 / owner 不符 → `IllegalMonitorStateException`。
+    ///(归零 owner=None + `notify_one` 唤醒等待者);未持有 / owner 不符 / 表中无该对象 → IMSE。
     pub(crate) fn monitor_exit(&mut self, obj: Reference) -> Result<(), VmError> {
         if obj.is_null() {
             return Err(crate::runtime::interpreter::throw_exception(
@@ -42,26 +53,28 @@ impl Vm {
             ));
         }
         let owner = self.main_thread();
-        // held 判定:锁 monitors 取 bool,出块释 guard 后再 throw(避免持 guard 调 &mut self)。
-        let held = {
-            let monitors = self.shared.monitors.lock().unwrap();
-            monitors
-                .get(&obj)
-                .is_some_and(|m| m.owner == owner && m.count > 0)
+        // 锁表取 Arc clone(无该对象 → 未持有 → IMSE)。先提取 owned Option<Arc>、释表 guard,
+        // 再 IMSE(throw_exception 须 &mut self,不能持表 guard)。
+        let mon = self.shared.monitors.lock().unwrap().get(&obj).cloned();
+        let Some(mon) = mon else {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/IllegalMonitorStateException",
+            ));
         };
-        if !held {
+        let mut guard = mon.inner.lock().unwrap();
+        if guard.owner != Some(owner) || guard.count == 0 {
             return Err(crate::runtime::interpreter::throw_exception(
                 self,
                 "java/lang/IllegalMonitorStateException",
             ));
         }
-        // 再锁执行 count-1/释放(与 held 判定不重叠,无死锁)。
-        let mut monitors = self.shared.monitors.lock().unwrap();
-        let count = monitors.get(&obj).unwrap().count;
-        if count == 1 {
-            monitors.remove(&obj);
-        } else {
-            monitors.get_mut(&obj).unwrap().count -= 1;
+        guard.count -= 1;
+        if guard.count == 0 {
+            guard.owner = None;
+            // 释 inner guard 后再 notify(标准做法:持锁 notify 非错误但释后更简,wait 方唤醒即重获)。
+            drop(guard);
+            mon.entry.notify_one();
         }
         Ok(())
     }
@@ -76,9 +89,24 @@ impl Vm {
             ));
         }
         let owner = self.main_thread();
-        let monitors = self.shared.monitors.lock().unwrap();
-        Ok(monitors
-            .get(&obj)
-            .is_some_and(|m| m.owner == owner && m.count > 0))
+        // 锁表取 Arc(无 → false),释表后锁 inner 读 owner==本线程 && count>0。
+        let mon = {
+            let table = self.shared.monitors.lock().unwrap();
+            table.get(&obj).cloned()
+        };
+        let Some(mon) = mon else { return Ok(false) };
+        let guard = mon.inner.lock().unwrap();
+        Ok(guard.owner == Some(owner) && guard.count > 0)
+    }
+}
+
+/// 占位空闲管程(owner==None)或重入本线程(owner==self);调用前须持 `inner` 锁且已过等待循环。
+fn acquire_or_reenter(inner: &mut std::sync::MutexGuard<'_, MonitorInner>, owner: Reference) {
+    if inner.owner == Some(owner) {
+        inner.count += 1;
+    } else {
+        // 等待循环保证到达此处时 owner==None。
+        inner.owner = Some(owner);
+        inner.count = 1;
     }
 }

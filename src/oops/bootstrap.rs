@@ -45,6 +45,10 @@ const BOOTSTRAP_HIERARCHY: &[(&str, Option<&str>)] = &[
     ("java/lang/ArrayStoreException", Some("java/lang/RuntimeException")),
     ("java/lang/NegativeArraySizeException", Some("java/lang/RuntimeException")),
     ("java/lang/IllegalMonitorStateException", Some("java/lang/RuntimeException")),
+    // java/lang/Thread:VM 线程身份的基础设施(ObjectMonitor owner = Thread 镜像句柄;Phase B.3a
+    // 阻塞管程须按 Thread 镜像区分持有者)。HotSpot 引导即载 java/lang/Thread;rustj 同理预装桩,
+    // 使 [`Vm::main_thread`] 在最小/单测设置下即可分配非 null owner(真运行经 load_closure 覆盖为真 Thread)。
+    ("java/lang/Thread", Some("java/lang/Object")),
 ];
 
 /// 在字节流尾追加一个 `Utf8` 条目,返回它的常量池索引(并推进 `next`)。

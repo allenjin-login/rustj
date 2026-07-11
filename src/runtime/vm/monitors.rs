@@ -122,6 +122,17 @@ impl Vm {
             ));
         }
         let owner = self.main_thread();
+        // B.4c:入口中断检查——已中断则清标志 + 抛 IEE(`JVM_Object_wait` 入口检 is_interrupted)。
+        if self
+            .interrupt_flag(owner)
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.clear_interrupt_status(owner);
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/InterruptedException",
+            ));
+        }
         // 锁表取 Arc clone(无该对象 → 未持有 → IMSE)。先提取 owned Option<Arc>、释表 guard,
         // 再 IMSE(throw_exception 须 &mut self,不能持表 guard)。
         let mon = self.shared.monitors.lock().unwrap().get(&obj).cloned();
@@ -148,27 +159,50 @@ impl Vm {
         let my_seq = guard.wake_seq;
         // 持 inner guard 调 entry.notify_one(std 允许;waiter 须重获 inner,blocked 至 wait_cvar.wait 释)。
         mon.entry.notify_one();
-        // wait_cvar 阻塞:释 inner 锁、唤醒重获。wait[_timeout]_while 谓词真(wake_seq 未变)→ 继续等
-        //(抗 spurious wakeup);notify/notifyAll 推 wake_seq → 谓词假 → 返回(或超时到)。
+        // B.4c:登记 wait_targets[owner]=obj(供 interrupt0 找本线程阻塞的 monitor → wait_cvar.notify_all)。
+        self.shared
+            .threads
+            .wait_targets
+            .lock()
+            .unwrap()
+            .insert(owner, obj);
+        // 中断标志 Arc clone:谓词内无法读 Java 字段(须锁堆),用镜像标志廉价轮询。
+        let irq = self.interrupt_flag(owner);
+        // wait_cvar 阻塞:释 inner 锁、唤醒重获。谓词真(wake_seq 未变 **且** 未被中断)→ 继续等
+        //(抗 spurious wakeup);notify/notifyAll 推 wake_seq 或 interrupt 置标志 → 谓词假 → 返回(或超时到)。
         let mut guard = if millis == 0 {
             mon.wait_cvar
-                .wait_while(guard, |inner| inner.wake_seq == my_seq)
+                .wait_while(guard, |inner| {
+                    inner.wake_seq == my_seq && !irq.load(std::sync::atomic::Ordering::Relaxed)
+                })
                 .unwrap()
         } else {
             mon.wait_cvar
                 .wait_timeout_while(guard, Duration::from_millis(millis as u64), |inner| {
-                    inner.wake_seq == my_seq
+                    inner.wake_seq == my_seq && !irq.load(std::sync::atomic::Ordering::Relaxed)
                 })
                 .unwrap()
                 .0
         };
+        // B.4c:注销 wait_targets(已唤醒,不再阻塞于 wait)。
+        self.shared.threads.wait_targets.lock().unwrap().remove(&owner);
         // 唤醒后:waiters-1、重获管程(可能被他人抢占 → entry 等待循环)、恢复重入计数。
         guard.waiters -= 1;
+        let notified = guard.wake_seq != my_seq;
         while guard.owner.is_some() && guard.owner != Some(owner) {
             guard = mon.entry.wait(guard).unwrap();
         }
         guard.owner = Some(owner);
         guard.count = saved_count;
+        // B.4c:唤醒后检中断——非 notify 唤醒(超时 / 中断)且被中断 → 清标志 + 抛 IEE
+        //(JLS §17.2:被 notify 唤醒则正常返回,即使随后被中断;故仅非 notify 时抛)。
+        if !notified && irq.load(std::sync::atomic::Ordering::Relaxed) {
+            self.clear_interrupt_status(owner);
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/InterruptedException",
+            ));
+        }
         Ok(())
     }
 

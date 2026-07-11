@@ -21,6 +21,15 @@ pub(crate) struct ThreadManager {
     /// 系统 ThreadGroup 单例(B.4a;main 线程 holder.group,`new Thread(r)` 构造器复用之)。
     /// 惰性分配;`system_thread_group` 首调置位。对应 HotSpot `Threads::create_vm` 创建的顶层组。
     pub(crate) system_group: std::sync::Mutex<Option<Reference>>,
+    /// 每线程**中断标志镜像**(B.4c):`Arc<AtomicBool>`。Java 字段 `Thread.interrupted` 由字节码
+    /// 置位(`interrupt()`),但 `Object.wait` 的 Condvar 谓词无法读 Java 字段(须锁堆)→ 此 Rust 侧
+    /// 镜像供谓词廉价轮询。`interrupt0` 置 true,`clearInterruptEvent` 置 false——与字段同步(每次
+    /// 字段写后即调对应 native)。惰性建条目。
+    pub(crate) interrupt_flags:
+        std::sync::Mutex<std::collections::HashMap<Reference, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// 每线程**正在 Object.wait 的锁对象**(B.4c):`interrupt0` 据此找目标线程阻塞的 monitor →
+    /// `wait_cvar.notify_all` 唤醒(谓词查中断标志 → 抛 InterruptedException)。无条目 = 未在 wait 中。
+    pub(crate) wait_targets: std::sync::Mutex<std::collections::HashMap<Reference, Reference>>,
 }
 
 impl ThreadManager {
@@ -30,6 +39,8 @@ impl ThreadManager {
             next_tid: std::sync::Mutex::new(1),
             handles: std::sync::Mutex::new(std::collections::HashMap::new()),
             system_group: std::sync::Mutex::new(None),
+            interrupt_flags: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wait_targets: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -343,6 +354,74 @@ impl Vm {
         self.set_eetop(this, 0);
         let _ = self.object_notify_all(this);
         let _ = self.monitor_exit(this);
+    }
+
+    /// 取/建线程的中断标志镜像(B.4c)。惰性建条目(首次访问,默认 false)。返 `Arc` clone
+    /// 供 `Object.wait` 的 Condvar 谓词廉价轮询(无法在谓词内读 Java 字段——须锁堆)。
+    pub(crate) fn interrupt_flag(
+        &self,
+        thread: Reference,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let mut flags = self.shared.threads.interrupt_flags.lock().unwrap();
+        flags
+            .entry(thread)
+            .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone()
+    }
+
+    /// `Thread.interrupt0()` 实例 native(B.4c;移植 `JVM_Interrupt` jvm.cpp → `JavaThread::interrupt`)。
+    /// null → NPE。置目标线程中断标志镜像 true + 若目标正阻塞于 `Object.wait` 则唤醒其 monitor 的
+    /// `wait_cvar`(谓词查中断标志 → 抛 InterruptedException)。Java 字段 `interrupted` 已由 `interrupt()`
+    /// 字节码在调本 native 前置 true;本 native 仅负责唤醒。sleep 中断由 `sleepNanos0` 轮询标志捕获。
+    pub(crate) fn interrupt_thread(&mut self, target: Reference) -> Result<(), crate::runtime::VmError> {
+        if target.is_null() {
+            return Err(crate::runtime::interpreter::throw_exception(
+                self,
+                "java/lang/NullPointerException",
+            ));
+        }
+        self.interrupt_flag(target)
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 若目标在 Object.wait 中,取其锁对象 → monitor → wait_cvar.notify_all 唤醒(谓词查中断)。
+        let lock_obj = self
+            .shared
+            .threads
+            .wait_targets
+            .lock()
+            .unwrap()
+            .get(&target)
+            .copied();
+        if let Some(lock) = lock_obj
+            && let Some(mon) = self.shared.monitors.lock().unwrap().get(&lock).cloned()
+        {
+            mon.wait_cvar.notify_all();
+        }
+        Ok(())
+    }
+
+    /// `Thread.clearInterruptEvent()` 静态 native(B.4c):清**当前线程**中断标志镜像。Java 字段
+    /// `interrupted` 已由 `clearInterrupt()`/`getAndClearInterrupt()` 字节码在调本 native 前置 false。
+    /// 对应 HotSpot `JVM_ClearInterruptEvent`(VM 记账清除)。与 [`Self::interrupt_thread`] 配对,
+    /// 保持 Java 字段 ↔ 镜像标志同步(每次字段写后即调对应 native)。
+    pub(crate) fn clear_interrupt_event(&mut self) {
+        let cur = self.main_thread();
+        if cur.is_null() {
+            return;
+        }
+        if let Some(flag) = self.shared.threads.interrupt_flags.lock().unwrap().get(&cur) {
+            flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 清线程中断状态(Java 字段 `interrupted` + 镜像标志;B.4c)。供 `Object.wait`/`Thread.sleep`
+    /// 抛 `InterruptedException` 前调用(JLS §17.2.3:抛 IEE 前先清中断状态)。对应 HotSpot
+    /// `ObjectMonitor::wait` / sleep 检测中断后清标志再抛。
+    pub(crate) fn clear_interrupt_status(&mut self, thread: Reference) {
+        // Java 字段 interrupted = false(真 Thread 写;桩无此字段静默跳过)。
+        self.set_instance_field_by_name(thread, "java/lang/Thread", "interrupted", Slot::Int(0));
+        if let Some(flag) = self.shared.threads.interrupt_flags.lock().unwrap().get(&thread) {
+            flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

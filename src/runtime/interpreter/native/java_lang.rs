@@ -494,17 +494,58 @@ pub(super) fn dispatch(
             Ok(Value::Void)
         }
 
-        // Thread.sleepNanos0(J)V —— Thread.java:569 `private static native`。移植 `JVM_Sleep`
-        // (os::sleep):当前线程睡眠 nanos 纳秒。rustj 单线程 → `std::thread::sleep`;0 纳秒即立返。
-        // InterruptedException 顺延(B.4 中断支持):单线程无中断源,不抛。
+        // Thread.sleepNanos0(J)V —— Thread.java:569 `private static native throws InterruptedException`。
+        // 移植 `JVM_Sleep`(os::sleep):当前线程睡眠 nanos 纳秒;被中断(`Thread.interrupt`)则清标志
+        // + 抛 InterruptedException。`std::thread::sleep` 不可中断 → 分片轮询(≤5ms)查中断标志
+        //(latency 可接受;sleep 粒度本粗)。入口亦检中断(已中断即抛)。
         ("java/lang/Thread", "sleepNanos0", "(J)V") => {
             let nanos = match args.first().copied().unwrap_or(Value::Long(0)) {
                 Value::Long(n) => n.max(0),
                 _ => 0,
             };
-            if nanos > 0 {
-                std::thread::sleep(std::time::Duration::from_nanos(nanos as u64));
+            let cur = vm.main_thread();
+            let irq = vm.interrupt_flag(cur);
+            let load = || irq.load(std::sync::atomic::Ordering::Relaxed);
+            // 入口中断检查(已中断即清标志 + 抛)。
+            if load() {
+                vm.clear_interrupt_status(cur);
+                return Err(crate::runtime::interpreter::throw_exception(
+                    vm,
+                    "java/lang/InterruptedException",
+                ));
             }
+            let total = std::time::Duration::from_nanos(nanos as u64);
+            let start = std::time::Instant::now();
+            loop {
+                if start.elapsed() >= total {
+                    return Ok(Value::Void);
+                }
+                if load() {
+                    vm.clear_interrupt_status(cur);
+                    return Err(crate::runtime::interpreter::throw_exception(
+                        vm,
+                        "java/lang/InterruptedException",
+                    ));
+                }
+                let remaining = total - start.elapsed();
+                let chunk = remaining.min(std::time::Duration::from_millis(5));
+                std::thread::sleep(chunk);
+            }
+        }
+
+        // Thread.interrupt0()V —— Thread.java:1595/2623 `private native`(实例)。`Thread.interrupt()`
+        // 字节码先置 `interrupted=true`,再调本 native 通知 VM。移植 `JVM_Interrupt`:置镜像标志 +
+        // 唤醒目标若阻塞于 Object.wait(使其抛 InterruptedException)。
+        ("java/lang/Thread", "interrupt0", "()V") => {
+            let this_ref = this.unwrap_or_else(Reference::null);
+            vm.interrupt_thread(this_ref).map(|()| Value::Void)
+        }
+
+        // Thread.clearInterruptEvent()V —— Thread.java:1701/2627 `private static native`。由
+        // `clearInterrupt()`/`getAndClearInterrupt()` 字节码(已置 `interrupted=false`)调用。清当前
+        // 线程镜像标志(与字段同步)。对应 HotSpot `JVM_ClearInterruptEvent`。
+        ("java/lang/Thread", "clearInterruptEvent", "()V") => {
+            vm.clear_interrupt_event();
             Ok(Value::Void)
         }
 

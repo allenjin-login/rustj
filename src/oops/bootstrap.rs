@@ -47,6 +47,11 @@ const BOOTSTRAP_HIERARCHY: &[(&str, Option<&str>)] = &[
     ("java/lang/IllegalMonitorStateException", Some("java/lang/RuntimeException")),
     // IllegalArgumentException:Object.wait(负 timeout) 抛(synchronizer.cpp:516);RuntimeException 子类。
     ("java/lang/IllegalArgumentException", Some("java/lang/RuntimeException")),
+    // IllegalThreadStateException:Thread.start() 二次启动抛(Thread.java:1471);RuntimeException 子类。
+    ("java/lang/IllegalThreadStateException", Some("java/lang/RuntimeException")),
+    // InterruptedException:Object.wait / Thread.sleep 被中断抛(checked exception);Exception 子类
+    //(非 RuntimeException)。B.4c。
+    ("java/lang/InterruptedException", Some("java/lang/Exception")),
     // java/lang/Thread:VM 线程身份的基础设施(ObjectMonitor owner = Thread 镜像句柄;Phase B.3a
     // 阻塞管程须按 Thread 镜像区分持有者)。HotSpot 引导即载 java/lang/Thread;rustj 同理预装桩,
     // 使 [`Vm::main_thread`] 在最小/单测设置下即可分配非 null owner(真运行经 load_closure 覆盖为真 Thread)。

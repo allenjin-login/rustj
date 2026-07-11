@@ -256,9 +256,30 @@ pub(super) fn dispatch(
             "getDeclaredConstructors0",
             "(Z)[Ljava/lang/reflect/Constructor;",
         ) => get_declared_constructors0(vm, this, args),
-        // desiredAssertionStatus() 字节码 `return desiredAssertionStatus0(this)` 调)。rustj
-        // 无断言支持 → 恒 false(断言禁用,即 `$assertionsDisabled = true`)。
+        // Class.desiredAssertionStatus0(Ljava/lang/Class;)Z —— Class.java 真原生(`desiredAssertionStatus()`
+        // 字节码 `return desiredAssertionStatus0(this)` 调)。rustj 无断言支持 → 恒 false(断言禁用,
+        // 即 `$assertionsDisabled = true`)。
         ("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z") => Ok(Value::Int(0)),
+
+        // Class.getConstantPool()Ljdk/internal/reflect/ConstantPool; —— Class.java 私有 native,供注解机制
+        // (Executable.declaredAnnotations → AnnotationParser.parseAnnotations 取 CP 解析注解字节)。
+        // **rustj 注解反射暂未完整移植**:返 null。因 Method/Constructor.getAnnotationBytes 亦返 null,
+        // AnnotationParser.parseAnnotations(null,...) 在解引用 CP 前即返 emptyMap(AnnotationParser.java:63),
+        // 故 null CP 不被触碰 —— isAnnotationPresent 对无注解成员(如 Integer.parseInt 无 @CallerSensitive)
+        // 正确返 false,解锁 `Method.invoke` 字节码路径。注解反射完整化(ConstantPool 17 natives + 真字节)
+        // 顺延至注解层。此为 Layer 4.15b 探针驱动发现的最小桩。
+        ("java/lang/Class", "getConstantPool", "()Ljdk/internal/reflect/ConstantPool;") => {
+            Ok(Value::Reference(Reference::null()))
+        }
+        // Method/Constructor.getAnnotationBytes()[B —— Executable 子类的包私有 native,返该成员的
+        // RuntimeVisibleAnnotations 属性原始字节(无属性 → null)。rustj 暂返 null(注解机制最小桩,同上):
+        // parseAnnotations(null) → emptyMap,isAnnotationPresent 对无 @CallerSensitive 的方法正确返 false。
+        ("java/lang/reflect/Method", "getAnnotationBytes", "()[B") => {
+            Ok(Value::Reference(Reference::null()))
+        }
+        ("java/lang/reflect/Constructor", "getAnnotationBytes", "()[B") => {
+            Ok(Value::Reference(Reference::null()))
+        }
 
         // Class.initClassName()Ljava/lang/String; —— Class.java:967 真原生;getName() 字节码
         // 首次(`name == null`)调此。按镜像反查内部名→外部形(`/`→`.`),经 string::intern 造真

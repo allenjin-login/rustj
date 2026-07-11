@@ -82,8 +82,8 @@ fn dispatch(
         | "jdk/internal/loader/BootLoader" => {
             jdk_internal_loader::dispatch(vm, class, name, desc, this, args)
         }
-        "jdk/internal/reflect/Reflection" => {
-            jdk_internal_reflect::dispatch(vm, class, name, desc, this, args)
+        c if c.starts_with("jdk/internal/reflect/") => {
+            jdk_internal_reflect::dispatch(vm, c, name, desc, this, args)
         }
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
     }

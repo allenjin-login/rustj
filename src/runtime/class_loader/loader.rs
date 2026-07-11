@@ -90,10 +90,15 @@ pub fn load_closure(
         // ClassPath 无但注册表已有(桩)→ 用桩的 cf 抽其引用(桩的边仅为 Object,无害);
         // 两处皆无(其他模块未含的引用)→ 跳过。
         let cf: &ClassFile = if let Some((real, module)) = class_path.load_class(&name)? {
-            // 源容器为命名模块 → 标记类属该模块(Class.getModule 用)。None = 无名模块,不标记。
-            // 须先于 load_or_replace(&mut) 调用,免与后续 &lc.cf 不可变借用冲突。
+            // 源容器为命名模块 → 标记类属该模块(Class.getModule 用)+ 回带完整 ModuleDescriptor
+            // (4.14c:bootstrap 据其 exports 填 Module.exportedPackages,解锁反射访问检查)。
+            // None = 无名模块,不标记。须先于 load_or_replace(&mut) 调用,免与后续 &lc.cf 不可变
+            // 借用冲突。
             if let Some(m) = module {
                 registry.set_class_module(&name, &m);
+                if let Some(desc) = class_path.module_descriptor(&m) {
+                    registry.set_module_descriptor(&m, desc);
+                }
             }
             let lc = registry.load_or_replace(real)?;
             loaded += 1;

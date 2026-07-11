@@ -1,18 +1,14 @@
 //! 集成闸门(Layer 4.15b):**反射调用 — `Method.invoke` 端到端**。
 //!
-//! **当前 `#[ignore]`**:端到端 `Method.invoke` 字节码路径的 `checkAccess` →
-//! `Reflection.verifyPublicMemberAccess` → `Module.isExported` →
-//! `Module.implIsExportedOrOpen` 访问 **`descriptor.packages()`/`descriptor.exports()`**
-//! (Module.java:705),而 4.14a 仅置 Module.name,descriptor 仍 null → NPE。解锁须
-//! **填充 java.base Module 的 descriptor**(真 `ModuleDescriptor`,含 packages/exports)——
-//! 模块系统完整性子层(4.14c),非 invoke0 native 本身。invoke0/newInstance0 native
-//! 已由 lib 闸门(`jdk_internal_reflect::tests::invoke0_*` / `new_instance0_*`)钉绿。
-//!
 //! `Method.invoke(obj, args)` 经真 java.base 字节码路径 → `MethodAccessor`(惰性)→
 //! `ReflectionFactory.newMethodAccessor` → `MethodHandleAccessorFactory.newMethodAccessor` →
 //! `useNativeAccessor`(`!VM.isJavaLangInvokeInited()` → true,rustj 不跑 initPhase3)→
 //! `DirectMethodHandleAccessor$NativeAccessor` → **native `invoke0`**(= HotSpot `JVM_InvokeMethod`)。
 //! 绕过「MethodHandle 直接调用」墙。详见 spec `2026-07-11-layer-4.15b-reflection-invocation-design.md`。
+//!
+//! `Method.invoke` 的 `checkAccess` → `Reflection.verifyPublicMemberAccess` → `Module.isExported`
+//! → `implIsExportedOrOpen` 读 java.base `Module.exportedPackages` 实例 Map——由 Layer 4.14c
+//! `populate_module_exports`(bootstrap_module_system 末尾)据 `module-info` 的非限定 exports 填充。
 //!
 //! 覆盖:静态法(parseInt(String)→42)、实例法(String.length()→5)、重载+拆箱
 //! (parseInt(String,int)→255,Integer 参拆箱)。需 `javac` + 本机 jmod;缺一跳过。
@@ -126,11 +122,8 @@ public class Probe {
 
 /// **RED→GREEN**(Layer 4.15b):`Method.invoke` 经真字节码路径 + native `invoke0`(JVM_InvokeMethod)。
 ///
-/// **`#[ignore]`**:阻塞于 java.base Module 的 descriptor 字段未填充
-/// (`Module.implIsExportedOrOpen` 访问 `descriptor.packages()` → NPE,Module.java:705)。
-/// `Method.invoke` 的 `checkAccess` 对**任意** public 法都经此路径(无 fast-path 绕开)。
-/// 解锁 = Layer 4.14c(Module descriptor 填充)。native invoke0/newInstance0 已由 lib 闸门钉绿。
-#[ignore = "阻塞于 Module.descriptor 填充(Layer 4.14c);invoke0 native 已 lib 钉绿"]
+/// Layer 4.14c(`populate_module_exports` 填 java.base `Module.exportedPackages`)解锁了
+/// `Method.invoke` 的 `checkAccess` → `Module.isExported` 访问检查,使本端到端闸门转绿。
 #[test]
 fn method_invoke_end_to_end() {
     if !javac_available() {

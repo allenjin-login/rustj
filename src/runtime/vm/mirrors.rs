@@ -82,8 +82,9 @@ impl Vm {
 
     /// 按**字段名**在指定声明类的扁平实例字段中查序号并写槽。类未加载或无此字段 → 静默跳过
     /// (供 Class 镜像字段 + Module 镜像 `name` 字段 + Thread 镜像字段等 VM 管理实例共用)。
-    /// `pub(super)`:跨子模块——[`super::threads`] 的 `alloc_main_thread` 置 Thread 字段用之。
-    pub(super) fn set_instance_field_by_name(
+    /// `pub(crate)`:跨子模块——[`super::threads`] 的 `alloc_main_thread` 置 Thread 字段、
+    /// [`crate::runtime::interpreter::launch`] 的 `populate_module_exports` 置 Module 字段均用之。
+    pub(crate) fn set_instance_field_by_name(
         &mut self,
         obj: Reference,
         declaring_class: &str,
@@ -145,8 +146,7 @@ impl Vm {
     /// 命名 Module 镜像(intern:同名恒同引用)。分配真 `java/lang/Module` Instance,置 `name`
     /// 字段 = intern(模块名)。对应 HotSpot 每个 `Module` 单例(JVM 侧 `java_lang_Module`)。
     /// `Module.getName()` 真字节码读 `name` 字段即得模块名;`isNamed()` = `name != null`。
-    fn intern_named_module(&mut self, name: &str) -> Reference {
-        // 缓存命中:单次锁取 owned Reference,释 guard 再返(B.2.3b)。
+    fn intern_named_module(&mut self, name: &str) -> Reference {        // 缓存命中:单次锁取 owned Reference,释 guard 再返(B.2.3b)。
         if let Some(r) = self.shared.module_mirrors.lock().unwrap().get(name).copied() {
             return r;
         }
@@ -179,6 +179,13 @@ impl Vm {
             *self.shared.unnamed_module.lock().unwrap() = Some(r);
         }
         r
+    }
+
+    /// 命名模块镜像(pub(crate) 入口;语义同 [`intern_named_module`])。供 launch bootstrap
+    /// `populate_module_exports` 按**模块名**取 java.base 等模块镜像,填 `descriptor`/
+    /// `exportedPackages` 实例字段(Layer 4.14c,解锁端到端反射访问检查)。
+    pub(crate) fn named_module_mirror(&mut self, name: &str) -> Reference {
+        self.intern_named_module(name)
     }
 
     /// 类内部名 → 所属模块的 Module 镜像(供 Class.module 字段填充):

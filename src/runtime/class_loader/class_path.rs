@@ -13,6 +13,8 @@
 use crate::classfile::{self, ClassFileError};
 use crate::metadata::{ClassFile, ModuleDescriptor};
 
+use std::collections::HashMap;
+
 use super::zip::{ZipError, ZipReader};
 
 /// 类路径错误:容器(zip)损坏 或 `.class` 解析失败。
@@ -50,12 +52,20 @@ struct Container {
 /// 类路径:容器列表。`load_class` 按内部名逐容器查条目并解析为 [`ClassFile`]。
 pub struct ClassPath {
     containers: Vec<Container>,
+    /// 模块名 → 完整 Rust [`ModuleDescriptor`](`module-info.class` 经 [`ModuleDescriptor::from_class_file`]
+    /// 解析得)。`add()` 解析后登记;供 `load_closure` 经 [`Self::module_descriptor`] 回带进注册表,
+    /// 使 Layer 4.14c bootstrap `populate_module_exports` 能填 java `Module.descriptor`/`exportedPackages`
+    /// (访问检查读实例字段 `exportedPackages`,非 `descriptor.exports()`;详见 spec)。
+    modules: HashMap<String, ModuleDescriptor>,
 }
 
 impl ClassPath {
     /// 空类路径。
     pub fn new() -> Self {
-        Self { containers: Vec::new() }
+        Self {
+            containers: Vec::new(),
+            modules: HashMap::new(),
+        }
     }
 
     /// 追加一个容器(原始 zip 字节;显示名仅诊断用)。内部解析中心目录一次,持有副本。
@@ -64,7 +74,8 @@ impl ClassPath {
     /// 解析其 `Module` 属性得模块名,存于容器(供 [`Self::load_class`] 回带源模块)。
     pub fn add(&mut self, name: impl Into<String>, bytes: &[u8]) -> Result<(), ClassPathError> {
         let zip = ZipReader::new(bytes)?;
-        // 尝试两种布局取 module-info.class;解析其 Module 属性(4.11 ModuleDescriptor)。
+        // 尝试两种布局取 module-info.class;解析其完整 Module 属性(4.11 ModuleDescriptor)。
+        // 保留完整描述符(不只 name):登记 name→desc 供 4.14c bootstrap 填 Module.exportedPackages。
         let module_name = (|| -> Result<Option<String>, ClassPathError> {
             let raw = zip
                 .read("classes/module-info.class")
@@ -75,8 +86,12 @@ impl ClassPath {
                 return Ok(None);
             };
             let cf = classfile::parse(&raw)?;
-            Ok(ModuleDescriptor::from_class_file(&cf)?
-                .map(|d| d.name().to_string()))
+            let Some(desc) = ModuleDescriptor::from_class_file(&cf)? else {
+                return Ok(None);
+            };
+            let mod_name = desc.name().to_string();
+            self.modules.insert(mod_name.clone(), desc);
+            Ok(Some(mod_name))
         })()?;
         self.containers.push(Container {
             name: name.into(),
@@ -94,6 +109,13 @@ impl ClassPath {
     /// 是否无容器。
     pub fn is_empty(&self) -> bool {
         self.containers.is_empty()
+    }
+
+    /// 模块名 → 完整 Rust [`ModuleDescriptor`](`add()` 解析自 `module-info.class`)。
+    /// 供 `load_closure` 把源容器模块的完整描述符回带进注册表(Layer 4.14c:解锁 Module
+    /// 反射访问检查;bootstrap 据其 exports 填 `Module.exportedPackages`)。无名模块 → `None`。
+    pub fn module_descriptor(&self, module_name: &str) -> Option<ModuleDescriptor> {
+        self.modules.get(module_name).cloned()
     }
 
     /// 按内部名加载类:逐容器查 `name.class`(jar 布局)与 `classes/name.class`(jmod 布局)。

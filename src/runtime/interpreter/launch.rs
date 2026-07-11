@@ -316,13 +316,222 @@ pub fn bootstrap_module_system(vm: &mut Vm) -> Result<(), VmError> {
         .ok_or(VmError::BadConstant("Phase 2:System.bootLayer 静态字段未找到"))?;
     sys_lc.static_storage.lock().unwrap()[boot_layer_ord] = Slot::Reference(layer_ref);
 
-    // 3) invokestatic VM.initLevel(I)V —— 置 2(MODULE_SYSTEM_INITED)。Phase 1 已置 1,
+    // 3) 模块导出填充(Layer 4.14c,对应 `ModuleBootstrap.boot` 内 `Module.initExports`:把各命名
+    //    模块的 exports 填入 java `Module.exportedPackages` 实例 Map)。须在 initLevel(2) 前——
+    //    真实 `System.initPhase2` 顺序即 `bootLayer = ModuleBootstrap.boot()` → `VM.initLevel(2)`
+    //    (System.java:1932→1941)。无已登记模块 / Module 未加载 → 内部静默跳过(保旧测试兼容)。
+    populate_module_exports(vm)?;
+
+    // 4) invokestatic VM.initLevel(I)V —— 置 2(MODULE_SYSTEM_INITED)。Phase 1 已置 1,
     //    单调上行校验(1 < 2 ≤ SYSTEM_SHUTDOWN)通过。
     invoke_static_void(vm, "jdk/internal/misc/VM", "initLevel", |frame| {
         frame.locals.set_int(0, 2)
     })?;
 
     Ok(())
+}
+
+/// 填充每个命名模块 java 镜像的 `descriptor` + `exportedPackages`(Layer 4.14c,解锁端到端反射)。
+///
+/// `Method.invoke` 的 `checkAccess` → `Reflection.verifyPublicMemberAccess` →
+/// `Module.isExported(pkg)`(1-arg,Module.java:697)→ `implIsExportedOrOpen`(741)对 java.base
+/// (命名模块)读 `descriptor.isOpen()`(须 false,故 descriptor 须非 null)+ `isExplicitlyExportedOrOpened`
+/// (812)读**实例字段** `this.exportedPackages`(`Map<String,Set<Module>>`,**非** `descriptor.exports()`)。
+/// descriptor=null → NPE(修前阻塞);exportedPackages=null → 判非导出。本函数把两者填为真 java 对象:
+///
+/// 1. `ensure_class_initialized(Module)` → 跑 `<clinit>`(Module.java:423 else 分支:`new Module(null)` +
+///    `Set.of(...)` + `ArchivedData.archive()`,纯字节码 + CDS native 已 stub)→ 建 `EVERYONE_MODULE`/
+///    `EVERYONE_SET`(`Set.of(EVERYONE_MODULE)`)。
+/// 2. 读 `Module.EVERYONE_SET` 静态字段。
+/// 3. 逐已登记命名模块:构造 java `HashMap` exportedPackages,把每个**非限定** export(Rust 描述符
+///    `to_modules` 空)的包名(内部形 `java/lang` → 点分 `java.lang`)→ `EVERYONE_SET`,经 `HashMap.put`
+///    真字节码写入(对应 `initExports`,Module.java:1473);构造 java `ModuleDescriptor` Instance 置 `name`
+///    (open/automatic 默认 false 即够——访问检查仅读这两布尔);置 Module 实例 `descriptor`+`exportedPackages`。
+///
+/// 无注册表 / 无已登记模块 / Module 未加载 → 静默跳过(保旧测试兼容)。
+fn populate_module_exports(vm: &mut Vm) -> Result<(), VmError> {
+    use crate::metadata::descriptor::FieldType;
+    use crate::runtime::Slot;
+
+    // 已登记命名模块 owned 快照(模块名 → Rust 描述符);空 → 跳过(旧测试无模块加载)。
+    let modules: Vec<(String, crate::metadata::ModuleDescriptor)> = vm
+        .registry()
+        .map(|r| r.module_descriptors())
+        .unwrap_or_default();
+    if modules.is_empty() {
+        return Ok(());
+    }
+    // Module 类未加载 → 无从填(防御;跳过不报错)。
+    let has_module = vm
+        .registry()
+        .is_some_and(|r| r.get("java/lang/Module").is_some());
+    if !has_module {
+        return Ok(());
+    }
+
+    // 1) 跑 Module.<clinit> → EVERYONE_MODULE/EVERYONE_SET 建好(CDS native 已 stub;纯字节码)。
+    crate::runtime::interpreter::clinit::ensure_class_initialized(vm, "java/lang/Module")?;
+
+    // 2) 读 Module.EVERYONE_SET 静态字段(声明 `Set<Module>` → erasure `Ljava/util/Set;`)。
+    let everyone_set = {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("populate_module_exports:须注册表"))?;
+        let ft = FieldType::Class("java/util/Set".to_string());
+        let (mod_lc, ord) = reg
+            .resolve_static_field("java/lang/Module", "EVERYONE_SET", &ft)
+            .ok_or(VmError::BadConstant("Module.EVERYONE_SET 静态字段未找到"))?;
+        match mod_lc.static_storage.lock().unwrap()[ord] {
+            Slot::Reference(r) => r,
+            _ => return Ok(()), // 不应发生(<clinit> 刚置过);防御跳过。
+        }
+    };
+    if everyone_set.is_null() {
+        return Ok(()); // Set.of 失败 → 不强填,避免下游 NPE。
+    }
+
+    // 3) 逐模块填 descriptor + exportedPackages。
+    for (module_name, desc) in modules {
+        populate_one_module(vm, &module_name, &desc, everyone_set)?;
+    }
+    Ok(())
+}
+
+/// 填单个命名模块的 `descriptor` + `exportedPackages`(`populate_module_exports` 的逐模块步)。
+/// 模块镜像缺失 / 字段未见 → 静默跳过(保旧测试兼容)。
+fn populate_one_module(
+    vm: &mut Vm,
+    module_name: &str,
+    desc: &crate::metadata::ModuleDescriptor,
+    everyone_set: Reference,
+) -> Result<(), VmError> {
+    use crate::runtime::Slot;
+
+    let module_ref = vm.named_module_mirror(module_name);
+    if module_ref.is_null() {
+        return Ok(()); // Module 类未加载 → 跳过。
+    }
+
+    // exportedPackages HashMap = {点分包名 → everyone_set}(每个非限定 export 一项)。
+    let exported_packages = build_exported_packages(vm, desc, everyone_set)?;
+    // java ModuleDescriptor Instance,置 name(open/automatic 默认 false 即够)。
+    let descriptor_ref = alloc_module_descriptor(vm, module_name)?;
+
+    // 置 Module 实例字段 descriptor + exportedPackages(按名查序号;字段未见 → 静默跳过)。
+    if !descriptor_ref.is_null() {
+        vm.set_instance_field_by_name(
+            module_ref,
+            "java/lang/Module",
+            "descriptor",
+            Slot::Reference(descriptor_ref),
+        );
+    }
+    if !exported_packages.is_null() {
+        vm.set_instance_field_by_name(
+            module_ref,
+            "java/lang/Module",
+            "exportedPackages",
+            Slot::Reference(exported_packages),
+        );
+    }
+    Ok(())
+}
+
+/// 构造 java `HashMap` exportedPackages = {点分包名 → `everyone_set`}(每个非限定 export 一项;
+/// 限定 export 顺延)。经 `HashMap.put` 真字节码写入(对应 `initExports`,Module.java:1473)。
+/// HashMap 未加载 → 返 null(调用方跳过填 exportedPackages)。
+fn build_exported_packages(
+    vm: &mut Vm,
+    desc: &crate::metadata::ModuleDescriptor,
+    everyone_set: Reference,
+) -> Result<Reference, VmError> {
+    // 分配空 HashMap Instance(table=null 默认;首次 put 触发 resize 分配 table,单线程后盾)。
+    let map_ref = {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("build_exported_packages:须注册表"))?;
+        let Some(hm_lc) = reg.get("java/util/HashMap") else {
+            return Ok(Reference::null());
+        };
+        vm.heap_mut()
+            .alloc(Oop::Instance(reg.new_instance(hm_lc)))
+    };
+
+    for exp in desc.exports() {
+        // 限定导出(to_modules 非空)顺延;仅填非限定(EVERYONE_SET)。
+        if !exp.to_modules.is_empty() {
+            continue;
+        }
+        // 内部形 "java/lang" → 点分 "java.lang"(Java 侧 isExported 的 pn 形参为点分包名)。
+        let dotted = exp.package.replace('/', ".");
+        let key_ref = crate::runtime::interpreter::string::intern(vm, &dotted)?;
+        hash_map_put(vm, map_ref, key_ref, everyone_set)?;
+    }
+    Ok(map_ref)
+}
+
+/// 经解释器跑 `HashMap.put(Object,Object)Object` 写一项(委派 HashMap.put 真字节码)。
+/// &'a 引用(reg/lc/CP)不绑 &self(§6)→ 出块后 interpret_with(&mut vm) 可独占。
+fn hash_map_put(
+    vm: &mut Vm,
+    map_ref: Reference,
+    key_ref: Reference,
+    val_ref: Reference,
+) -> Result<(), VmError> {
+    let reg = vm
+        .registry()
+        .ok_or(VmError::BadConstant("hash_map_put:须注册表"))?;
+    let lc = reg
+        .get("java/util/HashMap")
+        .ok_or(VmError::BadConstant("hash_map_put:HashMap 须预载"))?;
+    let m = find_method_by_sig(
+        lc,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    )
+    .ok_or(VmError::BadConstant(
+        "HashMap.put(Object,Object)Object 未找到",
+    ))?;
+    let code = m
+        .code
+        .as_ref()
+        .ok_or(VmError::BadConstant("HashMap.put 须为真字节码"))?;
+    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table);
+    let mut frame = Frame::new(code.max_locals, code.max_stack);
+    frame.locals.set_reference(0, map_ref)?;
+    frame.locals.set_reference(1, key_ref)?;
+    frame.locals.set_reference(2, val_ref)?;
+    interp.interpret_with(&mut frame, vm)?;
+    Ok(())
+}
+
+/// 分配 java `java/lang/module/ModuleDescriptor` Instance,置 `name` = intern(模块名)。
+/// open/automatic 默认 false(访问检查仅读这两布尔,不读 exports()/packages(),故最小填充即够)。
+/// ModuleDescriptor 未加载 → 返 null(调用方跳过填 descriptor)。
+fn alloc_module_descriptor(vm: &mut Vm, module_name: &str) -> Result<Reference, VmError> {
+    use crate::runtime::Slot;
+    let desc_ref = {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("alloc_module_descriptor:须注册表"))?;
+        let Some(md_lc) = reg.get("java/lang/module/ModuleDescriptor") else {
+            return Ok(Reference::null());
+        };
+        vm.heap_mut()
+            .alloc(Oop::Instance(reg.new_instance(md_lc)))
+    };
+    if desc_ref.is_null() {
+        return Ok(desc_ref);
+    }
+    let name_ref = crate::runtime::interpreter::string::intern(vm, module_name)?;
+    vm.set_instance_field_by_name(
+        desc_ref,
+        "java/lang/module/ModuleDescriptor",
+        "name",
+        Slot::Reference(name_ref),
+    );
+    Ok(desc_ref)
 }
 
 /// 在 `vm` 上解释执行一个**单参静态方法**(用 `setup` 把唯一形参写入 `frame.locals[0]`)。
@@ -369,4 +578,113 @@ fn find_static_method<'a>(lc: &'a LoadedClass, name: &str) -> Option<&'a MethodI
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oops::ClassRegistry;
+    use crate::runtime::class_loader::class_path::ClassPath;
+    use crate::runtime::class_loader::loader::load_closure;
+    use crate::runtime::{Frame, Value};
+    use std::path::{Path, PathBuf};
+
+    /// 本机首个 `java.base.jmod`;无则 `None`(闸门跳过)。
+    fn find_javabase_jmod() -> Option<PathBuf> {
+        for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
+            let p = Path::new("C:/Program Files/Java")
+                .join(ver)
+                .join("jmods/java.base.jmod");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        std::env::var("JAVA_HOME")
+            .ok()
+            .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
+            .filter(|p| p.exists())
+    }
+
+    /// 经解释器在 `module_ref` 上跑 `Module.isExported(String)Z`(Module.java:697,1-arg →
+    /// `implIsExportedOrOpen(pn, EVERYONE_MODULE, false)`)。返 owned `Value`(Z 作 Int)。
+    fn invoke_is_exported(
+        vm: &mut Vm,
+        module_ref: Reference,
+        pn_ref: Reference,
+    ) -> Result<Value, VmError> {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("isExported:须注册表"))?;
+        let lc = reg
+            .get("java/lang/Module")
+            .ok_or(VmError::BadConstant("Module 须预载"))?;
+        let m = find_method_by_sig(lc, "isExported", "(Ljava/lang/String;)Z")
+            .ok_or(VmError::BadConstant("Module.isExported(String)Z 未找到"))?;
+        let code = m
+            .code
+            .as_ref()
+            .ok_or(VmError::BadConstant("isExported 须为真字节码"))?;
+        let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
+            .with_exception_table(&code.exception_table);
+        let mut frame = Frame::new(code.max_locals, code.max_stack);
+        frame.locals.set_reference(0, module_ref)?;
+        frame.locals.set_reference(1, pn_ref)?;
+        interp.interpret_with(&mut frame, vm)
+    }
+
+    /// **RED→GREEN**(Layer 4.14c):`populate_module_exports`(由 `bootstrap_module_system` 末尾调)
+    /// 填充 java.base Module 的 `descriptor` + `exportedPackages` → `Module.isExported("java.lang")`
+    /// 经真字节码 `implIsExportedOrOpen` 命中 `exportedPackages.get("java.lang")=EVERYONE_SET` → 返 true。
+    ///
+    /// 修前(无 populate):descriptor=null → `implIsExportedOrOpen` 读 `descriptor.isOpen()` 抛 NPE
+    /// → 测试以 ThrownException 失败(RED)。修后:返 Int(1)(GREEN)。同时钉非导出包 → false。
+    #[test]
+    fn module_is_exported_after_populate() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        // Module(isExported 宿主)+ Integer(java.base 成员,触发 module_descriptors 登记)
+        // + HashMap(exportedPackages 构造)+ ModuleDescriptor(Module.descriptor 实例)
+        // + Object(java.base 成员)闭包预载。
+        for c in [
+            "java/lang/Module",
+            "java/lang/Integer",
+            "java/util/HashMap",
+            "java/lang/module/ModuleDescriptor",
+            "java/lang/Object",
+        ] {
+            load_closure(&mut registry, &cp, c).unwrap();
+        }
+
+        let mut vm = Vm::new(registry);
+        initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
+        // bootstrap_module_system 末尾须调 populate_module_exports(本层实现)。
+        bootstrap_module_system(&mut vm).expect("Phase 2 引导(含 populate)应成功");
+
+        // java.base 模块镜像(Integer 属 java.base → named_module_mirror("java.base"))。
+        let module_ref = vm.named_module_mirror("java.base");
+        assert!(!module_ref.is_null(), "java.base Module 镜像须非 null");
+
+        // isExported("java.lang") → true(1)。
+        let pn_ref = crate::runtime::interpreter::string::intern(&mut vm, "java.lang").unwrap();
+        let r = invoke_is_exported(&mut vm, module_ref, pn_ref)
+            .expect("isExported 须返 Z,非抛异常(RED 期此处抛 NPE)");
+        assert!(
+            matches!(r, Value::Int(1)),
+            "java.lang 须导出,isExported 须 true(1),得 {r:?}"
+        );
+
+        // 非导出包 → false(0)。
+        let bad_ref = crate::runtime::interpreter::string::intern(&mut vm, "no.such.pkg").unwrap();
+        let r2 = invoke_is_exported(&mut vm, module_ref, bad_ref).expect("isExported 须返 Z");
+        assert!(
+            matches!(r2, Value::Int(0)),
+            "no.such.pkg 须非导出 → false(0),得 {r2:?}"
+        );
+    }
 }

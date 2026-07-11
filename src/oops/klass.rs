@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use crate::classfile::ClassFileError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_field_descriptor, FieldType};
-use crate::metadata::{ClassFile, FieldInfo, MethodInfo};
+use crate::metadata::{ClassFile, FieldInfo, MethodInfo, ModuleDescriptor};
 use crate::runtime::Slot;
 
 use super::instance::InstanceOop;
@@ -156,6 +156,10 @@ pub struct ClassRegistry {
     /// (CLAUDE.md §6 类级可变状态惯例,同 `static_storage`);`Mutex`(替 `RefCell`)使其 `Sync`
     /// (Phase B.2.1)。锁粒度单语句(`set_class_module`/`class_module` 即锁即释),无重入死锁。
     class_modules: Mutex<HashMap<String, String>>,
+    /// 模块名 → 完整 Rust [`ModuleDescriptor`](`load_closure` 据源容器 `module-info` 回带)。
+    /// 供 Layer 4.14c bootstrap `populate_module_exports` 遍历,读各模块 exports 填 java
+    /// `Module.exportedPackages`(反射访问检查读此实例字段)。`Mutex` 同上(§6;`Sync`)。
+    module_descriptors: Mutex<HashMap<String, ModuleDescriptor>>,
 }
 
 impl ClassRegistry {
@@ -163,6 +167,7 @@ impl ClassRegistry {
         let mut reg = Self {
             classes: HashMap::new(),
             class_modules: Mutex::new(HashMap::new()),
+            module_descriptors: Mutex::new(HashMap::new()),
         };
         // 预装标准 java.lang.* 异常层次(合成桩),使 catch(Throwable/Exception/NPE …)
         // 与运行时异常抛出无需额外加载即可解析。Vm 以不可变借用持注册表,故须在构造期装好。
@@ -224,6 +229,37 @@ impl ClassRegistry {
     /// 类所属命名模块名(`None` = 未标记 → 无名模块)。供 `Vm::module_for_class` 查模块镜像。
     pub fn class_module(&self, class_name: &str) -> Option<String> {
         self.class_modules.lock().unwrap().get(class_name).cloned()
+    }
+
+    /// 登记一个命名模块的完整 Rust [`ModuleDescriptor`](由 `load_closure` 据源容器 `module-info`
+    /// 回带)。供 Layer 4.14c bootstrap `populate_module_exports` 读 java.base 等模块的 exports,
+    /// 填 java `Module.exportedPackages`(反射访问检查读此实例字段)。`Mutex` 内部可变(§6);
+    /// 锁粒度单语句(即锁即释),无重入死锁。
+    pub fn set_module_descriptor(&self, module_name: &str, desc: ModuleDescriptor) {
+        self.module_descriptors
+            .lock()
+            .unwrap()
+            .insert(module_name.to_string(), desc);
+    }
+
+    /// 命名模块的完整 Rust [`ModuleDescriptor`](`None` = 未登记/无名模块)。
+    pub fn module_descriptor(&self, module_name: &str) -> Option<ModuleDescriptor> {
+        self.module_descriptors
+            .lock()
+            .unwrap()
+            .get(module_name)
+            .cloned()
+    }
+
+    /// 所有已登记命名模块的 (模块名, 描述符) owned 快照(供 bootstrap `populate_module_exports`
+    /// 遍历)。克隆出表以释 `Mutex` guard,免遍历期重入死锁。
+    pub fn module_descriptors(&self) -> Vec<(String, ModuleDescriptor)> {
+        self.module_descriptors
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// 扁平化实例字段(超类链 ++ 本类),惰性缓存于 `flat_cache`。

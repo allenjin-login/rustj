@@ -75,8 +75,9 @@ fn build(vm: &mut Vm, text: &str) -> Result<Reference, VmError> {
 }
 
 /// 读回 `r` 所指 String 实例的文本;非 String 实例 / 悬空 / 损坏 → `None`。
-/// 供 `Class.getPrimitiveClass` 取原语名、`String.intern()` native 取文本键。
-pub(super) fn read_text(vm: &Vm, r: Reference) -> Result<Option<String>, VmError> {
+/// 供 `Class.getPrimitiveClass` 取原语名、`String.intern()` native 取文本键,以及
+/// `vm::threads`(读未捕获异常默认路径的线程名)。`pub(crate)`:vm 模块非 interpreter 后代。
+pub(crate) fn read_text(vm: &Vm, r: Reference) -> Result<Option<String>, VmError> {
     let value_ft = FieldType::Array(Box::new(FieldType::Byte));
     let coder_ft = FieldType::Byte;
 

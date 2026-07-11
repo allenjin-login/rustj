@@ -249,9 +249,15 @@ impl Vm {
             child.thread.thread_ref = Some(this);
             // eetop 已由父线程置位。跑 Thread.run()V(虚分派;override 优先)。异常丢弃(B.4 顺延)。
             let res = child.run_thread_body(this);
+            // B.4 收尾:未捕获异常分派(Java 语义)。`run()` 抛出 → VM 调
+            // `Thread.dispatchUncaughtException(e)`(Thread.java:2561 包私有字节码)→
+            // `getUncaughtExceptionHandler().uncaughtException(this, e)`。须在 terminate 前
+            //(getUncaughtExceptionHandler 检 isTerminated → 已终止返 null)。
+            if let Err(crate::runtime::VmError::ThrownException(throwable)) = res {
+                child.dispatch_uncaught_exception(this, throwable);
+            }
             // B.4b 终止:ensure_join——set TERMINATED + eetop=0 + notifyAll 唤醒 join() 等待者。
             child.terminate_thread(this);
-            let _ = res;
         });
         self.shared
             .threads
@@ -423,6 +429,94 @@ impl Vm {
             flag.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    /// 子线程未捕获异常分派(B.4 收尾;移植 HotSpot `JavaThread::invoke_uncaught_exception_handler`
+    /// → `Thread.dispatchUncaughtException(Throwable)`,Thread.java:2561)。`run()` 抛出后,VM 在
+    /// [`Self::terminate_thread`] 前调此。
+    ///
+    /// **自定义 handler**(`Thread.uncaughtExceptionHandler` 字段非 null)→ 走 Java 字节码
+    /// `dispatchUncaughtException`(`getUncaughtExceptionHandler().uncaughtException(this, e)`):
+    /// 虚分派 + `interpret_with`(帧 `locals[0]=this`/`locals[1]=throwable`)。
+    /// **默认路径**(字段 null;JVM `ThreadGroup.uncaughtException` 顶层分支)→ stderr 打印
+    /// `Exception in thread "<name>" <轨迹>`——**附线程名**(用户要求,方便 debug;JVM 本也如此)。
+    /// 自定义 handler 字节码分派失败 → 回退默认打印路径(防异常失控;JVM 亦不二次传播)。
+    fn dispatch_uncaught_exception(&mut self, this: Reference, throwable: Reference) {
+        let has_custom = self
+            .instance_reference_field(this, "java/lang/Thread", "uncaughtExceptionHandler")
+            .is_some_and(|h| !h.is_null());
+        if has_custom && self.invoke_dispatch_uncaught_bytecode(this, throwable).is_ok() {
+            return;
+        }
+        // 默认路径(无自定义 handler,或字节码分派失败回退):stderr + 线程名前缀。
+        eprintln!("{}", self.format_uncaught_default(this, throwable));
+    }
+
+    /// 默认未捕获异常的格式化文本(B.4 收尾):`Exception in thread "<name>" <轨迹>`——**附线程名**
+    ///(用户要求,方便 debug;JVM `ThreadGroup.uncaughtException` 顶层分支等价)。无自定义 handler 时
+    /// [`Self::dispatch_uncaught_exception`] 用此打印 stderr。抽离为独立法便于单测钉死格式。
+    /// 无 name 字段 → 回退 `"Thread-N"`;无轨迹元数据 → 退化为仅运行时类名(再回退 `java/lang/Throwable`)。
+    pub(crate) fn format_uncaught_default(&self, this: Reference, throwable: Reference) -> String {
+        let name_ref = self
+            .instance_reference_field(this, "java/lang/Thread", "name")
+            .filter(|r| !r.is_null());
+        let name = match name_ref {
+            Some(nr) => crate::runtime::interpreter::string::read_text(self, nr)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "Thread-N".to_string()),
+            None => "Thread-N".to_string(),
+        };
+        let trace = self.format_trace(throwable);
+        let body = if trace.is_empty() {
+            // 无轨迹元数据:退化为仅运行时类名(防御;正常 throw_exception 路径必有元数据)。
+            match self.shared.heap.lock().unwrap().get(throwable) {
+                Some(Oop::Instance(i)) => i.class_name().to_string(),
+                _ => "java/lang/Throwable".to_string(),
+            }
+        } else {
+            trace
+        };
+        format!("Exception in thread \"{name}\" {body}")
+    }
+
+    /// 走 Java 字节码 `Thread.dispatchUncaughtException(Throwable)`(B.4 收尾)。虚分派解析
+    /// `dispatchUncaughtException(Ljava/lang/Throwable;)V`(按 `this` 运行时类),建帧
+    /// `locals[0]=this`/`locals[1]=throwable`,经解释器跑真字节码。Err(类未加载 / 方法缺失 /
+    /// 运行时抛出)由 [`Self::dispatch_uncaught_exception`] 据以回退默认打印路径。
+    fn invoke_dispatch_uncaught_bytecode(
+        &mut self,
+        this: Reference,
+        throwable: Reference,
+    ) -> Result<(), crate::runtime::VmError> {
+        use crate::runtime::{Frame, Interpreter, Value, VmError};
+        let runtime_class = {
+            let heap = self.heap();
+            match heap.get(this) {
+                Some(Oop::Instance(i)) => i.class_name().to_string(),
+                _ => return Err(VmError::BadConstant("dispatchUncaught:this 须为 Instance")),
+            }
+        };
+        let reg = self
+            .registry()
+            .ok_or(VmError::BadConstant("dispatchUncaught 须类注册表"))?;
+        let Some((target_lc, target_method)) =
+            reg.resolve_dispatch(&runtime_class, "dispatchUncaughtException", "(Ljava/lang/Throwable;)V")
+        else {
+            return Err(VmError::BadConstant("未解析 dispatchUncaughtException"));
+        };
+        let Some(code) = target_method.code.as_ref() else {
+            return Err(VmError::BadConstant("dispatchUncaughtException 无 Code"));
+        };
+        let interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
+            .with_exception_table(&code.exception_table);
+        let mut frame = Frame::new(code.max_locals, code.max_stack);
+        frame.locals.set_reference(0, this)?;
+        frame.locals.set_reference(1, throwable)?;
+        match interp.interpret_with(&mut frame, self)? {
+            Value::Void => Ok(()),
+            _ => Err(VmError::BadConstant("dispatchUncaughtException 须 void")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,5 +540,19 @@ mod tests {
         // next_thread_tid 走同一计数器(递增取值):此后取值 == initial+1,计数器 → initial+2。
         assert_eq!(vm.next_thread_tid(), (initial + 1) as u64);
         assert_eq!(vm.read_next_thread_id(), initial + 2);
+    }
+
+    /// 默认未捕获异常文本**附线程名前缀**(B.4 收尾;用户要求"栈轨迹要附带线程信息")。
+    /// 空 Vm(无注册表)→ name 字段读返 None → 回退 `"Thread-N"`;throwable 无元数据 → 回退
+    /// `java/lang/Throwable`。钉死 `Exception in thread "<name>" <body>` 格式,防回归。
+    #[test]
+    fn uncaught_default_format_has_thread_prefix() {
+        let vm = Vm::default();
+        let s = vm.format_uncaught_default(Reference::null(), Reference::null());
+        assert!(
+            s.starts_with("Exception in thread \""),
+            "须附线程名前缀: {s}"
+        );
+        assert!(s.contains("Thread-N"), "无名线程回退 Thread-N: {s}");
     }
 }

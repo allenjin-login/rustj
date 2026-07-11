@@ -210,8 +210,13 @@ impl Vm {
     /// `Thread.start0` 真起线程(Phase B.3b;移植 `JVM_StartThread`,jvm.cpp)。`this` = Thread
     /// 实例。null → NPE。取 `Arc::clone(&self.shared)` → `std::thread::spawn` 子 OS 线程:子
     /// `Vm::from_shared` 派生(共享堆/注册表/管程;独立调用栈)→ 置 `thread_ref = this`(子线程
-    /// 身份)→ 置 `eetop` 非 0(标记 alive)→ 跑虚分派 `run()V` → 终止置 `eetop=0`。
+    /// 身份)→ 跑虚分派 `run()V` → 终止序列。
     /// `JoinHandle` 存 `ThreadManager.handles`(键=this);[`Vm::join_thread`] 阻塞 join。
+    ///
+    /// **B.4b 关键:eetop + threadStatus 须在父线程(start_thread)同步置位,spawn 之前**——
+    /// 对应 HotSpot `java_lang_Thread::set_thread`(JVM_StartThread 内,子线程 run 前)。否则
+    /// `start0` 返后 `isAlive()`(`eetop!=0`)可能读到旧值 0 → `join()` 不 wait 即返 → 子线程副作用
+    /// 丢失的竞态。父线程置位后,无论子线程何时调度,start0 返时 isAlive() 恒 true。
     ///
     /// spawn 闭包 move 捕获 `shared`(`Arc<VmShared>: 'static`,B.3.0)+ `this`(`Reference: Copy`)。
     /// 子线程 `run_thread_body` 的异常顺延(B.4:子线程未捕获异常处理 / `Thread.dispatchUncaughtException`)。
@@ -222,17 +227,19 @@ impl Vm {
                 "java/lang/NullPointerException",
             ));
         }
+        // 父线程同步置 alive 标志:eetop=1(`isAlive()`=eetop!=0)+ threadStatus=RUNNABLE。
+        // 必在 spawn 前——start0 返后 join() 的 isAlive() 须恒 true(无子线程调度竞态)。
+        self.set_eetop(this, 1);
+        self.set_thread_status(this, crate::runtime::vm::THREAD_STATUS_RUNNABLE);
         let shared = self.shared_arc();
         let handle = std::thread::spawn(move || {
             let mut child = Self::from_shared(shared);
             // 子线程身份 = 此 Thread 实例(`currentThread()` 返它;管程 owner 据此区分线程)。
             child.thread.thread_ref = Some(this);
-            // 标记 alive:eetop 非 0(VM 管理字段;Thread.java:265,`alive()` = eetop!=0)。
-            child.set_eetop(this, 1);
-            // 跑 Thread.run()V(虚分派;override 优先)。异常丢弃(B.4 顺延)。
+            // eetop 已由父线程置位。跑 Thread.run()V(虚分派;override 优先)。异常丢弃(B.4 顺延)。
             let res = child.run_thread_body(this);
-            // 终止:eetop=0(`isAlive()`=false)。B.3c 增 `notifyAll`(Thread.exit → join 唤醒)。
-            child.set_eetop(this, 0);
+            // B.4b 终止:ensure_join——set TERMINATED + eetop=0 + notifyAll 唤醒 join() 等待者。
+            child.terminate_thread(this);
             let _ = res;
         });
         self.shared
@@ -301,6 +308,41 @@ impl Vm {
     /// 真实 Thread(已加载)上写;桩(bootstrap)无此字段则静默跳过(同 [`Vm::alloc_main_thread`]。
     pub(crate) fn set_eetop(&mut self, this: Reference, val: i64) {
         self.set_instance_field_by_name(this, "java/lang/Thread", "eetop", Slot::Long(val));
+    }
+
+    /// 置 `Thread$FieldHolder.threadStatus` 字段(B.4b;JVMTI 状态位掩码 javaThreadStatus.hpp:33-60)。
+    /// `Thread.start()`/`Thread.join()` 经 `holder.threadStatus` 判活/判状态——此字段为它们的关键状态源。
+    /// 真实 Thread 无 holder(bootstrap 桩 / 未加载 FieldHolder)→ 静默跳过(保既有行为)。
+    fn set_thread_status(&mut self, this: Reference, status: i32) {
+        let Some(holder) = self.instance_reference_field(this, "java/lang/Thread", "holder") else {
+            return;
+        };
+        if holder.is_null() {
+            return;
+        }
+        self.set_instance_field_by_name(
+            holder,
+            "java/lang/Thread$FieldHolder",
+            "threadStatus",
+            Slot::Int(status),
+        );
+    }
+
+    /// 子线程终止序列(B.4b;移植 HotSpot `JavaThread::ensure_join`,javaThread.cpp:668-683):
+    /// `synchronized(threadObj)` [ObjectLocker] → `set_thread_status(TERMINATED)` →
+    /// `release_set_thread(nullptr)` [eetop=0] → `notify_all`。
+    ///
+    /// 顺序关键:status=TERMINATED + eetop=0 **在** notifyAll **之前**,使 joiner 的 `isAlive()`
+    ///(`eetop!=0`)重检返 false(否则 joiner 被唤醒后 isAlive() 仍 true → 死循环 wait)。
+    /// `synchronized` 块持管程,notifyAll 唤醒的 joiner 在本块退出后(释管程)才获锁继续——
+    /// 故 joiner 醒后重检 isAlive() 时,eetop 与 status 均已就位。
+    fn terminate_thread(&mut self, this: Reference) {
+        // 持 threadObj 管程(对应 ObjectLocker;确保 set_status/eetop 与 notifyAll 原子可见)。
+        let _ = self.monitor_enter(this);
+        self.set_thread_status(this, crate::runtime::vm::THREAD_STATUS_TERMINATED);
+        self.set_eetop(this, 0);
+        let _ = self.object_notify_all(this);
+        let _ = self.monitor_exit(this);
     }
 }
 

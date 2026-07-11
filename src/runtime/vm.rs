@@ -37,6 +37,14 @@ pub const DEFAULT_STACK_LIMIT: u32 = 512;
 /// 与数组偏移(≥ ARRAY_BYTE_BASE_OFFSET=16)的命名空间。
 pub(crate) const NEXT_THREAD_ID_OFFSET: i64 = i64::MIN + 7;
 
+/// `Thread$FieldHolder.threadStatus` 的 JVMTI 状态位(`javaThreadStatus.hpp:33-60`)。`holder.threadStatus`
+/// 原始 int 即此位掩码(NEW=0)。`Thread.start()`(Thread.java:1468)据此 `!= 0` 抛 `IllegalThreadStateException`;
+/// 子线程终止时 `ensure_join`(javaThread.cpp:674)复位为 TERMINATED。`VM.toThreadState` 按位解码。
+#[allow(dead_code)] // NEW=0 为初值默认,无需显式写入(仅文档 JVMTI NEW 状态)。
+pub(crate) const THREAD_STATUS_NEW: i32 = 0;
+pub(crate) const THREAD_STATUS_RUNNABLE: i32 = 0x0001 | 0x0004; // JVMTI_THREAD_STATE_ALIVE | _RUNNABLE
+pub(crate) const THREAD_STATUS_TERMINATED: i32 = 0x0002; // JVMTI_THREAD_STATE_TERMINATED
+
 /// 一个 Java 栈帧的身份切片(供栈轨迹):声明类内部名 + 方法名 + 抛出点 bci。
 ///
 /// `pc` = 当前指令起始字节码偏移(`run()` 分派前写入);抛出时即抛点 bci,

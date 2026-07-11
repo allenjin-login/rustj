@@ -104,6 +104,30 @@ impl Vm {
         }
     }
 
+    /// 按**字段名**读实例的引用字段(owned `Reference`)。类未加载 / 无此字段 / 非 Instance / 非引用 → `None`。
+    /// `pub(super)`:B.4b `set_thread_status` 读 `Thread.holder` 字段用。
+    pub(super) fn instance_reference_field(
+        &self,
+        obj: Reference,
+        declaring_class: &str,
+        field_name: &str,
+    ) -> Option<Reference> {
+        let reg = self.registry()?;
+        let lc = reg.get(declaring_class)?;
+        let ord = reg
+            .flattened_instance_fields(lc)
+            .iter()
+            .position(|f| f.name == field_name)?;
+        let heap = self.shared.heap.lock().unwrap();
+        match heap.get(obj)? {
+            Oop::Instance(i) => match i.field(ord) {
+                Slot::Reference(r) => Some(r),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// 分配一个默认初始化的 `java/lang/Module` Instance(须已闭包预载)。无注册表或 Module
     /// 未加载 → 返 null 兜底。**不跑 `<init>`**(named/unnamed 两构造器分别调 defineModule0/
     /// 仅置字段;rustj 直接置 `name` 字段,绕过 native 注册)。

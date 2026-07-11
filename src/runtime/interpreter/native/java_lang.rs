@@ -517,6 +517,15 @@ pub(super) fn dispatch(
             vm.start_thread(this_ref).map(|()| Value::Void)
         }
 
+        // Thread.ensureMaterializedForStackWalk(Object) —— Thread.java `private native`,由
+        // `runWith(ScopedValuebindings, Runnable)`(Thread.java:1538)调用。原意:为栈遍历物化
+        // 当前线程的 ScopedValue 绑定(rustj 不实现 ScopedValue 栈遍历)→ 空操作返回。
+        // 不绑则 `new Thread(r,name)` 的 Thread.run()→runWith→ensureMaterializedForStackWalk 抛 ULE。
+        // reachabilityFence(Object) 为空字节码(无需绑)。
+        ("java/lang/Thread", "ensureMaterializedForStackWalk", "(Ljava/lang/Object;)V") => {
+            Ok(Value::Void)
+        }
+
         // Thread.getNextThreadIdOffset()J —— Thread.java:2628 `private static native`。返回「下一
         // 线程 tid」计数器的地址(HotSpot 注释:"off-heap and shared with the VM")。rustj 无堆外内存,
         // 故返回**哨兵偏移** [`NEXT_THREAD_ID_OFFSET`](vm.rs);`Unsafe.getLongVolatile(null, 此值)` /

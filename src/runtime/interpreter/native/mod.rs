@@ -25,6 +25,7 @@ use super::{throw_exception, Value, VmError};
 
 mod java_io;
 mod java_lang;
+mod java_lang_invoke;
 mod jdk_internal;
 mod jdk_internal_loader;
 mod jdk_internal_reflect;
@@ -72,6 +73,11 @@ fn dispatch(
         return Ok(Value::Void);
     }
     match class {
+        // `java/lang/invoke/*`(MethodHandle/MemberName/MethodHandleNatives 子系统)优先于
+        // `java/lang/` 通配——独立子模块,职责隔离(java_lang.rs 已 1700+ 行,§6)。
+        c if c.starts_with("java/lang/invoke/") => {
+            java_lang_invoke::dispatch(vm, c, name, desc, this, args)
+        }
         c if c.starts_with("java/lang/") => java_lang::dispatch(vm, c, name, desc, this, args),
         c if c.starts_with("java/io/") => java_io::dispatch(vm, c, name, desc, this, args),
         c if c.starts_with("sun/nio/fs/") => sun_nio_fs::dispatch(vm, c, name, desc, this, args),

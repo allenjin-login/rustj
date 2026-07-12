@@ -4,7 +4,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::oops::Oop;
+use crate::oops::{ArrayOop, Oop};
 use crate::runtime::{Reference, Slot, Value, Vm, VmError};
 
 use super::super::{capture_backtrace, throw_exception};
@@ -125,6 +125,24 @@ pub(super) fn dispatch(
             Ok(Value::Reference(vm.intern_class_mirror(&name)))
         }
 
+        // Object.clone()Ljava/lang/Object; —— Object.java:protect native。jvm.cpp JVM_Clone
+        // (javaClasses.cpp `java_lang_Object` 浅拷贝):同运行时类的新对象,逐字段复制(实例)或
+        // 逐元素复制(数组)。`Cloneable` 检查(JVM_Clone 抛 CloneNotSupportedException)暂略——
+        // rustj 容忍非 Cloneable 类的 clone(仅 MemberName.clone 等内部用,均实现 Cloneable)。
+        // 解锁 MemberName.clone(DirectMethodHandle.makePreparedFieldLambdaForm 调之)。
+        ("java/lang/Object", "clone", "()Ljava/lang/Object;") => {
+            let Some(r) = this else {
+                return Err(throw_exception(vm, "java/lang/NullPointerException"));
+            };
+            // 单次 heap 锁取 owned Oop(克隆);guard 在本语句 `;` 处释放,故下文可 `&mut vm`。
+            let cloned = vm.heap().get(r).cloned();
+            let cloned = match cloned {
+                Some(o) => o,
+                None => return Err(throw_exception(vm, "java/lang/InternalError")),
+            };
+            Ok(Value::Reference(vm.heap_mut().alloc(cloned)))
+        }
+
         // System.arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V —— jvm.cpp:293-305
         // JVM_ArrayCopy → typeArrayKlass/objArrayKlass::copy_array。检查序(null→NPE、
         // 非数组/类型不符→ASE、负值/越界→AIOOBE)、引用 checkcast、重叠 memmove 见
@@ -142,6 +160,14 @@ pub(super) fn dispatch(
                     _ => return Err(VmError::BadConstant("arraycopy 实参缺失/类型不符")),
                 };
             super::super::arraycopy::system_arraycopy(vm, src, src_pos, dst, dst_pos, length)
+        }
+
+        // Array.newArray(Class componentType, int length)Object —— reflect/Array.java:483 private
+        // native(Array.newInstance:76 调)。按组件类型 + 长度造默认初始化数组。解锁
+        // `LambdaForm$BasicType.<clinit>`(Arrays.copyOf→Array.newInstance)→ DMH LF 准备。
+        // 对应 HotSpot reflect.cpp `JVM_NewArray` / arrayKlass 分派。
+        ("java/lang/reflect/Array", "newArray", "(Ljava/lang/Class;I)Ljava/lang/Object;") => {
+            array_new_array(vm, args)
         }
 
         // System.currentTimeMillis()J —— jvm.cpp JVM_CurrentTimeMillis:墙钟毫秒(自 Unix 纪元)。
@@ -260,6 +286,22 @@ pub(super) fn dispatch(
         // 字节码 `return desiredAssertionStatus0(this)` 调)。rustj 无断言支持 → 恒 false(断言禁用,
         // 即 `$assertionsDisabled = true`)。
         ("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z") => Ok(Value::Int(0)),
+
+        // Class 的"声明上下文"查询族 —— 三 private native,均返 null 表示"无外层"(顶级类)。
+        // 顶级/原语/数组类无 EnclosingMethod/declaring/simple-binary 信息;HotSpot 据类属性返 null。
+        // 解锁 `Class.getSimpleName`(MethodType.toString 调之,DMH.makePreparedFieldLambdaForm 串化
+        // MethodType 触发):getEnclosingMethod0=null→isLocalOrAnonymousClass=false;
+        // getDeclaringClass0=null→isTopLevelClass=true→getSimpleBinaryName 早返 null→getSimpleName0
+        // 走"顶级类取名剥包"分支。嵌套/匿名类场景顺延(返 null 对它们不准确,本闸门仅顶级类)。
+        ("java/lang/Class", "getEnclosingMethod0", "()[Ljava/lang/Object;") => {
+            Ok(Value::Reference(Reference::null()))
+        }
+        ("java/lang/Class", "getDeclaringClass0", "()Ljava/lang/Class;") => {
+            Ok(Value::Reference(Reference::null()))
+        }
+        ("java/lang/Class", "getSimpleBinaryName0", "()Ljava/lang/String;") => {
+            Ok(Value::Reference(Reference::null()))
+        }
 
         // Class.getConstantPool()Ljdk/internal/reflect/ConstantPool; —— Class.java 私有 native,供注解机制
         // (Executable.declaredAnnotations → AnnotationParser.parseAnnotations 取 CP 解析注解字节)。
@@ -599,6 +641,51 @@ pub(super) fn dispatch(
 
         // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
         _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
+    }
+}
+
+/// `Array.newArray(componentType, length)`:组件 Class 镜像 → 内部名 → 数组描述符 + 默认槽 → 造数组。
+/// 单次 mirror_internal_name 取 owned 名(返 String,无借用纠缠)后即 `&mut vm` 造数组。
+fn array_new_array(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+    let component_ref = match args.first().copied() {
+        Some(Value::Reference(r)) => r,
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    let length = match args.get(1).copied() {
+        Some(Value::Int(n)) => n,
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    if length < 0 {
+        return Err(throw_exception(vm, "java/lang/NegativeArraySizeException"));
+    }
+    let component = vm
+        .mirror_internal_name(component_ref)
+        .ok_or(VmError::BadConstant("Array.newArray:非法组件 Class 镜像"))?;
+    let (desc, default_slot) = array_element_layout(&component);
+    let elements = vec![default_slot; length as usize];
+    let r = vm.heap_mut().alloc(Oop::Array(ArrayOop::new(desc, elements)));
+    Ok(Value::Reference(r))
+}
+
+/// 组件内部名 → (数组描述符, 元素默认槽)。原语按 JVM 数组类型码;引用/数组组件元素默认 null。
+/// 同 `interpreter::array::array_descriptor` 的命名 + `parse_array_descriptor` 的默认槽,合并为
+/// `Array.newArray` 所需的组件→布局一步映射(原语组件 anewarray 不支持,故此处独立处理)。
+fn array_element_layout(component: &str) -> (String, Slot) {
+    if component.starts_with('[') {
+        // 数组组件 → `[[comp]`;元素为内层数组引用,默认 null。
+        return (format!("[{component}"), Slot::Reference(Reference::null()));
+    }
+    match component {
+        "int" => ("[I".into(), Slot::Int(0)),
+        "long" => ("[J".into(), Slot::Long(0)),
+        "boolean" => ("[Z".into(), Slot::Int(0)),
+        "byte" => ("[B".into(), Slot::Int(0)),
+        "char" => ("[C".into(), Slot::Int(0)),
+        "short" => ("[S".into(), Slot::Int(0)),
+        "float" => ("[F".into(), Slot::Float(0.0)),
+        "double" => ("[D".into(), Slot::Double(0.0)),
+        // 引用类 → `[Lname;`;元素为引用,默认 null(void 等异常组件由上层 JVM 抛 IAE,此处按引用兜底)。
+        _ => (format!("[L{component};"), Slot::Reference(Reference::null())),
     }
 }
 

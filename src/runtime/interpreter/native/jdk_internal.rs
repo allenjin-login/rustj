@@ -175,6 +175,14 @@ pub(super) fn dispatch(
             ensure_class_initialized_0(vm, args)
         }
 
+        // jdk.internal.misc.Unsafe.shouldBeInitialized0(Ljava/lang/Class;)Z —— Unsafe.java:3877
+        // `private native`(Unsafe.java:1172 字节码 `shouldBeInitialized` 委派本 native)。返 true =
+        // 类尚未初始化(调 ensureClassInitialized 会有效果)。取 Class 镜像名 → 查 `init_state`;
+        // 非 Done 即需初始化。解锁 DirectMethodHandle.shouldBeInitialized → DMH ensureInitialized 判定。
+        ("jdk/internal/misc/Unsafe", "shouldBeInitialized0", "(Ljava/lang/Class;)Z") => {
+            should_be_initialized_0(vm, args)
+        }
+
         // 注:addressSize()/pageSize()/isBigEndian()/unalignedAccess() 均为返回常量字段
         // (ADDRESS_SIZE / PAGE_SIZE / BIG_ENDIAN / UNALIGNED_ACCESS)的字节码方法;这些字段在
         // Unsafe.class 中已是字面量初始化(不经 native),故 <clinit> 无更多 native 依赖。
@@ -611,6 +619,23 @@ fn ensure_class_initialized_0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmEr
     };
     crate::runtime::interpreter::clinit::ensure_class_initialized(vm, &internal)?;
     Ok(Value::Void)
+}
+
+/// `Unsafe.shouldBeInitialized0(Class)Z` native 实现(Unsafe.java:3877 `private native`)。
+/// 返 `init_state != Done`(类尚未初始化则 true)。null/非镜像 → NPE;类未注册 → false
+/// (不可达:Class 镜像必对应已加载类,保守返 false 即"无需初始化")。
+fn should_be_initialized_0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+    let internal = match super::class_arg_name(vm, args) {
+        Some(n) => n,
+        None => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    let needs_init = match vm.registry() {
+        Some(reg) => reg
+            .get(&internal)
+            .is_some_and(|lc| lc.init_state() != crate::oops::InitState::Done),
+        None => false,
+    };
+    Ok(Value::Int(if needs_init { 1 } else { 0 }))
 }
 
 #[cfg(test)]

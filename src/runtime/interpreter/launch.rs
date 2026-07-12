@@ -331,6 +331,35 @@ pub fn bootstrap_module_system(vm: &mut Vm) -> Result<(), VmError> {
     Ok(())
 }
 
+/// **VM 运行时初始化 Phase 3 lite**(`java.lang.invoke` 引导,Phase B.5.1)。对应真 JVM
+/// `System.initPhase3` 的最小子集:确保 `java/lang/invoke/MethodHandleNatives` 与
+/// `java/lang/invoke/MethodHandleImpl` 已初始化。
+///
+/// - `MethodHandleNatives.<clinit>`(MethodHandleNatives.java:219-222)调 `VM.setJavaLangInvokeInited()`
+///   置 `javaLangInvokeInited=true`(VM.java:96 `@Stable boolean`)。**须由其 <clinit> 自然调**——
+///   `setJavaLangInvokeInited` 防"already inited"(VM.java:98-99),故 bootstrap **不**直写字段,
+///   否则后续 `MethodHandleNatives.<clinit>` 触发时抛 InternalError。
+/// - `MethodHandleImpl.<clinit>`(MethodHandleImpl.java:1538)装 `SharedSecrets.javaLangInvokeAccess`(JLIA)。
+///
+/// 解锁 `MethodHandleAccessorFactory.newFieldAccessor`(MethodHandleAccessorFactory.java:173)
+/// 的 `VM.isJavaLangInvokeInited()` 门(否则 InternalError)→ `Field.get/set` 的 DMH 链。
+///
+/// **前置**:Phase 1 + Phase 2 已跑;注册表已闭包预载 `java/lang/invoke/MethodHandleImpl`、
+/// `java/lang/invoke/MethodHandleNatives`、`jdk/internal/misc/VM`、`jdk/internal/access/SharedSecrets`。
+pub fn bootstrap_java_lang_invoke(vm: &mut Vm) -> Result<(), VmError> {
+    // 1) MethodHandleNatives.<clinit> → VM.setJavaLangInvokeInited() 置 flag=true。
+    crate::runtime::interpreter::clinit::ensure_class_initialized(
+        vm,
+        "java/lang/invoke/MethodHandleNatives",
+    )?;
+    // 2) MethodHandleImpl.<clinit> → 装 SharedSecrets.javaLangInvokeAccess(JLIA)。
+    crate::runtime::interpreter::clinit::ensure_class_initialized(
+        vm,
+        "java/lang/invoke/MethodHandleImpl",
+    )?;
+    Ok(())
+}
+
 /// 填充每个命名模块 java 镜像的 `descriptor` + `exportedPackages`(Layer 4.14c,解锁端到端反射)。
 ///
 /// `Method.invoke` 的 `checkAccess` → `Reflection.verifyPublicMemberAccess` →
@@ -685,6 +714,76 @@ mod tests {
         assert!(
             matches!(r2, Value::Int(0)),
             "no.such.pkg 须非导出 → false(0),得 {r2:?}"
+        );
+    }
+
+    /// **RED→GREEN**(Phase B.5.1):`bootstrap_java_lang_invoke` 翻转 `VM.javaLangInvokeInited`=true
+    /// 并确保 `MethodHandleImpl`<clinit> 跑(于 MethodHandleImpl.java:1538 装
+    /// `SharedSecrets.javaLangInvokeAccess`)。
+    ///
+    /// 修前:flag=false、JLIA=null → `MethodHandleAccessorFactory.newFieldAccessor:173` 抛
+    /// InternalError(Field.get/set 的硬门)。修后:flag=true、JLIA 非 null → 门通过,Field 反射
+    /// 可进 `unreflectField` → DMH 链。
+    #[test]
+    fn java_lang_invoke_bootstraps() {
+        use crate::metadata::descriptor::FieldType;
+        use crate::runtime::Slot;
+
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        // MethodHandleImpl(装 JLIA)+ MethodHandleNatives(registerNatives/resolve/offset 族)
+        // + VM(javaLangInvokeInited)+ SharedSecrets(JLIA 字段)闭包预载。
+        for c in [
+            "java/lang/invoke/MethodHandleImpl",
+            "java/lang/invoke/MethodHandleNatives",
+            "jdk/internal/misc/VM",
+            "jdk/internal/access/SharedSecrets",
+        ] {
+            load_closure(&mut registry, &cp, c).unwrap();
+        }
+
+        let mut vm = Vm::new(registry);
+        initialize_system_class(&mut vm).expect("Phase 1 应成功");
+        bootstrap_module_system(&mut vm).expect("Phase 2 应成功");
+        bootstrap_java_lang_invoke(&mut vm).expect("Phase 3 lite(java.lang.invoke)应成功");
+
+        // VM.javaLangInvokeInited == true(布尔静态字段存 Slot::Int(1))。
+        let inited = {
+            let reg = vm.registry().expect("须注册表");
+            let (lc, ord) = reg
+                .resolve_static_field(
+                    "jdk/internal/misc/VM",
+                    "javaLangInvokeInited",
+                    &FieldType::Boolean,
+                )
+                .expect("VM.javaLangInvokeInited 静态字段未找到");
+            matches!(lc.static_storage.lock().unwrap()[ord], Slot::Int(1))
+        };
+        assert!(inited, "VM.isJavaLangInvokeInited() 须为 true");
+
+        // SharedSecrets.javaLangInvokeAccess 非 null(MethodHandleImpl.<clinit> 装之)。
+        let jlia_nonnull = {
+            let reg = vm.registry().expect("须注册表");
+            let (lc, ord) = reg
+                .resolve_static_field(
+                    "jdk/internal/access/SharedSecrets",
+                    "javaLangInvokeAccess",
+                    &FieldType::Class(
+                        "jdk/internal/access/JavaLangInvokeAccess".to_string(),
+                    ),
+                )
+                .expect("SharedSecrets.javaLangInvokeAccess 静态字段未找到");
+            matches!(lc.static_storage.lock().unwrap()[ord], Slot::Reference(r) if !r.is_null())
+        };
+        assert!(
+            jlia_nonnull,
+            "SharedSecrets.javaLangInvokeAccess 须非 null(MethodHandleImpl <clinit> 须装 JLIA)"
         );
     }
 }

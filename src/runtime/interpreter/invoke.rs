@@ -22,7 +22,7 @@ use crate::oops::lambda::{
     REF_INVOKE_INTERFACE, REF_INVOKE_SPECIAL, REF_INVOKE_STATIC, REF_INVOKE_VIRTUAL,
     REF_NEW_INVOKE_SPECIAL,
 };
-use crate::oops::{LoadedClass, LambdaOop, Oop};
+use crate::oops::{LoadedClass, ArrayOop, LambdaOop, Oop};
 use crate::runtime::{Frame, LocalVars, Reference, Vm};
 
 use super::{clinit, exception, native, throw_exception, Interpreter, Value, VmError};
@@ -79,6 +79,36 @@ fn finish_invoke(
             None => Err(VmError::ThrownException(exc)),
         },
         Err(e) => Err(e),
+    }
+}
+
+/// 数组 receiver 的 Object 继承法虚分派(clone/getClass/hashCode/equals)。数组类型在 rustj 无
+/// 独立 LoadedClass,其 Object 继承法由 HotSpot 数组 Klass(typeArrayKlass/objArrayKlass)承载;
+/// 此处短路为等价语义(同 `java/lang/Object` 各 native)。解锁 `LambdaForm$BasicType[].getClass()`
+/// 等(DMH.makePreparedFieldLambdaForm LF 准备触发)。toString 等余法顺延。
+fn dispatch_array_object_method(
+    vm: &mut Vm,
+    objref: Reference,
+    arr: &ArrayOop,
+    method_name: &str,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    match method_name {
+        // clone() —— 浅拷贝(同描述符 + 复制元素槽),对应 Object.clone native。
+        "clone" => {
+            let r = vm.heap_mut().alloc(Oop::Array(arr.clone()));
+            Ok(Value::Reference(r))
+        }
+        // getClass() —— 数组类型的 Class 镜像(如 `[Ljava/lang/invoke/LambdaForm$BasicType;`)。
+        "getClass" => Ok(Value::Reference(vm.intern_class_mirror(arr.class_name()))),
+        // hashCode() —— 对象标识(句柄 id);Object.hashCode synchronizer mode 4。
+        "hashCode" => Ok(Value::Int(objref.id().unwrap_or(0) as i32)),
+        // equals(Object) —— 引用相等(Object.equals 默认语义;数组未覆盖)。
+        "equals" => {
+            let same = matches!(args.first().copied(), Some(Value::Reference(o)) if o == objref);
+            Ok(Value::Int(if same { 1 } else { 0 }))
+        }
+        _ => Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object 继承法)")),
     }
 }
 
@@ -865,21 +895,12 @@ pub(super) fn invoke_virtual(
     // 接收者取 owned(clone):其后 alloc/dispatch 需 &mut vm,持 heap guard 会 E0502(B.2.3b)。
     let recv = vm.heap().get(objref).cloned();
     let runtime_class = match recv {
-        // 数组 receiver:仅 `Object.clone()` 浅拷贝(同描述符 + 复制元素槽),解锁
-        // `Throwable.getOurStackTrace().clone()` 等;其余数组方法顺延。
-        Some(Oop::Array(a)) if method_name == "clone" => {
-            let r = vm.heap_mut().alloc(Oop::Array(a));
-            return finish_invoke(
-                interp,
-                frame,
-                vm,
-                caller_pc,
-                Ok(Value::Reference(r)),
-                md.return_type,
-            );
-        }
-        Some(Oop::Array(_)) => {
-            return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
+        // 数组 receiver:Object 继承法(clone/getClass/hashCode/equals)短路;解锁 LF 准备等
+        // 数组上的 Object 法分派。其余数组法顺延。
+        Some(Oop::Array(a)) => {
+            let argv: Vec<Value> = args.into_iter().map(Value::from).collect();
+            let result = dispatch_array_object_method(vm, objref, &a, &method_name, &argv);
+            return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
         }
         // Lambda 闭包 receiver:捕获 ++ SAM 实参交给实现方法(lambda$<caller>$0)静态执行。
         Some(Oop::Lambda(lambda)) => {
@@ -959,20 +980,11 @@ pub(super) fn invoke_interface(
     // 接收者取 owned(clone):其后 alloc/dispatch 需 &mut vm,持 heap guard 会 E0502(B.2.3b)。
     let recv = vm.heap().get(objref).cloned();
     let runtime_class = match recv {
-        // 数组 receiver:仅 `Object.clone()` 浅拷贝(同 invoke_virtual)。
-        Some(Oop::Array(a)) if method_name == "clone" => {
-            let r = vm.heap_mut().alloc(Oop::Array(a));
-            return finish_invoke(
-                interp,
-                frame,
-                vm,
-                caller_pc,
-                Ok(Value::Reference(r)),
-                md.return_type,
-            );
-        }
-        Some(Oop::Array(_)) => {
-            return Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object.clone)"));
+        // 数组 receiver:Object 继承法短路(同 invoke_virtual)。
+        Some(Oop::Array(a)) => {
+            let argv: Vec<Value> = args.into_iter().map(Value::from).collect();
+            let result = dispatch_array_object_method(vm, objref, &a, &method_name, &argv);
+            return finish_invoke(interp, frame, vm, caller_pc, result, md.return_type);
         }
         // Lambda 闭包 receiver:捕获 ++ SAM 实参交给实现方法静态执行。
         Some(Oop::Lambda(lambda)) => {

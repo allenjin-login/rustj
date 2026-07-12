@@ -106,8 +106,9 @@ impl Vm {
     }
 
     /// 按**字段名**读实例的引用字段(owned `Reference`)。类未加载 / 无此字段 / 非 Instance / 非引用 → `None`。
-    /// `pub(super)`:B.4b `set_thread_status` 读 `Thread.holder` 字段用。
-    pub(super) fn instance_reference_field(
+    /// `pub(crate)`:跨子模块——B.4b `set_thread_status` 读 `Thread.holder`、B.5.2 MH 调用钩子读
+    /// DMH.`member` / MemberName.`clazz`.`name` 均用之。
+    pub(crate) fn instance_reference_field(
         &self,
         obj: Reference,
         declaring_class: &str,
@@ -123,6 +124,30 @@ impl Vm {
         match heap.get(obj)? {
             Oop::Instance(i) => match i.field(ord) {
                 Slot::Reference(r) => Some(r),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// 按**字段名**读实例的 int 字段。类未加载 / 无此字段 / 非 Instance / 非 int → `None`。
+    /// `pub(crate)`:B.5.2 MH 调用钩子读 MemberName.`flags`(提取 refKind)用。
+    pub(crate) fn instance_int_field(
+        &self,
+        obj: Reference,
+        declaring_class: &str,
+        field_name: &str,
+    ) -> Option<i32> {
+        let reg = self.registry()?;
+        let lc = reg.get(declaring_class)?;
+        let ord = reg
+            .flattened_instance_fields(lc)
+            .iter()
+            .position(|f| f.name == field_name)?;
+        let heap = self.shared.heap.lock().unwrap();
+        match heap.get(obj)? {
+            Oop::Instance(i) => match i.field(ord) {
+                Slot::Int(v) => Some(v),
                 _ => None,
             },
             _ => None,

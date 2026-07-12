@@ -22,10 +22,17 @@ use crate::oops::lambda::{
     REF_INVOKE_INTERFACE, REF_INVOKE_SPECIAL, REF_INVOKE_STATIC, REF_INVOKE_VIRTUAL,
     REF_NEW_INVOKE_SPECIAL,
 };
-use crate::oops::{LoadedClass, ArrayOop, LambdaOop, Oop};
-use crate::runtime::{Frame, LocalVars, Reference, Vm};
+use crate::oops::{ClassRegistry, LoadedClass, ArrayOop, LambdaOop, Oop};
+use crate::runtime::{Frame, LocalVars, Reference, Slot, Vm};
 
-use super::{clinit, exception, native, throw_exception, Interpreter, Value, VmError};
+use super::{clinit, exception, native, string, throw_exception, Interpreter, Value, VmError};
+
+/// 字段引用类(`MethodHandleNatives.java:103-106`),编码于 MemberName.flags 的最高 4 位
+///(`flags >>> 24 & 0x0F`)。B.5.2 MH 调用钩子按之分派 getfield/putfield/getstatic/putstatic。
+const REF_GET_FIELD: u8 = 1;
+const REF_GET_STATIC: u8 = 2;
+const REF_PUT_FIELD: u8 = 3;
+const REF_PUT_STATIC: u8 = 4;
 
 /// invoke 后调用者分派循环的流向。
 pub(super) enum InvokeFlow {
@@ -110,6 +117,231 @@ fn dispatch_array_object_method(
         }
         _ => Err(VmError::BadConstant("invoke 目标为数组(仅支持 Object 继承法)")),
     }
+}
+
+/// `runtime_class` 是否为 `java/lang/invoke/DirectMethodHandle` 的(子)类(B.5.2 MH 调用钩子前置)。
+/// 沿超类链上行比对(owned 类名,避开 `&lc` 借 `reg` 的链式借用);无注册表/链顶 → false。
+fn is_direct_method_handle(vm: &Vm, runtime_class: &str) -> bool {
+    let Some(reg) = vm.registry() else {
+        return false;
+    };
+    let mut cur_name = Some(runtime_class.to_string());
+    while let Some(name) = cur_name {
+        match reg.get(&name) {
+            Some(lc) => {
+                if lc.name() == "java/lang/invoke/DirectMethodHandle" {
+                    return true;
+                }
+                cur_name = lc.super_class_name().map(|s| s.to_string());
+            }
+            None => break,
+        }
+    }
+    false
+}
+
+/// MethodHandle 签名多态调用钩子(B.5.2):receiver 为字段 DirectMethodHandle 时,直读其 `member`
+/// (MemberName)按 refKind 做 getfield/putfield/getstatic/putstatic。
+///
+/// 设计 §2 shortcut:rustj **不解释 LambdaForm**;`objectFieldOffset`/`staticFieldOffset`/
+/// `staticFieldBase` 均返 dummy(B.5.1),钩子只读 `member` 的 clazz/name/flags → 字段访问,语义等价。
+///
+/// 返 `Ok(Some(value))` = 已处理(调用方 `finish_invoke` 回填);`Ok(None)` = 非字段 DMH 或方法名非
+/// invoke 族 → 调用方走正常虚分派(方法 DMH 经 NativeAccessor.invoke0,4.15b,不经此)。
+fn try_method_handle_field_hook(
+    vm: &mut Vm,
+    method_name: &str,
+    runtime_class: &str,
+    mh_ref: Reference,
+    args: &[Arg],
+) -> Result<Option<Value>, VmError> {
+    if !matches!(method_name, "invoke" | "invokeExact" | "invokeBasic") {
+        return Ok(None);
+    }
+    if !is_direct_method_handle(vm, runtime_class) {
+        return Ok(None);
+    }
+    let v = dispatch_method_handle_field(vm, mh_ref, args)?;
+    Ok(Some(v))
+}
+
+/// 读 DMH.`member` → MemberName.{clazz,name,flags} → 按 refKind 做字段访问。
+/// MemberName 字段布局:clazz=声明类镜像 / name=字段名 String / flags=mods|MN_IS_FIELD|(refKind<<24)
+/// (B.5.1 init_from_field 置 clazz+flags;Java 侧构造器再置 name+type;makeSetter 经 changeReferenceKind
+/// 把 getter refKind 转 putter)。
+fn dispatch_method_handle_field(
+    vm: &mut Vm,
+    mh_ref: Reference,
+    args: &[Arg],
+) -> Result<Value, VmError> {
+    // member = DirectMethodHandle.member(DirectMethodHandle.java:55 final 字段)。
+    let member = vm
+        .instance_reference_field(mh_ref, "java/lang/invoke/DirectMethodHandle", "member")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("MH 钩子:DMH.member 缺失"))?;
+    // flags → refKind(MemberName.java:242 getReferenceKind:flags>>>24 & MN_REFERENCE_KIND_MASK=0x0F)。
+    let flags = vm
+        .instance_int_field(member, "java/lang/invoke/MemberName", "flags")
+        .ok_or(VmError::BadConstant("MH 钩子:MemberName.flags 缺失"))?;
+    let ref_kind = ((flags as u32) >> 24) as u8 & 0x0F;
+    // clazz → 声明类内部名(镜像经 mirror_class 反查)。
+    let clazz_mirror = vm
+        .instance_reference_field(member, "java/lang/invoke/MemberName", "clazz")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("MH 钩子:MemberName.clazz 缺失"))?;
+    let declaring = vm
+        .mirror_internal_name(clazz_mirror)
+        .ok_or(VmError::BadConstant("MH 钩子:clazz 非镜像"))?;
+    // name → 字段名(String 池解码)。
+    let name_ref = vm
+        .instance_reference_field(member, "java/lang/invoke/MemberName", "name")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("MH 钩子:MemberName.name 缺失"))?;
+    let field_name = string::read_text(vm, name_ref)?
+        .ok_or(VmError::BadConstant("MH 钩子:MemberName.name 非字符串"))?;
+
+    match ref_kind {
+        REF_GET_FIELD | REF_PUT_FIELD => access_instance_field(vm, &declaring, &field_name, ref_kind, args),
+        REF_GET_STATIC | REF_PUT_STATIC => access_static_field(vm, &declaring, &field_name, ref_kind, args),
+        _ => Err(VmError::BadConstant("MH 钩子仅支持字段 refKind(1-4)")),
+    }
+}
+
+/// 实例字段访问:getField 读 obj.field;putField 写 obj.field=value。obj 经 args[0],value 经 args[1]。
+/// 字段序号在**声明类**扁平布局中定位——其布局是运行时子类布局的前缀(超类链置前),故同一序号
+/// 对子类实例同样有效(同 getfield/putfield 语义)。
+fn access_instance_field(
+    vm: &mut Vm,
+    declaring: &str,
+    field_name: &str,
+    ref_kind: u8,
+    args: &[Arg],
+) -> Result<Value, VmError> {
+    let ord = {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("MH 钩子需类注册表"))?;
+        let lc = reg
+            .get(declaring)
+            .ok_or(VmError::BadConstant("MH 钩子:声明类未加载"))?;
+        reg.flattened_instance_fields(lc)
+            .iter()
+            .position(|f| f.name == field_name)
+            .ok_or(VmError::BadConstant("MH 钩子:实例字段未找到"))?
+    };
+    let obj = match args.first() {
+        Some(Arg::Reference(r)) => *r,
+        _ => return Err(VmError::BadConstant("MH 钩子:实例字段访问缺 obj 实参")),
+    };
+    if obj.is_null() {
+        return Err(throw_exception(vm, "java/lang/NullPointerException"));
+    }
+    match ref_kind {
+        REF_GET_FIELD => {
+            let slot = match vm.heap().get(obj) {
+                Some(Oop::Instance(i)) => i.field(ord),
+                _ => return Err(VmError::BadConstant("MH 钩子:obj 非 Instance")),
+            };
+            Ok(slot_to_value(slot))
+        }
+        REF_PUT_FIELD => {
+            let value = arg_to_slot(args.get(1))?;
+            match vm.heap_mut().get_mut(obj) {
+                Some(Oop::Instance(i)) => i.set_field(ord, value),
+                _ => return Err(VmError::BadConstant("MH 钩子:obj 非 Instance")),
+            }
+            Ok(Value::Void)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// 静态字段访问:getStatic 读 declaring.field;putStatic 写 =value。value 经 args[0]。
+/// 沿超类链按名定位(声明类即 member.clazz,保守沿链兼容继承静态字段);首次访问触发 `<clinit>`
+/// (同 getstatic/putstatic)。
+fn access_static_field(
+    vm: &mut Vm,
+    declaring: &str,
+    field_name: &str,
+    ref_kind: u8,
+    args: &[Arg],
+) -> Result<Value, VmError> {
+    clinit::ensure_class_initialized(vm, declaring)?;
+    let (lc_name, ord) = {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("MH 钩子需类注册表"))?;
+        resolve_static_field_by_name(&reg, declaring, field_name)
+            .ok_or(VmError::BadConstant("MH 钩子:静态字段未找到"))?
+    };
+    let reg = vm
+        .registry()
+        .ok_or(VmError::BadConstant("MH 钩子需类注册表"))?;
+    let lc = reg
+        .get(&lc_name)
+        .ok_or(VmError::BadConstant("MH 钩子:静态字段声明类未加载"))?;
+    match ref_kind {
+        REF_GET_STATIC => {
+            let slot = lc
+                .static_storage
+                .lock()
+                .unwrap()
+                .get(ord)
+                .copied()
+                .ok_or(VmError::BadConstant("MH 钩子:静态槽越界"))?;
+            Ok(slot_to_value(slot))
+        }
+        REF_PUT_STATIC => {
+            let value = arg_to_slot(args.first())?;
+            lc.static_storage.lock().unwrap()[ord] = value;
+            Ok(Value::Void)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// 沿超类链按名定位静态字段 → (声明类名, 序号)。owned 返回(避开 &lc 借 &reg 链式借用)。
+fn resolve_static_field_by_name(
+    reg: &ClassRegistry,
+    start: &str,
+    name: &str,
+) -> Option<(String, usize)> {
+    let mut cur_name = Some(start.to_string());
+    while let Some(class_name) = cur_name {
+        if let Some(lc) = reg.get(&class_name) {
+            if let Some(ord) = lc.static_fields().iter().position(|f| f.name == name) {
+                return Some((lc.name().to_string(), ord));
+            }
+            cur_name = lc.super_class_name().map(|s| s.to_string());
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+/// 槽位 → 解释器值(字段读取;Top/ReturnAddress 不会出现在字段值中,映射为 Void 由调用方类型校验兜底)。
+fn slot_to_value(slot: Slot) -> Value {
+    match slot {
+        Slot::Int(v) => Value::Int(v),
+        Slot::Long(v) => Value::Long(v),
+        Slot::Float(v) => Value::Float(v),
+        Slot::Double(v) => Value::Double(v),
+        Slot::Reference(r) => Value::Reference(r),
+        Slot::Top | Slot::ReturnAddress(_) => Value::Void,
+    }
+}
+
+/// 实参 → 槽位(字段写入;按 JVM 栈承载类型 1:1 映射,byte/char/short/boolean 均以 int 承载)。
+fn arg_to_slot(arg: Option<&Arg>) -> Result<Slot, VmError> {
+    Ok(match arg {
+        Some(Arg::Int(v)) => Slot::Int(*v),
+        Some(Arg::Long(v)) => Slot::Long(*v),
+        Some(Arg::Float(v)) => Slot::Float(*v),
+        Some(Arg::Double(v)) => Slot::Double(*v),
+        Some(Arg::Reference(r)) => Slot::Reference(*r),
+        None => return Err(VmError::BadConstant("MH 钩子:setter 缺 value 实参")),
+    })
 }
 
 /// 进入一帧:`frame_depth +1`,执行 `f`,返回前 `−1`(Ok/Err 两路对称)。
@@ -910,6 +1142,12 @@ pub(super) fn invoke_virtual(
         None => return Err(VmError::BadConstant("invokevirtual 引用悬空")),
     };
 
+    // MethodHandle 签名多态短路(B.5.2):receiver 为字段 DirectMethodHandle → 直读 member 做
+    // getfield/putfield/getstatic/putstatic。非字段 DMH / 非 invoke 族 → None,走下方正常虚分派。
+    if let Some(v) = try_method_handle_field_hook(vm, &method_name, &runtime_class, objref, &args)? {
+        return finish_invoke(interp, frame, vm, caller_pc, Ok(v), md.return_type);
+    }
+
     let registry = vm
         .registry()
         .ok_or(VmError::BadConstant("invokevirtual 需要类注册表"))?;
@@ -993,6 +1231,11 @@ pub(super) fn invoke_interface(
         Some(Oop::Instance(i)) => i.class_name().to_string(),
         None => return Err(VmError::BadConstant("invokeinterface 引用悬空")),
     };
+
+    // MethodHandle 签名多态短路(B.5.2):同 invoke_virtual;DMH 经接口类型调用亦走此路。
+    if let Some(v) = try_method_handle_field_hook(vm, &method_name, &runtime_class, objref, &args)? {
+        return finish_invoke(interp, frame, vm, caller_pc, Ok(v), md.return_type);
+    }
 
     let registry = vm
         .registry()

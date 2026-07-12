@@ -116,18 +116,10 @@ impl Vm {
     /// `\nCaused by: <cause 类>[: message]` + cause 自身帧。深度上限 64(防环/失控链)。
     /// 无快照且无 cause/message → 空串(旧契约)。供测试/诊断;顶层未捕获时自动打印。
     pub fn format_trace(&self, exc: Reference) -> String {
-        // 头异常存在性 + 非空判定:单次锁取布尔,释 guard 后再渲染(format_trace 沿 cause 链
-        // 多次读 exception_meta + heap,持 guard 重锁 exception_meta 会自死锁;B.2.3b)。
-        let has_info = {
-            let meta = self.shared.exception_meta.lock().unwrap();
-            match meta.get(&exc) {
-                Some(m) => !(m.frames.is_empty() && m.cause.is_none() && m.message.is_none()),
-                None => return String::new(),
-            }
-        };
-        if !has_info {
-            return String::new();
-        }
+        // 沿 cause 链渲染:每跳单次锁 exception_meta 取 owned(frames/message/cause),释 guard 再
+        // 读 heap 取类名(持 guard 重锁 exception_meta / 与 heap 锁序冲突均规避;B.2.3b)。
+        // **始终打印头异常类名**:native 分派抛出的异常(如 UnsatisfiedLinkError)无 frames/message,
+        // 但类名本身对调试关键(曾因此红测得空轨迹)。
         let mut out = String::new();
         let mut cur = Some(exc);
         let mut head = true;

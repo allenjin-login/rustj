@@ -320,6 +320,59 @@ fn resolve_static_field_by_name(
     None
 }
 
+/// `invokestatic` 方法解析(JVMS §5.4.3.4):沿超类链 → 再遍历超接口,按 (名,描述符) 找**声明类**
+/// 的内部名。编译器生成码(如 Class-File API 的 impl 类)常把 `invokestatic` 引用指向继承该静态法的
+/// 子类(JLS 源码层调超类静态法,javac 仍可能经桥/合成路径下标到子类);故解析须上行,而非只查引用类
+/// 自身。owned 返回(避开 `&lc` 借 `&reg` 链式借用)。未命中 → None(调用方报"未找到目标方法")。
+fn find_static_method_owner(
+    reg: &ClassRegistry,
+    start: &str,
+    name: &str,
+    desc: &str,
+) -> Option<String> {
+    // 1. 超类链(含 start 自身)。
+    let mut cur_name = Some(start.to_string());
+    while let Some(class_name) = cur_name {
+        if let Some(lc) = reg.get(&class_name) {
+            if find_method(&lc.cf, name, desc).is_ok() {
+                return Some(class_name);
+            }
+            cur_name = lc.super_class_name().map(|s| s.to_string());
+        } else {
+            break;
+        }
+    }
+    // 2. 超接口(传递性,声明序):递归收集后逐个查。
+    let mut ifaces = Vec::new();
+    collect_interfaces(reg, start, &mut ifaces);
+    for iface in ifaces {
+        if let Some(lc) = reg.get(&iface)
+            && find_method(&lc.cf, name, desc).is_ok()
+        {
+            return Some(iface);
+        }
+    }
+    None
+}
+
+/// 递归收集 `start`(沿超类链各类)的直接 + 传递超接口,保留声明顺序、去重。
+fn collect_interfaces(reg: &ClassRegistry, start: &str, out: &mut Vec<String>) {
+    let mut cur_name = Some(start.to_string());
+    while let Some(class_name) = cur_name {
+        if let Some(lc) = reg.get(&class_name) {
+            for iface in lc.interface_names() {
+                if !out.contains(&iface) {
+                    out.push(iface.clone());
+                    collect_interfaces(reg, &iface, out);
+                }
+            }
+            cur_name = lc.super_class_name().map(|s| s.to_string());
+        } else {
+            break;
+        }
+    }
+}
+
 /// 槽位 → 解释器值(字段读取;Top/ReturnAddress 不会出现在字段值中,映射为 Void 由调用方类型校验兜底)。
 fn slot_to_value(slot: Slot) -> Value {
     match slot {
@@ -977,8 +1030,12 @@ pub(super) fn invoke_static(
     let (class_name, method_name, desc) = resolve_methodref(interp.cp(), methodref_index)?;
     // 首次静态调用 → 触发声明类初始化(<clinit> 先行)。
     clinit::ensure_class_initialized(vm, &class_name)?;
+    // invokestatic 方法解析(JVMS §5.4.3.4):引用类可能仅继承该静态法(编译器生成码常见),
+    // 须沿超类链 → 超接口定位**声明类**;未命中回退到引用类自身(find_method 报"未找到")。
+    let owner = find_static_method_owner(&registry, &class_name, &method_name, &desc)
+        .unwrap_or_else(|| class_name.clone());
     let target_lc = registry
-        .get(&class_name)
+        .get(&owner)
         .ok_or(VmError::BadConstant("invokestatic 目标类未加载"))?;
     let target_method = find_method(&target_lc.cf, &method_name, &desc)?;
     let md = parse_method_descriptor(&desc)?;

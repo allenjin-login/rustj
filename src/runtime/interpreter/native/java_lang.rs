@@ -313,6 +313,11 @@ pub(super) fn dispatch(
         ("java/lang/Class", "getConstantPool", "()Ljdk/internal/reflect/ConstantPool;") => {
             Ok(Value::Reference(Reference::null()))
         }
+        // Class.isHidden()Z —— Class.java:4033 真原生。rustj 无 hidden class(无 defineHiddenClass),
+        // 恒 false。被 Class.descriptorString(Class.java:3956) 调用以区分隐式类描述符形;false → 走普通
+        // `L<name>;` 分支。解锁 ClassSpecializer.<clinit>(ClassSpecializer.java:73 经 ConstantUtils.
+        // referenceClassDesc → Class.descriptorString)。Phase G.0 探针驱动发现。
+        ("java/lang/Class", "isHidden", "()Z") => Ok(Value::Int(0)),
         // Method/Constructor.getAnnotationBytes()[B —— Executable 子类的包私有 native,返该成员的
         // RuntimeVisibleAnnotations 属性原始字节(无属性 → null)。rustj 暂返 null(注解机制最小桩,同上):
         // parseAnnotations(null) → emptyMap,isAnnotationPresent 对无 @CallerSensitive 的方法正确返 false。

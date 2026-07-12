@@ -149,7 +149,7 @@ fn constant_value_slot(vm: &mut Vm, cp: &ConstantPool, cv_index: u16) -> Option<
 /// 沿用 `invoke_static` / `throw_exception` 的 `'a` 借用技巧:[`Vm::registry`] 返回
 /// `&'a ClassRegistry`(寿命不绑 `&self`),故取出 `&'a LoadedClass` 后仍可 `&mut vm`
 /// 执行 `<clinit>`,并在重入/超类递归中反复再借。
-pub(crate) fn ensure_class_initialized(
+pub fn ensure_class_initialized(
     vm: &mut Vm,
     class_name: &str,
 ) -> Result<(), VmError> {

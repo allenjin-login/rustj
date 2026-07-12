@@ -63,6 +63,16 @@ pub fn initialize_system_class(vm: &mut Vm) -> Result<(), VmError> {
     // `ClassLoaders.<clinit>` → `getSystemClassLoader()` 整链。须在 props 之后(安装可能触发 System.<clinit>)。
     install_java_lang_access(vm)?;
 
+    // SharedSecrets.javaLangReflectAccess 安装 —— 经 AccessibleObject.<clinit>(AccessibleObject.java:78
+    // `SharedSecrets.setJavaLangReflectAccess(new ReflectAccess())`)。**须在 ReflectionFactory 单例被
+    // 任何反射触及之前**:`ReflectionFactory.soleInstance` 为 static final,构造时一次性读
+    // `SharedSecrets.getJavaLangReflectAccess()` 缓存进 final `langReflectAccess` 字段;若此刻为 null
+    // (AccessibleObject 未初始化),则恒 null → `getExecutableSharedParameterTypes` NPE。`Class.getConstructor0`
+    // 先调 `getReflectionFactory()` 再调 `privateGetDeclaredConstructors`(后者方 ensure AccessibleObject),
+    // 故单例必早于 ensure 缓存空值——须在 Phase 1 提前装。解锁 `getDeclaredConstructor`(BMH species 生成
+    // `deriveSuperClass` 经之)及通用构造器反射。AccessibleObject 未预载 → 静默跳过(保旧测试兼容)。
+    install_java_lang_reflect_access(vm)?;
+
     Ok(())
 }
 
@@ -88,6 +98,21 @@ fn install_java_lang_access(vm: &mut Vm) -> Result<(), VmError> {
         return Ok(());
     }
     invoke_static_void(vm, "java/lang/System", "setJavaLangAccess", |_| Ok(()))
+}
+
+/// 安装 `SharedSecrets.javaLangReflectAccess` —— 经 `ensure_class_initialized(
+/// "java/lang/reflect/AccessibleObject")` 触发其 `<clinit>`(AccessibleObject.java:78
+/// `SharedSecrets.setJavaLangReflectAccess(new ReflectAccess())`)。须早于 ReflectionFactory 单例
+/// 缓存(见 `initialize_system_class` 注释)。AccessibleObject 未预载 → 静默跳过。
+fn install_java_lang_reflect_access(vm: &mut Vm) -> Result<(), VmError> {
+    let has_ao = vm
+        .registry()
+        .map(|r| r.get("java/lang/reflect/AccessibleObject").is_some())
+        .unwrap_or(false);
+    if !has_ao {
+        return Ok(());
+    }
+    crate::runtime::interpreter::clinit::ensure_class_initialized(vm, "java/lang/reflect/AccessibleObject")
 }
 
 /// 构造真 `java.util.Properties` 实例并写 `System.props` 静态字段(Phase 1 收尾,Layer 4.20),

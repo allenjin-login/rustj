@@ -7,7 +7,7 @@
 
 mod array;
 mod arraycopy;
-mod clinit;
+pub mod clinit;
 mod exception;
 mod field;
 mod invoke;

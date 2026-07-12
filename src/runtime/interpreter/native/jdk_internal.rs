@@ -79,6 +79,7 @@ pub(super) fn dispatch(
         //(见下)。实参:第 0 = 数组 Reference,第 1 = offset Long(单个 category-2 槽,JVM 级单参)。
         ("jdk/internal/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V") => put_byte(vm, args),
         ("jdk/internal/misc/Unsafe", "getByte", "(Ljava/lang/Object;J)B") => get_byte(vm, args),
+        ("jdk/internal/misc/Unsafe", "getChar", "(Ljava/lang/Object;J)C") => get_char(vm, args),
         ("jdk/internal/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S") => get_short(vm, args),
         ("jdk/internal/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I") => get_int(vm, args),
         ("jdk/internal/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J") => get_long(vm, args),
@@ -236,6 +237,20 @@ fn get_byte(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     };
     let bytes = array_le_bytes(vm, arr, byte_index(offset), 1)?;
     Ok(Value::Int((bytes[0] as i8) as i32))
+}
+
+/// `Unsafe.getChar(Object o, long offset)C`(Unsafe.java native):读 2 字节,小端拼为**无符号** char
+/// (0..65535,不符号扩展)。被 `getCharUnaligned(o,off,bigEndian)`(纯 Java 字节码)经 `convEndian`
+/// 委派——`RawBytecodeHelper.getU2Unchecked`(StackMapGenerator 读生成字节码的 u2 操作数)传
+/// `bigEndian=true`,故 getChar 先 LE 读再由调用方翻 BE。解锁 Class-File API 物种方法的栈映射生成。
+fn get_char(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+    let (arr, offset) = match (args.first(), args.get(1)) {
+        (Some(Value::Reference(r)), Some(Value::Long(o))) => (*r, *o),
+        _ => return Err(VmError::BadConstant("Unsafe.getChar 参数形状不符")),
+    };
+    let bytes = array_le_bytes(vm, arr, byte_index(offset), 2)?;
+    let v = (bytes[0] as u16) | ((bytes[1] as u16) << 8);
+    Ok(Value::Int(v as i32))
 }
 
 /// `Unsafe.getShort(Object o, long offset)S`(Unsafe.java:227 native):读 2 字节,小端拼为有符号 short。

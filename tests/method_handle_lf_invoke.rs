@@ -104,6 +104,13 @@ public class Probe {
         MethodHandle mh = MethodHandles.identity(int.class);
         return (int) mh.invokeExact(42);
     }
+    // constant(int.class, 42) 的 LF = [carrier(BMH), Name(species.getterFunction(0), carrier)](读 BMH 绑定的
+    // 物种字段);且构造本身经 factory().invokeBasic → 物种工厂 LF(含 newInvokeSpecial 构造节点)。
+    // 验证 NamedFunction 计算节点分派(字段读 + 构造器调用)。
+    public static int constantInvokeExact() throws Throwable {
+        MethodHandle mh = MethodHandles.constant(int.class, 42);
+        return (int) mh.invokeExact();
+    }
 }
 "#;
 
@@ -161,5 +168,22 @@ fn identity_invoke_exact_via_lambda_form() {
             panic!("identityInvokeExact 抛异常:\n{trace}");
         }
         Err(e) => panic!("identityInvokeExact 内部错误:{e:?}"),
+    }
+}
+
+/// **RED→GREEN**(Phase G.2.2):`MethodHandles.constant(int.class, 42).invokeExact()` == 42。
+/// constant 的构造经物种工厂 invokeBasic(构造器 NamedFunction 节点),LF = [carrier, 字段读] →
+/// 验证 NamedFunction 计算节点分派(字段读 + 构造器调用)。
+#[test]
+fn constant_invoke_exact_via_lambda_form() {
+    let Some(mut vm) = setup_vm() else { return };
+    match run_static_int(&mut vm, "constantInvokeExact") {
+        Ok(Value::Int(v)) => assert_eq!(v, 42, "constant(42) 经 LF 解释须返 42"),
+        Ok(other) => panic!("期望 Int,得 {other:?}"),
+        Err(VmError::ThrownException(exc)) => {
+            let trace = vm.format_trace(exc);
+            panic!("constantInvokeExact 抛异常:\n{trace}");
+        }
+        Err(e) => panic!("constantInvokeExact 内部错误:{e:?}"),
     }
 }

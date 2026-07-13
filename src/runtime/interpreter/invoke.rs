@@ -33,6 +33,7 @@ const REF_GET_FIELD: u8 = 1;
 const REF_GET_STATIC: u8 = 2;
 const REF_PUT_FIELD: u8 = 3;
 const REF_PUT_STATIC: u8 = 4;
+// 方法引用类(REF_INVOKE_*)经 `crate::oops::lambda` 复用导入,G.2.2 linkTo / NamedFunction 节点派发。
 
 /// invoke 后调用者分派循环的流向。
 pub(super) enum InvokeFlow {
@@ -238,7 +239,7 @@ fn interpret_lambda_form(
         }
         *slot = arg_to_slot(args.get(arg_idx))?;
     }
-    // 计算节点 names[arity..](function != null)。G.2.1 identity 无计算节点;遇计算节点暂抛错(G.2.2+)。
+    // 计算节点 names[arity..](function != null)。G.2.1 identity 无计算节点。
     for idx in arity..names_len {
         let name_ref = match vm.heap().get(names_arr) {
             Some(Oop::Array(a)) => match a.element(idx) {
@@ -252,12 +253,10 @@ fn interpret_lambda_form(
             "java/lang/invoke/LambdaForm$Name",
             "function",
         );
-        if matches!(function, Some(r) if !r.is_null()) {
-            return Err(VmError::BadConstant(
-                "LF 解释:计算节点(NamedFunction)分派未实现 —— G.2.2+",
-            ));
+        // names[arity..] 均为计算节点(function != null):按 NamedFunction.member 分派求值(G.2.2)。
+        if function.is_some_and(|r| !r.is_null()) {
+            values[idx] = eval_compute_node(vm, name_ref, &values)?;
         }
-        // function == null → 参数/常量节点:参数已绑;常量 G.2.2 处理(暂留默认 Top)。
     }
     // result < 0(LambdaForm.VOID_RESULT)→ void;否则返 names[result]。
     if result < 0 {
@@ -268,6 +267,411 @@ fn interpret_lambda_form(
         return Err(VmError::BadConstant("LF 解释:result 下标越界"));
     }
     Ok(slot_to_value(values[r]))
+}
+
+/// 求值一个 LF 计算节点(`Name.function != null`):读 `NamedFunction.member` 并按成员身份分派
+/// (G.2.2)。节点实参(`Name.arguments`)是 `Object[]`:元素为 `Name`(引用先前节点 → values[index])
+/// 或字面量(装箱)。成员分派:
+/// - `DirectMethodHandle.internalMemberName(mh)` → 返 `mh.member`(MemberName 引用);
+/// - `MethodHandle.linkTo*` / `invokeBasic` → MH 链接器:末参为 MemberName,以其派发前置实参;
+/// - 其余方法/字段成员 → 按 refKind 调用/访问(复用 DMH 字段访问逻辑)。
+fn eval_compute_node(
+    vm: &mut Vm,
+    name_ref: Reference,
+    values: &[Slot],
+) -> Result<Slot, VmError> {
+    let nf = vm
+        .instance_reference_field(name_ref, "java/lang/invoke/LambdaForm$Name", "function")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("LF 节点:function 缺失"))?;
+    let member = vm
+        .instance_reference_field(nf, "java/lang/invoke/LambdaForm$NamedFunction", "member")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("LF 节点:NamedFunction.member 缺失"))?;
+    let mname = read_member_name_string(vm, member, "name");
+    let mclazz = vm
+        .instance_reference_field(member, "java/lang/invoke/MemberName", "clazz")
+        .and_then(|c| vm.mirror_internal_name(c))
+        .unwrap_or_default();
+    let arg_slots = resolve_name_arguments(vm, name_ref, values)?;
+
+    // MemberName.flags 高 4 位 = refKind(直接节点用;linkTo/internalMemberName 不读)。
+    let flags = vm
+        .instance_int_field(member, "java/lang/invoke/MemberName", "flags")
+        .unwrap_or(0);
+    let ref_kind = ((flags as u32) >> 24) as u8 & 0x0F;
+
+    match (mclazz.as_str(), mname.as_str()) {
+        // DirectMethodHandle.internalMemberName(mh) → 返 mh.member(LF 取 DMH 尾 MemberName 用)。
+        ("java/lang/invoke/DirectMethodHandle", "internalMemberName") => {
+            let target = match arg_slots.first() {
+                Some(Slot::Reference(r)) => *r,
+                _ => return Err(VmError::BadConstant("internalMemberName:缺 receiver")),
+            };
+            let m = vm
+                .instance_reference_field(target, "java/lang/invoke/DirectMethodHandle", "member")
+                .ok_or(VmError::BadConstant("internalMemberName:receiver 无 member 字段"))?;
+            Ok(Slot::Reference(m))
+        }
+        // linkTo*/invokeBasic:末参为 MemberName,以其派发前置实参(HotSpot linkTo 内联)。
+        ("java/lang/invoke/MethodHandle", m)
+            if m.starts_with("linkTo") || m == "invokeBasic" =>
+        {
+            link_to_member(vm, &arg_slots)
+        }
+        // 直接节点:getterFunction/方法 NamedFunction —— member 自身的 refKind 决定字段读/方法调。
+        // 此为 LF 求值的核心:常量 LF 的 `Name(getterFunction, carrier)` 即此路径(refKind=getField)。
+        _ => {
+            let args: Vec<Arg> = arg_slots
+                .iter()
+                .map(|s| slot_to_arg(*s))
+                .collect::<Result<_, _>>()?;
+            invoke_member_name(vm, member, ref_kind, &args).map(value_to_slot)
+        }
+    }
+}
+
+/// 读 MemberName 的字符串型字段(`name` / `type` 等)→ 解码 String 池文本。
+fn read_member_name_string(vm: &mut Vm, member: Reference, field: &str) -> String {
+    vm.instance_reference_field(member, "java/lang/invoke/MemberName", field)
+        .and_then(|r| string::read_text(vm, r).ok().flatten())
+        .unwrap_or_default()
+}
+
+/// 解析 LF 计算节点实参 `Name.arguments`(Object[])→ 槽位向量。元素为 `Name`(引用先前节点 →
+/// values[index])或字面量(装箱对象 → 拆箱)。Name.index(short)定位 values。
+fn resolve_name_arguments(
+    vm: &mut Vm,
+    name_ref: Reference,
+    values: &[Slot],
+) -> Result<Vec<Slot>, VmError> {
+    let arr = vm
+        .instance_reference_field(name_ref, "java/lang/invoke/LambdaForm$Name", "arguments")
+        .filter(|r| !r.is_null());
+    let Some(arr) = arr else {
+        return Ok(Vec::new());
+    };
+    let len = match vm.heap().get(arr) {
+        Some(Oop::Array(a)) => a.length(),
+        _ => return Ok(Vec::new()),
+    };
+    let mut out = Vec::with_capacity(len);
+    for k in 0..len {
+        let elem = match vm.heap().get(arr) {
+            Some(Oop::Array(a)) => a.element(k),
+            _ => return Err(VmError::BadConstant("LF 节点:arguments 非数组")),
+        };
+        let slot = match elem {
+            Slot::Reference(r) if !r.is_null() => {
+                let is_name = matches!(
+                    vm.heap().get(r),
+                    Some(Oop::Instance(i)) if i.class_name() == "java/lang/invoke/LambdaForm$Name"
+                );
+                if is_name {
+                    let ni = vm
+                        .instance_int_field(r, "java/lang/invoke/LambdaForm$Name", "index")
+                        .ok_or(VmError::BadConstant("LF 节点:Name.index 缺失"))?
+                        as usize;
+                    values
+                        .get(ni)
+                        .copied()
+                        .ok_or(VmError::BadConstant("LF 节点:Name.index 越界"))?
+                } else {
+                    // 字面量装箱 → 拆箱(Integer/Long/Float/Double 的 value 字段)。
+                    unbox_literal(vm, r)?
+                }
+            }
+            other => other,
+        };
+        out.push(slot);
+    }
+    Ok(out)
+}
+
+/// 拆箱字面量实参(Integer/Long/Float/Double/Short/Byte/Boolean/Character → value 槽位)。
+fn unbox_literal(vm: &mut Vm, r: Reference) -> Result<Slot, VmError> {
+    let (class_name, value_ord) = {
+        let reg = vm
+            .registry()
+            .ok_or(VmError::BadConstant("拆箱需类注册表"))?;
+        let heap = vm.heap();
+        let inst = match heap.get(r) {
+            Some(Oop::Instance(i)) => i,
+            _ => return Err(VmError::BadConstant("拆箱:非 Instance")),
+        };
+        let cn = inst.class_name().to_string();
+        let lc = reg
+            .get(&cn)
+            .ok_or(VmError::BadConstant("拆箱:类未加载"))?;
+        let ord = reg
+            .flattened_instance_fields(&lc)
+            .iter()
+            .position(|f| f.name == "value")
+            .ok_or(VmError::BadConstant("拆箱:无 value 字段"))?;
+        (cn, ord)
+    };
+    let slot = match vm.heap().get(r) {
+        Some(Oop::Instance(i)) => i.field(value_ord),
+        _ => return Err(VmError::BadConstant("拆箱:非 Instance")),
+    };
+    // 仅校验声明类是已知装箱类型(值槽位已按 JVM 承载类型存)。
+    match class_name.as_str() {
+        "java/lang/Integer" | "java/lang/Long" | "java/lang/Float" | "java/lang/Double"
+        | "java/lang/Short" | "java/lang/Byte" | "java/lang/Boolean" | "java/lang/Character" => Ok(slot),
+        _ => Err(VmError::BadConstant("拆箱:非已知装箱类型")),
+    }
+}
+
+/// `MethodHandle.linkTo*` / `invokeBasic` 链接器(G.2.2):末参为 MemberName,据其 refKind 派发
+/// 前置实参(字段读/写、方法调用)。对应 HotSpot `MethodHandles::linkTo*` 内联:跳转到 MemberName
+/// 的 vmtarget/vmindex。rustj 直读 MemberName.{clazz,name,flags,type} 派发(同 DMH 字段 shortcut)。
+fn link_to_member(vm: &mut Vm, arg_slots: &[Slot]) -> Result<Slot, VmError> {
+    let mname_ref = match arg_slots.last() {
+        Some(Slot::Reference(r)) if !r.is_null() => *r,
+        _ => return Err(VmError::BadConstant("linkTo:末参非 MemberName")),
+    };
+    let flags = vm
+        .instance_int_field(mname_ref, "java/lang/invoke/MemberName", "flags")
+        .ok_or(VmError::BadConstant("linkTo:MemberName.flags 缺失"))?;
+    let ref_kind = ((flags as u32) >> 24) as u8 & 0x0F;
+    let call_args: Vec<Arg> = arg_slots[..arg_slots.len() - 1]
+        .iter()
+        .map(|s| slot_to_arg(*s))
+        .collect::<Result<_, _>>()?;
+    invoke_member_name(vm, mname_ref, ref_kind, &call_args).map(value_to_slot)
+}
+
+/// 按 MemberName 的 refKind 派发字段访问 / 方法调用(G.2.2 核心)。linkTo 链接器与直接
+/// NamedFunction 节点(getterFunction 等)共用此路径——二者仅 MemberName 来源不同(末参 vs
+/// `function.member`),派发逻辑一致。字段 refKind 复用 DMH 字段访问;方法 refKind 解析目标方法
+/// 后 `interpret_with` 跑真字节码(invokeStatic=物种工厂 make / invokeVirtual=虚分派 / newInvokeSpecial
+/// =构造器先分配再跑 `<init>`)。
+fn invoke_member_name(
+    vm: &mut Vm,
+    mname: Reference,
+    ref_kind: u8,
+    args: &[Arg],
+) -> Result<Value, VmError> {
+    match ref_kind {
+        REF_GET_FIELD | REF_PUT_FIELD | REF_GET_STATIC | REF_PUT_STATIC => {
+            let declaring = vm
+                .instance_reference_field(mname, "java/lang/invoke/MemberName", "clazz")
+                .and_then(|c| vm.mirror_internal_name(c))
+                .ok_or(VmError::BadConstant("MemberName.clazz 非镜像"))?;
+            let field_name = read_member_name_string(vm, mname, "name");
+            match ref_kind {
+                REF_GET_FIELD | REF_PUT_FIELD => {
+                    access_instance_field(vm, &declaring, &field_name, ref_kind, args)
+                }
+                REF_GET_STATIC | REF_PUT_STATIC => {
+                    access_static_field(vm, &declaring, &field_name, ref_kind, args)
+                }
+                _ => unreachable!(),
+            }
+        }
+        REF_INVOKE_STATIC
+        | REF_INVOKE_VIRTUAL
+        | REF_INVOKE_SPECIAL
+        | REF_NEW_INVOKE_SPECIAL
+        | REF_INVOKE_INTERFACE => invoke_method_ref(vm, mname, ref_kind, args),
+        _ => Err(VmError::BadConstant("MemberName:未知 refKind")),
+    }
+}
+
+/// 按 MemberName 调用方法(G.2.2):解析目标方法(MemberName.{clazz,name,type→描述符})、建帧、
+/// `interpret_with`。invokeStatic 在声明类解析;invokeVirtual/Interface 按接收者运行时类虚分派;
+/// invokeSpecial 在声明类非虚解析;newInvokeSpecial 先分配新实例(构造器 `<init>`)。
+fn invoke_method_ref(
+    vm: &mut Vm,
+    mname: Reference,
+    ref_kind: u8,
+    args: &[Arg],
+) -> Result<Value, VmError> {
+    let declaring = vm
+        .instance_reference_field(mname, "java/lang/invoke/MemberName", "clazz")
+        .and_then(|c| vm.mirror_internal_name(c))
+        .ok_or(VmError::BadConstant("MemberName.clazz 非镜像"))?;
+    let method_name = read_member_name_string(vm, mname, "name");
+    let desc = member_name_method_descriptor(vm, mname)?;
+
+    // 解析目标方法(返回 owned Arc<LoadedClass> + 方法下标,后续 &mut vm 须先释)。
+    let (is_static, is_constructor, receiver, resolve_class, method_args): (
+        bool,
+        bool,
+        Option<Reference>,
+        String,
+        &[Arg],
+    ) = match ref_kind {
+        REF_INVOKE_STATIC => {
+            clinit::ensure_class_initialized(vm, &declaring)?;
+            (true, false, None, declaring.clone(), args)
+        }
+        REF_NEW_INVOKE_SPECIAL => {
+            // 构造器:先分配新实例作 locals[0],其余实参为 <init> 参数。
+            clinit::ensure_class_initialized(vm, &declaring)?;
+            let reg = vm
+                .registry()
+                .ok_or(VmError::BadConstant("linkTo 方法调用需类注册表"))?;
+            let lc = reg
+                .get(&declaring)
+                .ok_or(VmError::BadConstant("linkTo:声明类未加载"))?;
+            let inst = reg.new_instance(&lc);
+            let new_ref = vm.heap_mut().alloc(Oop::Instance(inst));
+            (true, true, Some(new_ref), declaring.clone(), args)
+        }
+        REF_INVOKE_VIRTUAL | REF_INVOKE_INTERFACE => {
+            // 虚分派:按接收者(arg0)运行时类解析。
+            let recv = match args.first() {
+                Some(Arg::Reference(r)) if !r.is_null() => *r,
+                _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+            };
+            let runtime_class = match vm.heap().get(recv) {
+                Some(Oop::Instance(i)) => i.class_name().to_string(),
+                _ => return Err(VmError::BadConstant("虚分派:接收者非 Instance")),
+            };
+            (false, false, Some(recv), runtime_class, args)
+        }
+        REF_INVOKE_SPECIAL => {
+            // 非虚:在声明类解析;接收者 = arg0。
+            let recv = match args.first() {
+                Some(Arg::Reference(r)) if !r.is_null() => *r,
+                _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+            };
+            (false, false, Some(recv), declaring.clone(), args)
+        }
+        _ => unreachable!(),
+    };
+
+    let reg = vm
+        .registry()
+        .ok_or(VmError::BadConstant("linkTo 方法调用需类注册表"))?;
+    let (target_lc, target_idx) = match reg.resolve_dispatch(&resolve_class, &method_name, &desc) {
+        Some(x) => x,
+        None => {
+            return Err(throw_exception(vm, "java/lang/NoSuchMethodError"));
+        }
+    };
+    let target_method = &target_lc.cf.methods[target_idx];
+    let Some(code) = target_method.code.as_ref() else {
+        return Err(throw_exception(vm, "java/lang/AbstractMethodError"));
+    };
+    let interp = Interpreter::new(&code.code, &target_lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table);
+    let mut frame = Frame::new(code.max_locals, code.max_stack);
+    // 写 locals:实例方法/构造器 locals[0]=接收者;静态从 0 起。实参按 category-2 占槽(long/double=2)。
+    let mut slot: u16 = 0;
+    if !is_static {
+        let recv = receiver.ok_or(VmError::BadConstant("实例调用缺接收者"))?;
+        frame.locals.set_reference(slot, recv)?;
+        slot += 1;
+    }
+    let first_arg = if is_static { 0 } else { 1 };
+    for (i, arg) in method_args.iter().enumerate().skip(first_arg) {
+        slot += store_arg(&mut frame.locals, slot, *arg)?;
+        let _ = i;
+    }
+    let result = interp.interpret_with(&mut frame, vm)?;
+    if is_constructor {
+        // 构造器返新实例(<init> 返 void,实例经 locals[0] 持有)。
+        return Ok(Value::Reference(
+            receiver.ok_or(VmError::BadConstant("构造器调用缺新实例"))?,
+        ));
+    }
+    Ok(result)
+}
+
+/// 读 MemberName.type → 方法描述符 `(...)R`。type 为 String(直接描述符)或 MethodType
+/// (rtype:Class + ptypes:Class[] → 拼描述符)。字段 MemberName 不调此(其 type 为 Class)。
+fn member_name_method_descriptor(vm: &mut Vm, mname: Reference) -> Result<String, VmError> {
+    let type_ref = vm
+        .instance_reference_field(mname, "java/lang/invoke/MemberName", "type")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("MemberName.type 缺失"))?;
+    // type 为 String → 直接描述符。
+    let type_class = match vm.heap().get(type_ref) {
+        Some(Oop::Instance(i)) => i.class_name().to_string(),
+        _ => return Err(VmError::BadConstant("MemberName.type 非 Instance")),
+    };
+    if type_class == "java/lang/String" {
+        return string::read_text(vm, type_ref)?
+            .ok_or(VmError::BadConstant("MemberName.type 非字符串"));
+    }
+    if !type_class.contains("MethodType") {
+        return Err(VmError::BadConstant("MemberName.type 非 MethodType/String"));
+    }
+    // MethodType:rtype(Class) + ptypes(Class[]) → 描述符。
+    let rtype_mirror = vm
+        .instance_reference_field(type_ref, "java/lang/invoke/MethodType", "rtype")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("MethodType.rtype 缺失"))?;
+    let ptypes_arr = vm
+        .instance_reference_field(type_ref, "java/lang/invoke/MethodType", "ptypes")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("MethodType.ptypes 缺失"))?;
+    let rdesc = class_mirror_descriptor(vm, rtype_mirror)?;
+    let plen = match vm.heap().get(ptypes_arr) {
+        Some(Oop::Array(a)) => a.length(),
+        _ => return Err(VmError::BadConstant("MethodType.ptypes 非数组")),
+    };
+    let mut pdescs = Vec::with_capacity(plen);
+    for k in 0..plen {
+        let pmirror = match vm.heap().get(ptypes_arr) {
+            Some(Oop::Array(a)) => match a.element(k) {
+                Slot::Reference(r) if !r.is_null() => r,
+                _ => return Err(VmError::BadConstant("ptypes 元素非引用")),
+            },
+            _ => return Err(VmError::BadConstant("MethodType.ptypes 非数组")),
+        };
+        pdescs.push(class_mirror_descriptor(vm, pmirror)?);
+    }
+    Ok(format!("({}){rdesc}", pdescs.join("")))
+}
+
+/// Class 镜像 → 字段/方法描述符中的类型编码。原语("int"→"I" 等)、数组(内部名即描述符)、
+/// 其余 → `Lname;`。原语镜像经 `mirror_internal_name` 返 "int"/"long"/...;数组返 "[..."。
+fn class_mirror_descriptor(vm: &Vm, mirror: Reference) -> Result<String, VmError> {
+    let internal = vm
+        .mirror_internal_name(mirror)
+        .ok_or(VmError::BadConstant("Class 镜像:无内部名"))?;
+    Ok(match internal.as_str() {
+        "int" => "I".into(),
+        "long" => "J".into(),
+        "float" => "F".into(),
+        "double" => "D".into(),
+        "boolean" => "Z".into(),
+        "byte" => "B".into(),
+        "char" => "C".into(),
+        "short" => "S".into(),
+        "void" => "V".into(),
+        s if s.starts_with('[') => s.to_string(),
+        other => format!("L{other};"),
+    })
+}
+
+/// 槽位 → 调用实参(字段/方法调用用;与 arg_to_slot 互逆)。
+fn slot_to_arg(slot: Slot) -> Result<Arg, VmError> {
+    Ok(match slot {
+        Slot::Int(v) => Arg::Int(v),
+        Slot::Long(v) => Arg::Long(v),
+        Slot::Float(v) => Arg::Float(v),
+        Slot::Double(v) => Arg::Double(v),
+        Slot::Reference(r) => Arg::Reference(r),
+        Slot::Top | Slot::ReturnAddress(_) => {
+            return Err(VmError::BadConstant("LF:Top/ReturnAddress 不可作实参"))
+        }
+    })
+}
+
+/// 解释器值 → 槽位(计算节点结果回填用)。
+fn value_to_slot(v: Value) -> Slot {
+    match v {
+        Value::Int(x) => Slot::Int(x),
+        Value::Long(x) => Slot::Long(x),
+        Value::Float(x) => Slot::Float(x),
+        Value::Double(x) => Slot::Double(x),
+        Value::Reference(r) => Slot::Reference(r),
+        Value::Void => Slot::Top,
+    }
 }
 
 /// 读 DMH.`member` → MemberName.{clazz,name,flags} → 按 refKind 做字段访问。

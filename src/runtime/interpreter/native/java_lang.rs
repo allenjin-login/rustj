@@ -523,6 +523,26 @@ pub(super) fn dispatch(
             find_loaded_class0(vm, args)
         }
 
+        // ClassLoader.defineClass0(loader, lookup, name, b, off, len, pd, initialize, flags, classData)Class
+        // —— ClassLoader.java:1111 `private static native`,经 `MethodHandles.Lookup.defineClass(byte[])`
+        // → `JavaLangAccess.defineClass` → 本 native 调用。移植 `jvm_lookup_define_class`(jvm.cpp:914):
+        // 从 `b[off..off+len]` 取类字节 → `classfile::parse` → `ClassRegistry::define_class`(注册到
+        // **运行时表**)→ `intern_class_mirror` → `initialize` 真? `ensure_class_initialized` : 否 → 返镜像。
+        //
+        // **非隐藏分支**(物种类 `BoundMethodHandle$Species_*` 均普通 strong-linked 非 nestmate 类,
+        // jvm.cpp:976 分支):忽略 loader/lookup/pd/flags/classData——rustj 单 bootstrap loader +
+        // 单注册表模型,无 per-loader 隔离/隐藏类/nestmate/package 校验(HotSpot jvm.cpp:1015 同包检查
+        // 顺延)。`name` 仅参考(以 classfile `this_class` 实际名为准,移植 HotSpot「name 可空、从流推导」
+        // jvm.cpp:966)。**first-wins**:重复 defineClass 同一类返已有(rustj 宽容;HotSpot 抛
+        // `LinkageError "attempted duplicate class definition"`)——物种类生成不重复同名。
+        // 解锁 Phase G 全量 LambdaForm 解释:`BMH.<clinit>`→`ClassSpecializer.generateConcreteSpeciesCode`
+        // → Class-File API 生成物种字节 → `Lookup.defineClass` → 本 native 注册物种类。
+        (
+            "java/lang/ClassLoader",
+            "defineClass0",
+            "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
+        ) => define_class0(vm, args),
+
         // System.mapLibraryName(Ljava/lang/String;)Ljava/lang/String; —— System.java:1699
         // `public static native`。移植 `Java_java_lang_System_mapLibraryName`(System.c:296):
         // 返 `JNI_LIB_PREFIX + libname + JNI_LIB_SUFFIX`。Windows:"net"→"net.dll";Linux:"libnet.so";
@@ -711,6 +731,85 @@ fn find_loaded_class0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
         Ok(Value::Reference(vm.intern_class_mirror(&internal)))
     } else {
         Ok(Value::Reference(Reference::null()))
+    }
+}
+
+/// `ClassLoader.defineClass0(loader, lookup, name, b, off, len, pd, initialize, flags, classData)Class`
+/// —— ClassLoader.java:1111 `private static native`,移植 `jvm_lookup_define_class`(jvm.cpp:914)。
+/// 见 [`dispatch`](super::super::native::dispatch) 处 arm 注释。从 `b[off..off+len]` 取类字节 →
+/// `classfile::parse`(jvm.cpp:978 `resolve_from_stream`)→ `ClassRegistry::define_class`(注册到运行时表)
+/// → `intern_class_mirror` → `initialize` 真? `ensure_class_initialized`(jvm.cpp:1020 `ik->initialize`):
+/// 否 → 返镜像(仅注册)。`loader`/`lookup`/`pd`/`flags`/`classData` 忽略(单 bootstrap loader/单注册表)。
+fn define_class0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+    // args[3]=byte[] b(args[0]loader/[1]lookup/[2]name/[4]off/[5]len/[6]pd/[7]initialize/[8]flags/[9]classData)。
+    let bytes_ref = match args.get(3) {
+        Some(Value::Reference(r)) => *r,
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    let off = match args.get(4).copied() {
+        Some(Value::Int(i)) if i >= 0 => i as usize,
+        _ => 0,
+    };
+    let len = match args.get(5).copied() {
+        Some(Value::Int(i)) if i >= 0 => i as usize,
+        _ => 0,
+    };
+    let initialize = matches!(args.get(7), Some(Value::Int(n)) if *n != 0);
+
+    // 读 byte[] 子段 b[off..off+len](越界 → AIOOBE,对应 JNI GetByteArrayRegion)。
+    let class_bytes = read_byte_range(vm, bytes_ref, off, len)?;
+
+    // 解析类字节;坏字节 → ClassFormatError。
+    let cf = crate::classfile::parse(&class_bytes)
+        .map_err(|_| throw_exception(vm, "java/lang/ClassFormatError"))?;
+    let name = cf
+        .this_class_name()
+        .ok_or_else(|| throw_exception(vm, "java/lang/ClassFormatError"))?
+        .to_string();
+
+    // 注册到运行时表(define_class 首胜);布局解析失败 → ClassFormatError。`reg`(owned Arc)至此
+    // 不再用,释后 `&mut vm` 跑初始化(§6 NLL:registry() 返 owned Arc clone,与 &mut vm 不冲突)。
+    let reg = vm
+        .registry()
+        .ok_or(VmError::BadConstant("defineClass0 需类注册表"))?;
+    reg.define_class(cf)
+        .map_err(|_| throw_exception(vm, "java/lang/ClassFormatError"))?;
+
+    if initialize {
+        super::super::clinit::ensure_class_initialized(vm, &name)?;
+    }
+    Ok(Value::Reference(vm.intern_class_mirror(&name)))
+}
+
+/// 读 `byte[]` 的 `b[off..off+len]` 子段为 owned `Vec<u8>`(`define_class0` 用)。非 `[B` 数组 →
+/// InternalError;off/len 越界 → ArrayIndexOutOfBoundsException(对应 JNI GetByteArrayRegion)。
+/// 持 heap guard 读 + 收集后释 guard(drop-before-recurse,§6)。
+fn read_byte_range(vm: &mut Vm, arr: Reference, off: usize, len: usize) -> Result<Vec<u8>, VmError> {
+    let outcome: Result<Vec<u8>, &str> = (|| {
+        let heap = vm.heap();
+        let a = match heap.get(arr) {
+            Some(Oop::Array(a)) if a.class_name() == "[B" => a,
+            _ => return Err("java/lang/InternalError"),
+        };
+        let length = a.length();
+        let end = off
+            .checked_add(len)
+            .ok_or("java/lang/ArrayIndexOutOfBoundsException")?;
+        if end > length {
+            return Err("java/lang/ArrayIndexOutOfBoundsException");
+        }
+        let mut buf = Vec::with_capacity(len);
+        for ei in off..end {
+            match a.element(ei) {
+                Slot::Int(v) => buf.push(v as u8),
+                _ => buf.push(0),
+            }
+        }
+        Ok(buf)
+    })();
+    match outcome {
+        Ok(v) => Ok(v),
+        Err(cls) => Err(throw_exception(vm, cls)),
     }
 }
 

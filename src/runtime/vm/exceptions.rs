@@ -163,8 +163,30 @@ impl Vm {
                     out.push_str(&loc);
                 }
             }
-            cur = cause;
+            cur = cause.or_else(|| self.read_throwable_cause(e));
         }
         out
+    }
+
+    /// 读 `Throwable.cause` 实例字段([`format_trace`](Self::format_trace) 回退用)。`exception_meta.cause`
+    /// 仅镜像 **JVM 自动抛出**的包裹关系(`record_cause`);Java 字节码 `new X(cause)`(如
+    /// `new InternalError(e)` 经 `Throwable(Throwable)` 构造器)直接写实例字段,rustj 不镜像 →
+    /// `format_trace` 追链断于首层。此法读真 `Throwable.cause`(`Ljava/lang/Object;`)字段补全链,
+    /// 使 Java 构造的异常链根因可见。桩 Throwable(无此字段)/ null cause → None。
+    fn read_throwable_cause(&self, exc: Reference) -> Option<Reference> {
+        use crate::metadata::descriptor::FieldType;
+        use crate::runtime::Slot;
+        let reg = self.registry()?;
+        let lc = reg.get("java/lang/Throwable")?;
+        let ord = reg.instance_field(&lc, "cause", &FieldType::Class("java/lang/Throwable".into()))?;
+        let heap = self.shared.heap.lock().unwrap();
+        let inst = match heap.get(exc) {
+            Some(Oop::Instance(i)) => i,
+            _ => return None,
+        };
+        match inst.field(ord) {
+            Slot::Reference(r) if !r.is_null() => Some(r),
+            _ => None,
+        }
     }
 }

@@ -184,6 +184,31 @@ pub(super) fn dispatch(
             should_be_initialized_0(vm, args)
         }
 
+        // jdk.internal.misc.Unsafe.fullFence()V —— Unsafe.java:3472 `public native`(唯一 fence native;
+        // storeFence/loadFence 为 @IntrinsicCandidate 字节码,无 intrinsic 时 fall back 调 fullFence)。
+        // 内存屏障(StoreLoad+LoadLoad+StoreStore+LoadStore);rustj 单线程模型无重排 → **no-op**。
+        // 解锁 ClassSpecializer.linkCodeToSpeciesData(ClassSpecializer.java:936/943)的 `UNSAFE.storeFence()`
+        // 物种数据链接(write SpeciesData 到 species 类静态字段前后)。
+        ("jdk/internal/misc/Unsafe", "fullFence", "()V") => Ok(Value::Void),
+
+        // jdk.internal.misc.Unsafe.putReference/getReference(O,J...) —— Unsafe.java native
+        //(jmod javap 实测 `public final native`;@IntrinsicCandidate)。**Phase G.1b**:物种 SD 字段链接
+        //(ClassSpecializer.java:938/913)经之读写物种类的静态 speciesData 字段——base = 声明类 Class 镜像
+        //(由 `staticFieldBase` 给)、offset = 静态字段序号(由 `staticFieldOffset` 给)。故须 **Class 镜像
+        // 路由**:base 是 Class 镜像(`mirror_internal_name` Some)→ 写/读该类 `static_storage[ord]`;
+        // 否则退化为实例/数组(`write_slot`/`read_slot`,单线程 volatile=plain)。解锁 BMH.<clinit>
+        // 物种生成链 defineClass→linkCodeToSpeciesData 的 putReference/readSpeciesDataFromCode 的 getReference。
+        (
+            "jdk/internal/misc/Unsafe",
+            "putReference",
+            "(Ljava/lang/Object;JLjava/lang/Object;)V",
+        ) => put_reference(vm, args),
+        (
+            "jdk/internal/misc/Unsafe",
+            "getReference",
+            "(Ljava/lang/Object;J)Ljava/lang/Object;",
+        ) => get_reference(vm, args),
+
         // 注:addressSize()/pageSize()/isBigEndian()/unalignedAccess() 均为返回常量字段
         // (ADDRESS_SIZE / PAGE_SIZE / BIG_ENDIAN / UNALIGNED_ACCESS)的字节码方法;这些字段在
         // Unsafe.class 中已是字面量初始化(不经 native),故 <clinit> 无更多 native 依赖。
@@ -501,6 +526,82 @@ fn write_slot(vm: &mut Vm, o: Reference, offset: i64, slot: Slot) -> Result<(), 
         Ok(()) => Ok(()),
         Err(cls) => Err(throw_exception(vm, cls)),
     }
+}
+
+/// offset → 静态字段序号读(Class 镜像为 base 的路径,单线程 volatile=plain):base 为 Class 镜像 →
+/// 取其内部名 → 注册表查 `LoadedClass` → `static_storage[ord]`。供 `getReference` 的静态分支共用。
+/// 非 Class 镜像 / 类未加载 / 序号越界 → None。
+fn read_static_slot(vm: &Vm, class_mirror: Reference, ord: i64) -> Option<Slot> {
+    let internal = vm.mirror_internal_name(class_mirror)?;
+    let reg = vm.registry()?;
+    let lc = reg.get(&internal)?;
+    let storage = lc.static_storage.lock().unwrap();
+    storage.get(ord as usize).cloned()
+}
+
+/// offset → 静态字段序号写(Class 镜像为 base 的路径):base 为 Class 镜像 → 写 `static_storage[ord]`。
+/// 序号越界 / 类未加载 → `InternalError`。持 static_storage guard 期间仅写(无 &mut vm),释 guard
+/// 后再 throw(drop-before-recurse;B.2.3b)。
+fn write_static_slot(
+    vm: &mut Vm,
+    class_mirror: Reference,
+    ord: i64,
+    slot: Slot,
+) -> Result<(), VmError> {
+    let outcome: Result<(), &str> = (|| {
+        let internal = vm.mirror_internal_name(class_mirror).ok_or("java/lang/InternalError")?;
+        let reg = vm.registry().ok_or("java/lang/InternalError")?;
+        let lc = reg
+            .get(&internal)
+            .ok_or("java/lang/InternalError")?;
+        let mut storage = lc.static_storage.lock().unwrap();
+        let ord = ord as usize;
+        if ord >= storage.len() {
+            return Err("java/lang/InternalError");
+        }
+        storage[ord] = slot;
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(cls) => Err(throw_exception(vm, cls)),
+    }
+}
+
+/// `Unsafe.putReference(Object o, long offset, Object x)V` —— Unsafe.java native。
+/// **base 为 Class 镜像**(经 `MethodHandleNatives.staticFieldBase` 得)→ 写该类静态字段
+/// (`write_static_slot`,offset = `staticFieldOffset` 给的序号);否则实例/数组(`write_slot`)。
+/// 单线程 volatile=plain。解锁物种 SD 字段链接(ClassSpecializer.java:938)。
+fn put_reference(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset, x) = match (args.first(), args.get(1), args.get(2)) {
+        (Some(Value::Reference(o)), Some(Value::Long(off)), Some(Value::Reference(x))) => (*o, *off, *x),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    if vm.mirror_internal_name(o).is_some() {
+        write_static_slot(vm, o, offset, Slot::Reference(x))?;
+    } else {
+        write_slot(vm, o, offset, Slot::Reference(x))?;
+    }
+    Ok(Value::Void)
+}
+
+/// `Unsafe.getReference(Object o, long offset)Object` —— Unsafe.java native。
+/// **base 为 Class 镜像** → 读该类静态字段(`read_static_slot`);否则实例/数组(`read_slot`)。
+/// 单线程 volatile=plain。解锁 readSpeciesDataFromCode(ClassSpecializer.java:913)读回 SpeciesData。
+fn get_reference(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+    let (o, offset) = match (args.first(), args.get(1)) {
+        (Some(Value::Reference(o)), Some(Value::Long(off))) => (*o, *off),
+        _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
+    };
+    let slot = if vm.mirror_internal_name(o).is_some() {
+        read_static_slot(vm, o, offset)
+    } else {
+        read_slot(vm, o, offset)
+    };
+    Ok(match slot {
+        Some(Slot::Reference(r)) => Value::Reference(r),
+        _ => Value::Reference(Reference::null()),
+    })
 }
 
 /// `Unsafe.getReferenceVolatile(Object o, long offset)Object` —— Unsafe.java:2117 native。

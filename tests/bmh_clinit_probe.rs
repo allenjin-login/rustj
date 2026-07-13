@@ -88,14 +88,14 @@ fn setup_vm() -> Option<Vm> {
     Some(vm)
 }
 
-/// **RED→GREEN**(G.0):`BoundMethodHandle.<clinit>` 经 ClassSpecializer.<clinit> →
+/// **RED→GREEN**(G.0→G.1):`BoundMethodHandle.<clinit>` 经 ClassSpecializer.<clinit> →
 /// Class.descriptorString → Class.isHidden 不抛 EIIE。
 ///
-/// **G.0 进度**:isHidden + LangReflectAccess + invokestatic 层次解析 + Unsafe.getChar 四墙已修,
-/// 物种字节码经 Class-File API 全量生成成功。**当前撞 G.1 墙**:`ClassLoader.defineClass0`
-/// (装载生成字节)native 缺 → ULE。待 G.1(Lookup.defineClass 移植)后去 ignore。
+/// **G.0** 修了 isHidden/LangReflectAccess/invokestatic/getChar 四墙;物种字节码经 Class-File API
+/// 全量生成成功。**G.1b RED**:`ClassLoader.defineClass0`(装载生成字节)native 缺 → ULE。
+/// **G.1b GREEN**:绑 defineClass0(byte[]→classfile::parse→define_class→intern mirror)后,
+/// BMH.<clinit> 物种类(`BoundMethodHandle$Species_*`)被 defineClass 注册,类初始化成。
 #[test]
-#[ignore = "BMH.<clinit> 物种生成撞 defineClass0(G.1 墙);G.0 已修 isHidden/LangReflectAccess/invokestatic/getChar 四墙"]
 fn bound_method_handle_clinit_succeeds() {
     let Some(mut vm) = setup_vm() else { return };
     match ensure_class_initialized(&mut vm, "java/lang/invoke/BoundMethodHandle") {

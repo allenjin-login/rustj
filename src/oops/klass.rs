@@ -362,6 +362,26 @@ impl ClassRegistry {
         None
     }
 
+    /// 沿超类链找静态字段的**(声明类, 序号)**——仅按名匹配(忽略描述符)。供
+    /// `MethodHandleNatives.staticFieldOffset` 用:MemberName.type 对字段存的是 `Class` 对象
+    /// 而非描述符串,无法直接转 `FieldType`,故按名定位(rustj 同一类内静态字段名唯一足够)。
+    /// 序号 = 声明类 `static_storage` 索引(同 `resolve_static_field`;静态字段不继承前缀,
+    /// `static_storage` 仅含本类声明的静态字段,见 `resolve_fields`)。
+    pub fn resolve_static_field_by_name(
+        &self,
+        class_name: &str,
+        name: &str,
+    ) -> Option<(Arc<LoadedClass>, usize)> {
+        let mut cur = self.get(class_name);
+        while let Some(lc) = cur {
+            if let Some(ord) = lc.static_fields().iter().position(|f| f.name == name) {
+                return Some((lc, ord));
+            }
+            cur = lc.super_class_name().and_then(|s| self.get(s));
+        }
+        None
+    }
+
     /// 虚分派:从 `class_name` 沿超类链找首个 (name, desc) 方法 → (声明类, 方法在 `cf.methods`
     /// 的下标)。声明类返 owned `Arc`,方法下标由调用方经 `&lc.cf.methods[idx]` 再取(`lc: Arc`
     /// 持有数据,借用其 methods 平凡合法——owned Arc 解耦,无需 `&'a self` 绑定)。

@@ -89,6 +89,10 @@ pub fn load_closure(
         // 桩或缺失 → 从 ClassPath 取真类覆盖(load_or_replace 末胜,真类覆盖桩);
         // ClassPath 无但注册表已有(桩)→ 用桩的 cf 抽其引用(桩的边仅为 Object,无害);
         // 两处皆无(其他模块未含的引用)→ 跳过。
+        // `load_or_replace` / `get` 现返 owned `Arc<LoadedClass>`(原为 `&'a LoadedClass`)。
+        // 须把 Arc 绑到外层变量,使其存活至下方 `referenced_names(cf)` 循环结束——&lc.cf 借用
+        // 源自此 Arc,若仅在 if/else 分支内持有则出块即 drop,借用悬垂。
+        let lc;
         let cf: &ClassFile = if let Some((real, module)) = class_path.load_class(&name)? {
             // 源容器为命名模块 → 标记类属该模块(Class.getModule 用)+ 回带完整 ModuleDescriptor
             // (4.14c:bootstrap 据其 exports 填 Module.exportedPackages,解锁反射访问检查)。
@@ -100,10 +104,11 @@ pub fn load_closure(
                     registry.set_module_descriptor(&m, desc);
                 }
             }
-            let lc = registry.load_or_replace(real)?;
+            lc = registry.load_or_replace(real)?;
             loaded += 1;
             &lc.cf
-        } else if let Some(lc) = registry.get(&name) {
+        } else if let Some(loaded_lc) = registry.get(&name) {
+            lc = loaded_lc;
             &lc.cf
         } else {
             continue;

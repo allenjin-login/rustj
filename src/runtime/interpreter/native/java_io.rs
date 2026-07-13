@@ -171,7 +171,7 @@ fn file_path_text(vm: &Vm, file_ref: Reference) -> Result<Option<String>, VmErro
         return Err(VmError::BadConstant("file_path_text:java/io/File 须预载"));
     };
     let Some(ord) = reg
-        .flattened_instance_fields(lc)
+        .flattened_instance_fields(&lc)
         .iter()
         .position(|f| f.name == "path")
  else {

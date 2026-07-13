@@ -131,7 +131,7 @@ fn read_executable_meta(
         let lc = reg
             .get(class_name)
             .ok_or(VmError::BadConstant("Executable 类未加载"))?;
-        let flat = reg.flattened_instance_fields(lc);
+        let flat = reg.flattened_instance_fields(&lc);
         let find = |n: &str| {
             flat.iter().position(|f| f.name == n)
                 .ok_or(VmError::BadConstant("Executable 缺 clazz/slot/modifiers 字段"))
@@ -209,7 +209,7 @@ fn unbox_arg(vm: &mut Vm, arg: Reference, param_type: &crate::metadata::descript
                 let lc = reg
                     .get(wrapper)
                     .ok_or(VmError::BadConstant("包装类未加载"))?;
-                reg.flattened_instance_fields(lc)
+                reg.flattened_instance_fields(&lc)
                     .iter()
                     .position(|f| f.name == "value")
                     .ok_or(VmError::BadConstant("包装类无 value 字段"))?
@@ -281,11 +281,11 @@ fn alloc_wrapper(vm: &mut Vm, wrapper: &str, value: Slot) -> Result<Reference, V
             .get(wrapper)
             .ok_or(VmError::BadConstant("包装类未加载"))?;
         let ord = reg
-            .flattened_instance_fields(lc)
+            .flattened_instance_fields(&lc)
             .iter()
             .position(|f| f.name == "value")
             .ok_or(VmError::BadConstant("包装类无 value 字段"))?;
-        let inst_ref = vm.heap_mut().alloc(Oop::Instance(reg.new_instance(lc)));
+        let inst_ref = vm.heap_mut().alloc(Oop::Instance(reg.new_instance(&lc)));
         (inst_ref, ord)
     };
     if let Some(Oop::Instance(i)) = vm.heap_mut().get_mut(inst_ref) {
@@ -348,7 +348,7 @@ fn wrap_in_invocation_target_exception(vm: &mut Vm, cause: Reference) -> VmError
             return VmError::ThrownException(ite);
         };
         let Some(ord) = reg
-            .flattened_instance_fields(lc)
+            .flattened_instance_fields(&lc)
             .iter()
             .position(|f| f.name == "target")
         else {
@@ -431,16 +431,15 @@ fn invoke_method_native(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     let reg = vm
         .registry()
         .ok_or(VmError::BadConstant("invoke0 需类注册表"))?;
-    let (target_lc, target_method) = if is_static {
+    let (target_lc, target_method_idx) = if is_static {
         let lc = reg
             .get(&internal)
             .ok_or(VmError::BadConstant("invoke0:声明类未加载"))?;
-        let m = lc
-            .cf
+        lc.cf
             .methods
             .get(slot)
             .ok_or(VmError::BadConstant("invoke0:slot 越界"))?;
-        (lc, m)
+        (lc, slot)
     } else {
         if receiver.is_null() {
             return Err(throw_exception(vm, "java/lang/NullPointerException"));
@@ -463,6 +462,7 @@ fn invoke_method_native(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
             None => return Err(throw_exception(vm, "java/lang/AbstractMethodError")),
         }
     };
+    let target_method = &target_lc.cf.methods[target_method_idx];
     let Some(code) = target_method.code.as_ref() else {
         return Err(throw_exception(vm, "java/lang/AbstractMethodError"));
     };
@@ -563,7 +563,7 @@ fn new_instance_native(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
         .ok_or(VmError::BadConstant("newInstance0:声明类未加载"))?;
     let new_inst = vm
         .heap_mut()
-        .alloc(Oop::Instance(reg.new_instance(lc)));
+        .alloc(Oop::Instance(reg.new_instance(&lc)));
     let init_method = lc
         .cf
         .methods
@@ -900,13 +900,13 @@ mod tests {
             let lc = reg
                 .get(class_name)
                 .unwrap_or_else(|| panic!("{class_name} 须加载"));
-            let flat = reg.flattened_instance_fields(lc);
+            let flat = reg.flattened_instance_fields(&lc);
             let find = |n: &str| {
                 flat.iter()
                     .position(|f| f.name == n)
                     .unwrap_or_else(|| panic!("{class_name} 缺 {n} 字段"))
             };
-            (reg.new_instance(lc), find("clazz"), find("slot"), find("modifiers"))
+            (reg.new_instance(&lc), find("clazz"), find("slot"), find("modifiers"))
         };
         let inst_ref = vm.heap_mut().alloc(Oop::Instance(inst));
         if let Some(Oop::Instance(i)) = vm.heap_mut().get_mut(inst_ref) {
@@ -925,11 +925,11 @@ mod tests {
                 .get(wrapper)
                 .unwrap_or_else(|| panic!("{wrapper} 须加载"));
             let ord = reg
-                .flattened_instance_fields(lc)
+                .flattened_instance_fields(&lc)
                 .iter()
                 .position(|f| f.name == "value")
                 .unwrap_or_else(|| panic!("{wrapper} 缺 value"));
-            (reg.new_instance(lc), ord)
+            (reg.new_instance(&lc), ord)
         };
         let inst_ref = vm.heap_mut().alloc(Oop::Instance(inst));
         if let Some(Oop::Instance(i)) = vm.heap_mut().get_mut(inst_ref) {
@@ -943,7 +943,7 @@ mod tests {
         let ord = {
             let reg = vm.registry().expect("注册表");
             let lc = reg.get(wrapper).expect("包装类须加载");
-            reg.flattened_instance_fields(lc)
+            reg.flattened_instance_fields(&lc)
                 .iter()
                 .position(|f| f.name == "value")
                 .expect("value 字段")
@@ -1127,7 +1127,7 @@ mod tests {
         let target_ord = {
             let reg = vm.registry().expect("注册表");
             let lc = reg.get("java/lang/reflect/InvocationTargetException").unwrap();
-            reg.flattened_instance_fields(lc)
+            reg.flattened_instance_fields(&lc)
                 .iter()
                 .position(|f| f.name == "target")
                 .expect("ITE.target 字段")

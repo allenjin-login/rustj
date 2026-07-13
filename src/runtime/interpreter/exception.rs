@@ -104,7 +104,7 @@ mod tests {
 
     fn sub_instance(reg: &ClassRegistry, vm: &mut Vm) -> Reference {
         let lc = reg.get("SubExc").unwrap();
-        vm.heap_mut().alloc(Oop::Instance(reg.new_instance(lc)))
+        vm.heap_mut().alloc(Oop::Instance(reg.new_instance(&lc)))
     }
 
     fn entry(start: u16, end: u16, handler: u16, catch_type: u16) -> ExceptionTableEntry {

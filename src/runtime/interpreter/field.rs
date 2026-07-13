@@ -145,7 +145,7 @@ pub(super) fn new_instance(
     let lc = registry
         .get(&class_name)
         .ok_or(VmError::BadConstant("new 目标类未加载"))?;
-    let oop = Oop::Instance(registry.new_instance(lc));
+    let oop = Oop::Instance(registry.new_instance(&lc));
     let reference = vm.heap_mut().alloc(oop);
     frame.operands.push_reference(reference)?;
     Ok(())
@@ -167,7 +167,7 @@ pub(super) fn get_field(
         .get(&class_name)
         .ok_or(VmError::BadConstant("目标类未加载"))?;
     let ordinal = registry
-        .instance_field(lc, &field_name, &ft)
+        .instance_field(&lc, &field_name, &ft)
         .ok_or(VmError::BadConstant("getfield 未找到实例字段"))?;
 
     let objref = frame.operands.pop_reference()?;
@@ -206,7 +206,7 @@ pub(super) fn put_field(
         .get(&class_name)
         .ok_or(VmError::BadConstant("目标类未加载"))?;
     let ordinal = registry
-        .instance_field(lc, &field_name, &ft)
+        .instance_field(&lc, &field_name, &ft)
         .ok_or(VmError::BadConstant("putfield 未找到实例字段"))?;
 
     let value = pop_field_value(frame, &ft)?;

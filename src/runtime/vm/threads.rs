@@ -78,7 +78,7 @@ impl Vm {
             let Some(lc) = reg.get("java/lang/Thread") else {
                 return Reference::null();
             };
-            reg.new_instance(lc)
+            reg.new_instance(&lc)
         };
         let r = self.heap_mut().alloc(Oop::Instance(inst));
         if r.is_null() {
@@ -120,7 +120,7 @@ impl Vm {
             let Some(lc) = reg.get("java/lang/ThreadGroup") else {
                 return Reference::null();
             };
-            reg.new_instance(lc)
+            reg.new_instance(&lc)
         };
         let r = self.heap_mut().alloc(Oop::Instance(inst));
         if r.is_null() {
@@ -151,7 +151,7 @@ impl Vm {
             let Some(lc) = reg.get("java/lang/Thread$FieldHolder") else {
                 return;
             };
-            let inst = reg.new_instance(lc);
+            let inst = reg.new_instance(&lc);
             self.heap_mut().alloc(Oop::Instance(inst))
         };
         if holder.is_null() {
@@ -296,7 +296,7 @@ impl Vm {
         let reg = self
             .registry()
             .ok_or(VmError::BadConstant("start0 须类注册表"))?;
-        let (target_lc, target_method) = match reg.resolve_dispatch(&runtime_class, "run", "()V") {
+        let (target_lc, target_method_idx) = match reg.resolve_dispatch(&runtime_class, "run", "()V") {
             Some(x) => x,
             None => {
                 return Err(crate::runtime::interpreter::throw_exception(
@@ -305,6 +305,7 @@ impl Vm {
                 ))
             }
         };
+        let target_method = &target_lc.cf.methods[target_method_idx];
         let Some(code) = target_method.code.as_ref() else {
             return Err(crate::runtime::interpreter::throw_exception(
                 self,
@@ -499,11 +500,12 @@ impl Vm {
         let reg = self
             .registry()
             .ok_or(VmError::BadConstant("dispatchUncaught 须类注册表"))?;
-        let Some((target_lc, target_method)) =
+        let Some((target_lc, target_method_idx)) =
             reg.resolve_dispatch(&runtime_class, "dispatchUncaughtException", "(Ljava/lang/Throwable;)V")
         else {
             return Err(VmError::BadConstant("未解析 dispatchUncaughtException"));
         };
+        let target_method = &target_lc.cf.methods[target_method_idx];
         let Some(code) = target_method.code.as_ref() else {
             return Err(VmError::BadConstant("dispatchUncaughtException 无 Code"));
         };

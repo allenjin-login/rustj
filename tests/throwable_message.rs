@@ -111,7 +111,7 @@ public class Tm {
 fn run_int(vm: &mut Vm, name: &str) -> i32 {
     let reg = vm.registry().expect("Tm 须已加载");
     let lc = reg.get("Tm").expect("Tm 须已加载");
-    let m = find_method(lc, name, "()I");
+    let m = find_method(&lc, name, "()I");
     let code = m.code.as_ref().expect("{name} 须有 Code");
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
@@ -160,9 +160,9 @@ fn get_message_and_get_cause_via_real_fields() {
 
     // 3) getMessage/getCause 须为真字节码(非 native)——证字段回读走真字节码。
     let thr = registry.get("java/lang/Throwable").unwrap();
-    let gm = find_method(thr, "getMessage", "()Ljava/lang/String;");
+    let gm = find_method(&thr, "getMessage", "()Ljava/lang/String;");
     assert!(!gm.access_flags.is_native(), "Throwable.getMessage 须为真字节码");
-    let gc = find_method(thr, "getCause", "()Ljava/lang/Throwable;");
+    let gc = find_method(&thr, "getCause", "()Ljava/lang/Throwable;");
     assert!(!gc.access_flags.is_native(), "Throwable.getCause 须为真字节码");
 
     let mut vm = Vm::new(registry);

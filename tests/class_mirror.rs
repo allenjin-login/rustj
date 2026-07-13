@@ -97,7 +97,7 @@ public class Cm {
 fn run_int(vm: &mut Vm, name: &str) -> i32 {
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("Cm").expect("Cm 须已加载");
-    let m = find_method(lc, name, "()I");
+    let m = find_method(&lc, name, "()I");
     let code = m.code.as_ref().expect("{name} 须有 Code");
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)

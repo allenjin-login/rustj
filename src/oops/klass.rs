@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::classfile::ClassFileError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
@@ -150,7 +150,15 @@ struct FieldLayout {
 
 /// 类注册表:按内部名索引的已加载类。
 pub struct ClassRegistry {
-    classes: HashMap<String, LoadedClass>,
+    /// 静态表(setup 期 `load`/`load_or_replace`/`load_stub` 经 `&mut self` 填充;普通 `&self`
+    /// 读,无锁)。值为 `Arc<LoadedClass>` 使 `get()` 返**owned `Arc`**(见 [`Self::get`])。
+    classes: HashMap<String, Arc<LoadedClass>>,
+    /// 运行时定义的类(`define_class`,移植 `JVM_LookupDefineClass`)。与 `classes` 分离:
+    /// `classes` setup 期填(无锁读);`runtime_classes` 运行期 `define_class(&self)` append
+    ///(`Mutex` 内部可变性——这是「`&self` 读 + `&self` 写」无 unsafe 的唯一安全解)。
+    /// `get()` 两表合并查(先静后动),故 `find_virtual_method`/`resolve_dispatch` 等经 `get()`
+    /// 的解析路径自然命中运行时类。对应物种类生成(ClassSpecializer.defineClass)。
+    runtime_classes: Mutex<HashMap<String, Arc<LoadedClass>>>,
     /// 类内部名 → 所属模块名(由 `load_closure` 据「源容器模块」标记;`Class.getModule()` 用)。
     /// `None`(未标记)= 无名模块。`Mutex` 内部可变:注册表以不可变借用暴露,经此写回
     /// (CLAUDE.md §6 类级可变状态惯例,同 `static_storage`);`Mutex`(替 `RefCell`)使其 `Sync`
@@ -166,6 +174,7 @@ impl ClassRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             classes: HashMap::new(),
+            runtime_classes: Mutex::new(HashMap::new()),
             class_modules: Mutex::new(HashMap::new()),
             module_descriptors: Mutex::new(HashMap::new()),
         };
@@ -175,45 +184,77 @@ impl ClassRegistry {
         reg
     }
 
-    /// 加载(解析字段布局)并按 `this_class_name` 注册;返回已注册类的引用。
-    pub fn load(&mut self, cf: ClassFile) -> Result<&LoadedClass, ClassFileError> {
+    /// 加载(解析字段布局)并按 `this_class_name` 注册;返回该类的 `Arc<LoadedClass>`(owned,
+    /// 调用方与注册表共享同一 `Arc`)。setup 期 `&mut self` 填静态表 `classes`。
+    pub fn load(&mut self, cf: ClassFile) -> Result<Arc<LoadedClass>, ClassFileError> {
         let name = cf
             .this_class_name()
             .ok_or(ClassFileError::Unsupported("类缺少 this_class 名"))?
             .to_string();
-        let lc = LoadedClass::from_cf(cf)?;
-        Ok(self.classes.entry(name).or_insert(lc))
+        let lc = Arc::new(LoadedClass::from_cf(cf)?);
+        Ok(self.classes.entry(name).or_insert(lc).clone())
     }
 
     /// 加载并**覆盖**同名已注册类(`load` 首胜;此末胜)。用于以真类(从容器加载)退役
     /// 合成引导桩:同名的合成桩被真 `ClassFile` 取而代之。对应北极星"退役 Stage A 桩"。
-    pub fn load_or_replace(&mut self, cf: ClassFile) -> Result<&LoadedClass, ClassFileError> {
+    pub fn load_or_replace(&mut self, cf: ClassFile) -> Result<Arc<LoadedClass>, ClassFileError> {
         let name = cf
             .this_class_name()
             .ok_or(ClassFileError::Unsupported("类缺少 this_class 名"))?
             .to_string();
-        let lc = LoadedClass::from_cf(cf)?;
-        self.classes.insert(name.clone(), lc);
-        Ok(self.classes.get(&name).expect("刚插入"))
+        let lc = Arc::new(LoadedClass::from_cf(cf)?);
+        self.classes.insert(name, Arc::clone(&lc));
+        Ok(lc)
     }
 
     /// 加载并标记为**合成引导桩**([`super::bootstrap::install_bootstrap`] 用)。语义同 [`load`]
     /// (首胜),但置 `is_synthetic_stub = true`。供闭包加载器
     /// [`load_closure`](crate::runtime::class_loader::loader::load_closure) 识别「待真类覆盖」的桩
     /// 并跳过已是真类者(使二次调用幂等)。
-    pub fn load_stub(&mut self, cf: ClassFile) -> Result<&LoadedClass, ClassFileError> {
+    pub fn load_stub(&mut self, cf: ClassFile) -> Result<Arc<LoadedClass>, ClassFileError> {
         let name = cf
             .this_class_name()
             .ok_or(ClassFileError::Unsupported("类缺少 this_class 名"))?
             .to_string();
         let mut lc = LoadedClass::from_cf(cf)?;
         lc.is_synthetic_stub = true;
-        Ok(self.classes.entry(name).or_insert(lc))
+        Ok(self.classes.entry(name).or_insert(Arc::new(lc)).clone())
     }
 
-    /// 按内部名取已加载类。
-    pub fn get(&self, name: &str) -> Option<&LoadedClass> {
-        self.classes.get(name)
+    /// 按内部名取已加载类(owned `Arc<LoadedClass>`)。合并查**静态表**(`classes`,setup 期填、
+    /// 无锁)与**运行时表**(`runtime_classes`,运行期 `define_class` append、`Mutex`);先静后动。
+    /// 返 owned `Arc` 而非 `&LoadedClass`:运行时表经 `Mutex` 守卫,无法返 `&'a self` 绑定的借用
+    ///(`MutexGuard` 不能跨方法返回);`Arc` clone 解耦调用方与 `&mut Vm`(§6 NLL trick 由此简化:
+    /// 持 `lc: Arc<LoadedClass>` 同时 `&mut vm` 平凡成立)。每次调用 `Arc` 原子 inc/dec,可接受。
+    pub fn get(&self, name: &str) -> Option<Arc<LoadedClass>> {
+        if let Some(arc) = self.classes.get(name) {
+            return Some(Arc::clone(arc));
+        }
+        self.runtime_classes.lock().unwrap().get(name).cloned()
+    }
+
+    /// 运行时定义一个类(移植 `JVM_LookupDefineClass` / `jvm_lookup_define_class`
+    /// [src/hotspot/share/prims/jvm.cpp:914]):解析 `cf` 为 `LoadedClass` 并注册到**运行时表**
+    /// (`runtime_classes`),使后续 `get()`/`find_virtual_method`/`resolve_dispatch` 等解析路径
+    /// (经 `get()` 两表合并查询)能命中。与 `load`(setup 期、`&mut self`、首胜、静态表)互补:
+    /// 本法 `&self`(运行期无 `&mut registry`),靠 `Mutex` 内部可变性 append。返回该类 `Arc`。
+    /// **首胜**:若类已在静态或运行时表(`get()` 命中),返已有 Arc 而非重定义(rustj 宽容;
+    /// HotSpot 对重复定义抛 `LinkageError "attempted duplicate class definition"`)。物种类
+    /// (`BoundMethodHandle$Species_*`)生成不会重复 defineClass 同一键。
+    pub fn define_class(&self, cf: ClassFile) -> Result<Arc<LoadedClass>, ClassFileError> {
+        let name = cf
+            .this_class_name()
+            .ok_or(ClassFileError::Unsupported("类缺少 this_class 名"))?
+            .to_string();
+        if let Some(existing) = self.get(&name) {
+            return Ok(existing);
+        }
+        let lc = Arc::new(LoadedClass::from_cf(cf)?);
+        self.runtime_classes
+            .lock()
+            .unwrap()
+            .insert(name, Arc::clone(&lc));
+        Ok(lc)
     }
 
     /// 标记一个类所属的**命名模块**(由 `load_closure` 据源容器的 `module-info` 推导)。
@@ -276,7 +317,7 @@ impl ClassRegistry {
             && super_name.as_str() != "java/lang/Object"
             && let Some(super_lc) = self.get(super_name)
         {
-            fields.extend(self.flattened_instance_fields(super_lc));
+            fields.extend(self.flattened_instance_fields(&super_lc));
         }
         fields.extend(lc.instance_fields.iter().cloned());
         *lc.flat_cache.lock().unwrap() = Some(fields.clone());
@@ -303,13 +344,14 @@ impl ClassRegistry {
 
     /// 沿超类链找静态字段的**(声明类, 序号)**。getstatic/putstatic 解析:Fieldref 的类
     /// 可能指向继承该字段的子类(javac 对继承静态字段如此编码),故须上行找到真正声明、
-    /// 持有 `static_storage` 的类。接口静态字段不沿此路径(顺延)。
-    pub fn resolve_static_field<'a>(
-        &'a self,
+    /// 持有 `static_storage` 的类。接口静态字段不沿此路径(顺延)。声明类返 owned `Arc`
+    ///(`get()` 现 owned;调用方持 Arc 同时访问 `&mut vm` 平凡成立)。
+    pub fn resolve_static_field(
+        &self,
         class_name: &str,
         name: &str,
         ft: &FieldType,
-    ) -> Option<(&'a LoadedClass, usize)> {
+    ) -> Option<(Arc<LoadedClass>, usize)> {
         let mut cur = self.get(class_name);
         while let Some(lc) = cur {
             if let Some(ord) = lc.static_field(name, ft) {
@@ -320,58 +362,60 @@ impl ClassRegistry {
         None
     }
 
-    /// 虚分派:从 `class_name` 沿超类链找首个 (name, desc) 方法 → (声明类, 方法)。
+    /// 虚分派:从 `class_name` 沿超类链找首个 (name, desc) 方法 → (声明类, 方法在 `cf.methods`
+    /// 的下标)。声明类返 owned `Arc`,方法下标由调用方经 `&lc.cf.methods[idx]` 再取(`lc: Arc`
+    /// 持有数据,借用其 methods 平凡合法——owned Arc 解耦,无需 `&'a self` 绑定)。
     ///
     /// 对应 HotSpot `InstanceKlass::find_method` 上行查找(我们用线性查找,不用 vtable)。
     /// 链**含 `java/lang/Object`**:子类实例上未覆写的 `getClass`/`hashCode`/`toString`/
     /// `equals` 等须解析到 `Object` 的声明法(真 Object 有这些 native;引导桩仅有 `<init>`,
     /// 走进去也匹配不到 → 返 None,与旧短路等价,故对桩无害)。
-    pub fn find_virtual_method<'a>(
-        &'a self,
+    pub fn find_virtual_method(
+        &self,
         class_name: &str,
         name: &str,
         desc: &str,
-    ) -> Option<(&'a LoadedClass, &'a MethodInfo)> {
+    ) -> Option<(Arc<LoadedClass>, usize)> {
         let mut current = self.get(class_name);
         while let Some(lc) = current {
-            if let Some(m) = lc
+            if let Some(idx) = lc
                 .cf
                 .methods
                 .iter()
-                .find(|m| method_matches(&lc.cf, m, name, desc))
+                .position(|m| method_matches(&lc.cf, m, name, desc))
             {
-                return Some((lc, m));
+                return Some((lc, idx));
             }
             current = lc.super_class_name.as_deref().and_then(|s| self.get(s));
         }
         None
     }
 
-    /// 在 `class_name`(单类,非链)内精确查找 (name, desc) 方法 → (类, 方法)。
-    /// 用于 invokespecial 的私有精确判定与 super 虚查起点。
-    pub fn find_exact_method<'a>(
-        &'a self,
+    /// 在 `class_name`(单类,非链)内精确查找 (name, desc) 方法 → (类, 方法下标)。
+    /// 用于 invokespecial 的私有精确判定与 super 虚查起点。声明类返 owned `Arc`。
+    pub fn find_exact_method(
+        &self,
         class_name: &str,
         name: &str,
         desc: &str,
-    ) -> Option<(&'a LoadedClass, &'a MethodInfo)> {
+    ) -> Option<(Arc<LoadedClass>, usize)> {
         let lc = self.get(class_name)?;
         lc.cf
             .methods
             .iter()
-            .find(|m| method_matches(&lc.cf, m, name, desc))
-            .map(|m| (lc, m))
+            .position(|m| method_matches(&lc.cf, m, name, desc))
+            .map(|idx| (lc, idx))
     }
 
     /// 接口 default 方法查找:沿 `class_name` 类层次所有传递实现接口 BFS,
-    /// 找首个**带 Code** 的 (name, desc) → (声明接口类, 方法)。
-    /// 类链已由调用方查过;此仅兜底 default(抽象方法跳过,继续搜索)。
-    pub fn find_default_method<'a>(
-        &'a self,
+    /// 找首个**带 Code** 的 (name, desc) → (声明接口类, 方法下标)。
+    /// 类链已由调用方查过;此仅兜底 default(抽象方法跳过,继续搜索)。声明类返 owned `Arc`。
+    pub fn find_default_method(
+        &self,
         class_name: &str,
         name: &str,
         desc: &str,
-    ) -> Option<(&'a LoadedClass, &'a MethodInfo)> {
+    ) -> Option<(Arc<LoadedClass>, usize)> {
         let mut queue: VecDeque<String> = VecDeque::new();
         let mut visited: HashSet<String> = HashSet::new();
         // 种子:`class_name` 及其超类链上每类的直接接口。
@@ -390,13 +434,13 @@ impl ClassRegistry {
         // BFS 接口闭包,跳过抽象,命中带 Code 的 default。
         while let Some(iface_name) = queue.pop_front() {
             if let Some(iface_lc) = self.get(&iface_name) {
-                if let Some(m) = iface_lc
+                if let Some(idx) = iface_lc
                     .cf
                     .methods
                     .iter()
-                    .find(|m| method_matches(&iface_lc.cf, m, name, desc) && m.code.is_some())
+                    .position(|m| method_matches(&iface_lc.cf, m, name, desc) && m.code.is_some())
                 {
-                    return Some((iface_lc, m));
+                    return Some((iface_lc, idx));
                 }
                 for super_iface in iface_lc.interface_names() {
                     if visited.insert(super_iface.clone()) {
@@ -454,13 +498,13 @@ impl ClassRegistry {
 
     /// 虚/接口分派解析:类链先行(`find_virtual_method`),落空走接口 default
     /// (`find_default_method`)。命中抽象类方法(无 Code)时仍返回(由调用方判
-    /// `AbstractMethodError`);default 路径必带 Code。
-    pub fn resolve_dispatch<'a>(
-        &'a self,
+    /// `AbstractMethodError`);default 路径必带 Code。返 (声明类 `Arc`, 方法下标)。
+    pub fn resolve_dispatch(
+        &self,
         class_name: &str,
         name: &str,
         desc: &str,
-    ) -> Option<(&'a LoadedClass, &'a MethodInfo)> {
+    ) -> Option<(Arc<LoadedClass>, usize)> {
         if let Some(hit) = self.find_virtual_method(class_name, name, desc) {
             return Some(hit);
         }
@@ -803,5 +847,23 @@ mod tests {
         let reg = checkcast_hierarchy();
         assert!(reg.is_instance("[I", "java/lang/Object"));
         assert!(!reg.is_instance("[I", "Shape"));
+    }
+
+    /// Phase G.1a:运行时定义的类(经 `define_class`,移植 `JVM_LookupDefineClass`)须经 `get()`
+    /// 命中——`get()` 合并查静态表(`classes`)与运行时表(`runtime_classes`)。这是 native
+    /// `defineClass0` 把物种类字节注册后,后续 `new`/`invokevirtual`/字段访问能解析到该类的前提。
+    #[test]
+    fn runtime_defined_class_is_lookupable_via_get() {
+        // 运行时定义的类 "R"(从未 `load` 入静态表)。
+        let pool = mk_cp(&["R", "java/lang/Object"], &[1, 2]);
+        let cf = mk_cf(pool, 3, 4, vec![], vec![]);
+        let reg = ClassRegistry::new(); // 仅 `&self`(模拟运行期:无 `&mut`)
+        let arc = reg.define_class(cf).expect("define_class 应成功");
+        assert_eq!(arc.name(), "R");
+        // get() 须经运行时表命中。
+        let got = reg.get("R").expect("get 应命中运行时定义的类");
+        assert_eq!(got.name(), "R");
+        // 静态/运行时表均无 → None。
+        assert!(reg.get("Nope").is_none());
     }
 }

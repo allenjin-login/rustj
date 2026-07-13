@@ -140,7 +140,7 @@ fn read_field_meta(vm: &Vm, fld: Reference) -> Result<(Reference, i32), VmError>
         let lc = reg
             .get("java/lang/reflect/Field")
             .ok_or(VmError::BadConstant("Field 类未加载"))?;
-        let flat = reg.flattened_instance_fields(lc);
+        let flat = reg.flattened_instance_fields(&lc);
         let find = |n: &str| {
             flat.iter()
                 .position(|f| f.name == n)

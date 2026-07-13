@@ -224,7 +224,7 @@ fn access_instance_field(
         let lc = reg
             .get(declaring)
             .ok_or(VmError::BadConstant("MH 钩子:声明类未加载"))?;
-        reg.flattened_instance_fields(lc)
+        reg.flattened_instance_fields(&lc)
             .iter()
             .position(|f| f.name == field_name)
             .ok_or(VmError::BadConstant("MH 钩子:实例字段未找到"))?
@@ -483,6 +483,15 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> Result<&'a Meth
         .ok_or(VmError::BadConstant("invokestatic 未找到目标方法"))
 }
 
+/// 同 [`find_method`] 但返回方法在 `cf.methods` 中的下标(供返回 `Arc<LoadedClass>` 的解析路径
+/// 解构为 `(Arc, usize)` 后再下标取 `&MethodInfo`,避免自引用元组)。
+fn find_method_index(cf: &ClassFile, name: &str, desc: &str) -> Result<usize, VmError> {
+    cf.methods
+        .iter()
+        .position(|m| method_matches(cf, m, name, desc))
+        .ok_or(VmError::BadConstant("invokestatic 未找到目标方法"))
+}
+
 /// 方法名与描述符是否同时匹配。
 fn method_matches(cf: &ClassFile, m: &MethodInfo, name: &str, desc: &str) -> bool {
     let name_ok = matches!(
@@ -719,13 +728,13 @@ fn dispatch_lambda(
             .ok_or(VmError::BadConstant("lambda 构造器无 Code"))?;
         let new_ref = vm
             .heap_mut()
-            .alloc(Oop::Instance(registry.new_instance(target_lc)));
+            .alloc(Oop::Instance(registry.new_instance(&target_lc)));
         return match run_callee(
             interp,
             frame,
             vm,
             caller_pc,
-            target_lc,
+            &target_lc,
             target_method,
             code,
             Some(new_ref),
@@ -744,8 +753,10 @@ fn dispatch_lambda(
         };
     }
 
-    // (objref, 实现形参, 目标类, 目标方法):实例引用剥首位接收者 + 按其类虚分派。
-    let (objref, impl_args, target_lc, target_method) = if instance_ref {
+    // (objref, 实现形参, 目标类, 目标方法下标):实例引用剥首位接收者 + 按其类虚分派。
+    // 元组用 `(Arc, usize)` 而非 `(Arc, &MethodInfo)`——后者 `&MethodInfo` 借自 `Arc` 自引用,
+    // 无法与 `Arc` 同存于元组(move 出 Arc 即悬垂)。下标在块外统一取 `&MethodInfo`。
+    let (objref, impl_args, target_lc, target_method_idx) = if instance_ref {
         let first = combined
             .first()
             .copied()
@@ -758,17 +769,18 @@ fn dispatch_lambda(
             Some(Oop::Instance(i)) => i.class_name().to_string(),
             _ => return Err(VmError::BadConstant("实例方法引用接收者须为实例")),
         };
-        let (lc, m) = registry
+        let (lc, idx) = registry
             .resolve_dispatch(&recv_class, &impl_name, &impl_desc)
             .ok_or(VmError::BadConstant("lambda 实例方法引用未解析到方法(抽象?)"))?;
-        (Some(recv), combined, lc, m)
+        (Some(recv), combined, lc, idx)
     } else {
         let lc = registry
             .get(&impl_class)
             .ok_or(VmError::BadConstant("lambda 实现类未加载"))?;
-        let m = find_method(&lc.cf, &impl_name, &impl_desc)?;
-        (None, combined, lc, m)
+        let idx = find_method_index(&lc.cf, &impl_name, &impl_desc)?;
+        (None, combined, lc, idx)
     };
+    let target_method = &target_lc.cf.methods[target_method_idx];
 
     // 实现为 native(方法引用到 native,如 Object::hashCode)→ 内置 native 分派。
     if target_method.access_flags.is_native() {
@@ -781,7 +793,7 @@ fn dispatch_lambda(
         .code
         .as_ref()
         .ok_or(VmError::BadConstant("lambda 实现方法无 Code(抽象)"))?;
-    run_callee(interp, frame, vm, caller_pc, target_lc, target_method, code, objref, impl_args, return_type)
+    run_callee(interp, frame, vm, caller_pc, &target_lc, target_method, code, objref, impl_args, return_type)
 }
 
 /// `Value → Arg`(闭包捕获还原为实参)。void 不可能是捕获值。
@@ -1068,7 +1080,7 @@ pub(super) fn invoke_static(
         frame,
         vm,
         caller_pc,
-        target_lc,
+        &target_lc,
         target_method,
         code,
         None,
@@ -1104,7 +1116,7 @@ pub(super) fn invoke_special(
     //   <init> → 声明类精确(未加载根类 ()V → 空操作,沿用 4.1);
     //   私有   → 声明类精确(私有不可继承,无需虚查);
     //   其余   → super 虚查(声明类 = 调用者直接超类,上行)。
-    let (target_lc, target_method) = if method_name == "<init>" {
+    let (target_lc, target_method_idx) = if method_name == "<init>" {
         match registry.get(&class_name) {
             None => {
                 // 未加载类(根类 java/lang/Object 等):仅放行 <init>()V 空构造器。
@@ -1113,16 +1125,20 @@ pub(super) fn invoke_special(
                 }
                 return Err(VmError::BadConstant("invokespecial 目标类未加载"));
             }
-            Some(lc) => (lc, find_method(&lc.cf, &method_name, &desc)?),
+            Some(lc) => {
+                let idx = find_method_index(&lc.cf, &method_name, &desc)?;
+                (lc, idx)
+            }
         }
     } else {
         match registry.find_exact_method(&class_name, &method_name, &desc) {
-            Some((lc, m)) if m.access_flags.is_private() => (lc, m),
+            Some((lc, idx)) if lc.cf.methods[idx].access_flags.is_private() => (lc, idx),
             _ => registry
                 .find_virtual_method(&class_name, &method_name, &desc)
                 .ok_or(VmError::BadConstant("invokespecial 未找到目标方法"))?,
         }
     };
+    let target_method = &target_lc.cf.methods[target_method_idx];
     // ACC_NATIVE → 内置 native 分派表(声明类 = 解析到的目标类)。
     if target_method.access_flags.is_native() {
         return dispatch_native(
@@ -1149,7 +1165,7 @@ pub(super) fn invoke_special(
         frame,
         vm,
         caller_pc,
-        target_lc,
+        &target_lc,
         target_method,
         code,
         Some(objref),
@@ -1210,12 +1226,13 @@ pub(super) fn invoke_virtual(
         .ok_or(VmError::BadConstant("invokevirtual 需要类注册表"))?;
     // 类链先行,落空走接口 default(Java 8+ 类类型调用 default 亦走此路);
     // 命中抽象方法 → AbstractMethodError。
-    let (target_lc, target_method) = match registry
+    let (target_lc, target_method_idx) = match registry
         .resolve_dispatch(&runtime_class, &method_name, &desc)
     {
         Some(x) => x,
         None => return Err(throw_exception(vm, "java/lang/AbstractMethodError")),
     };
+    let target_method = &target_lc.cf.methods[target_method_idx];
     // ACC_NATIVE → 内置 native 分派表(Object.hashCode 等虚方法 native 经此)。
     if target_method.access_flags.is_native() {
         return dispatch_native(
@@ -1241,7 +1258,7 @@ pub(super) fn invoke_virtual(
         frame,
         vm,
         caller_pc,
-        target_lc,
+        &target_lc,
         target_method,
         code,
         Some(objref),
@@ -1298,12 +1315,13 @@ pub(super) fn invoke_interface(
         .registry()
         .ok_or(VmError::BadConstant("invokeinterface 需要类注册表"))?;
     // 类链先行,落空走接口 default;命中抽象方法 → AbstractMethodError。
-    let (target_lc, target_method) = match registry
+    let (target_lc, target_method_idx) = match registry
         .resolve_dispatch(&runtime_class, &method_name, &desc)
     {
         Some(x) => x,
         None => return Err(throw_exception(vm, "java/lang/AbstractMethodError")),
     };
+    let target_method = &target_lc.cf.methods[target_method_idx];
     // ACC_NATIVE → 内置 native 分派表。
     if target_method.access_flags.is_native() {
         return dispatch_native(
@@ -1329,7 +1347,7 @@ pub(super) fn invoke_interface(
         frame,
         vm,
         caller_pc,
-        target_lc,
+        &target_lc,
         target_method,
         code,
         Some(objref),

@@ -177,8 +177,8 @@ pub fn ensure_class_initialized(
     }
     // 准备阶段:应用 `ConstantValue` 属性(JVMS §4.7.2 / §5.4.2)——`static` 字段的常量初值。
     // 须在 `<clinit>` 前:常量字段若有 putstatic 会再覆盖;String 常量需 `Vm` intern(仅 init 期可得)。
-    apply_constant_values(vm, lc);
-    match run_clinit(lc, vm) {
+    apply_constant_values(vm, &lc);
+    match run_clinit(&lc, vm) {
         Ok(()) => {
             lc.set_init_state(InitState::Done);
             Ok(())

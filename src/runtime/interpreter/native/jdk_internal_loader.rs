@@ -100,7 +100,7 @@ fn instance_class_name(vm: &Vm, r: Reference) -> Option<String> {
 fn named_field_ord(vm: &Vm, class_name: &str, field_name: &str) -> Option<usize> {
     vm.registry().and_then(|reg| {
         reg.get(class_name).and_then(|lc| {
-            reg.flattened_instance_fields(lc)
+            reg.flattened_instance_fields(&lc)
                 .iter()
                 .position(|f| f.name == field_name)
         })
@@ -254,7 +254,7 @@ mod tests {
             let lc = reg
                 .get("jdk/internal/loader/NativeLibraries$NativeLibraryImpl")
                 .expect("NativeLibraryImpl 须已加载");
-            reg.new_instance(lc)
+            reg.new_instance(&lc)
         };
         vm.heap_mut().alloc(Oop::Instance(inst))
     }

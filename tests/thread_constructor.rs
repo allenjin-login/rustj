@@ -169,7 +169,7 @@ fn thread_constructor_end_to_end() {
     // 3) 分配 Probe 实例(makeThread 的入参;fieldless,不跑 <init> 无碍)。
     let probe = {
         let lc = registry.get("Probe").unwrap();
-        let inst = registry.new_instance(lc);
+        let inst = registry.new_instance(&lc);
         vm.heap_mut().alloc(Oop::Instance(inst))
     };
 

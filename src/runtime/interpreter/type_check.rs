@@ -186,7 +186,7 @@ mod tests {
         let square_lc = reg.get("Square").unwrap();
         let inst = vm
             .heap_mut()
-            .alloc(Oop::Instance(reg.new_instance(square_lc)));
+            .alloc(Oop::Instance(reg.new_instance(&square_lc)));
         let code = [
             Opcode::Aload0 as u8,
             Opcode::Instanceof as u8,
@@ -231,7 +231,7 @@ mod tests {
         let square_lc = reg.get("Square").unwrap();
         let inst = vm
             .heap_mut()
-            .alloc(Oop::Instance(reg.new_instance(square_lc)));
+            .alloc(Oop::Instance(reg.new_instance(&square_lc)));
         let code = [
             Opcode::Aload0 as u8,
             Opcode::Checkcast as u8,
@@ -257,7 +257,7 @@ mod tests {
         let square_lc = reg.get("Square").unwrap();
         let inst = vm
             .heap_mut()
-            .alloc(Oop::Instance(reg.new_instance(square_lc)));
+            .alloc(Oop::Instance(reg.new_instance(&square_lc)));
         // checkcast 自身类通过(objectref 保留、不抛);失败用例留给集成闸门(同级类 Rect)。
         let code = [
             Opcode::Aload0 as u8,

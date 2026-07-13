@@ -384,7 +384,7 @@ fn object_field_offset(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     // 借注册表(§6:'a 不绑 &self)查扁平布局序号;不触堆,出块即释放。
     let ord = vm.registry().and_then(|reg| {
         reg.get(&internal).and_then(|lc| {
-            reg.flattened_instance_fields(lc)
+            reg.flattened_instance_fields(&lc)
                 .iter()
                 .position(|f| f.name == field_name)
         })
@@ -700,7 +700,7 @@ mod tests {
         let inst_ref = {
             let reg = vm.registry().expect("须注册表");
             let lc = reg.get("java/lang/Integer").expect("Integer 须加载");
-            let inst = reg.new_instance(lc);
+            let inst = reg.new_instance(&lc);
             vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
         };
 
@@ -923,7 +923,7 @@ mod tests {
         let inst_ref = {
             let reg = vm.registry().expect("须注册表");
             let lc = reg.get("java/lang/Integer").expect("Integer 须加载");
-            let inst = reg.new_instance(lc);
+            let inst = reg.new_instance(&lc);
             vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
         };
 
@@ -1002,7 +1002,7 @@ mod tests {
         let inst_ref = {
             let reg = vm.registry().expect("须注册表");
             let lc = reg.get("java/lang/Long").expect("Long 须加载");
-            let inst = reg.new_instance(lc);
+            let inst = reg.new_instance(&lc);
             vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
         };
 
@@ -1087,7 +1087,7 @@ mod tests {
         let inst_ref = {
             let reg = vm.registry().expect("须注册表");
             let lc = reg.get("java/lang/Integer").expect("Integer 须加载");
-            let inst = reg.new_instance(lc);
+            let inst = reg.new_instance(&lc);
             vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
         };
         let int_mirror = vm.intern_class_mirror("java/lang/Integer");

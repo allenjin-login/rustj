@@ -54,7 +54,7 @@ impl Vm {
         let Some(class_lc) = reg.get("java/lang/Class") else {
             return Reference::null();
         };
-        let inst = reg.new_instance(class_lc);
+        let inst = reg.new_instance(&class_lc);
         self.shared.heap.lock().unwrap().alloc(Oop::Instance(inst))
     }
 
@@ -94,7 +94,7 @@ impl Vm {
         let Some(reg) = self.registry() else { return };
         let Some(lc) = reg.get(declaring_class) else { return };
         let Some(ord) = reg
-            .flattened_instance_fields(lc)
+            .flattened_instance_fields(&lc)
             .iter()
             .position(|f| f.name == field_name)
         else {
@@ -117,7 +117,7 @@ impl Vm {
         let reg = self.registry()?;
         let lc = reg.get(declaring_class)?;
         let ord = reg
-            .flattened_instance_fields(lc)
+            .flattened_instance_fields(&lc)
             .iter()
             .position(|f| f.name == field_name)?;
         let heap = self.shared.heap.lock().unwrap();
@@ -141,7 +141,7 @@ impl Vm {
         let reg = self.registry()?;
         let lc = reg.get(declaring_class)?;
         let ord = reg
-            .flattened_instance_fields(lc)
+            .flattened_instance_fields(&lc)
             .iter()
             .position(|f| f.name == field_name)?;
         let heap = self.shared.heap.lock().unwrap();
@@ -164,7 +164,7 @@ impl Vm {
         let Some(lc) = reg.get("java/lang/Module") else {
             return Reference::null();
         };
-        let inst = reg.new_instance(lc);
+        let inst = reg.new_instance(&lc);
         self.shared.heap.lock().unwrap().alloc(Oop::Instance(inst))
     }
 

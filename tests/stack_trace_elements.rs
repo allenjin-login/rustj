@@ -103,7 +103,7 @@ public class St {
 fn run_top(vm: &mut Vm) -> Reference {
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("St").expect("St 须已加载");
-    let m = find_method(lc, "top", "()I");
+    let m = find_method(&lc, "top", "()I");
     let code = m.code.as_ref().expect("top 须有 Code");
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
@@ -119,7 +119,7 @@ fn run_top(vm: &mut Vm) -> Reference {
 fn run_check(vm: &mut Vm, exc: Reference) -> Value {
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("St").expect("St 须已加载");
-    let m = find_method(lc, "check", "(Ljava/lang/Throwable;)I");
+    let m = find_method(&lc, "check", "(Ljava/lang/Throwable;)I");
     let code = m.code.as_ref().expect("check 须有 Code");
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     frame.locals.set_reference(0, exc).unwrap();
@@ -168,9 +168,9 @@ fn get_stack_trace_returns_real_elements() {
 
     // 3) 真 STE 的 getMethodName/getLineNumber 须为真字节码(非 native)——证 getter 在回填对象上可读。
     let ste = registry.get("java/lang/StackTraceElement").unwrap();
-    let gm = find_method(ste, "getMethodName", "()Ljava/lang/String;");
+    let gm = find_method(&ste, "getMethodName", "()Ljava/lang/String;");
     assert!(!gm.access_flags.is_native(), "STE.getMethodName 须为真字节码");
-    let gl = find_method(ste, "getLineNumber", "()I");
+    let gl = find_method(&ste, "getLineNumber", "()I");
     assert!(!gl.access_flags.is_native(), "STE.getLineNumber 须为真字节码");
 
     let mut vm = Vm::new(registry);

@@ -499,7 +499,7 @@ pub(super) fn dispatch(
             let ord = cn.as_ref().and_then(|cn| {
                 vm.registry().and_then(|reg| {
                     reg.get(cn).and_then(|lc| {
-                        reg.flattened_instance_fields(lc)
+                        reg.flattened_instance_fields(&lc)
                             .iter()
                             .position(|f| f.name == "referent")
                     })
@@ -773,19 +773,19 @@ fn init_stack_trace_elements(
             .get(STE)
             .ok_or(VmError::BadConstant("StackTraceElement 未预载"))?;
         let ord_dc = reg
-            .instance_field(lc, "declaringClass", &str_ft)
+            .instance_field(&lc, "declaringClass", &str_ft)
             .ok_or(VmError::BadConstant("STE.declaringClass 未找到"))?;
         let ord_mn = reg
-            .instance_field(lc, "methodName", &str_ft)
+            .instance_field(&lc, "methodName", &str_ft)
             .ok_or(VmError::BadConstant("STE.methodName 未找到"))?;
         let ord_fn = reg
-            .instance_field(lc, "fileName", &str_ft)
+            .instance_field(&lc, "fileName", &str_ft)
             .ok_or(VmError::BadConstant("STE.fileName 未找到"))?;
         let ord_ln = reg
-            .instance_field(lc, "lineNumber", &FieldType::Int)
+            .instance_field(&lc, "lineNumber", &FieldType::Int)
             .ok_or(VmError::BadConstant("STE.lineNumber 未找到"))?;
         let ord_dco = reg
-            .instance_field(lc, "declaringClassObject", &class_ft)
+            .instance_field(&lc, "declaringClassObject", &class_ft)
             .ok_or(VmError::BadConstant("STE.declaringClassObject 未找到"))?;
         (ord_dc, ord_mn, ord_fn, ord_ln, ord_dco)
     };
@@ -892,7 +892,7 @@ fn get_declared_fields0(
         let field_lc = reg
             .get("java/lang/reflect/Field")
             .ok_or(VmError::BadConstant("java/lang/reflect/Field 未预载"))?;
-        let flat = reg.flattened_instance_fields(field_lc);
+        let flat = reg.flattened_instance_fields(&field_lc);
         let find = |n: &str| {
             flat.iter().position(|f| f.name == n).ok_or(VmError::BadConstant(
                 "java/lang/reflect/Field 缺 clazz/slot/name/type/modifiers 之一",
@@ -924,7 +924,7 @@ fn get_declared_fields0(
                 .get("java/lang/reflect/Field")
                 .ok_or(VmError::BadConstant("java/lang/reflect/Field 未预载"))?;
             vm.heap_mut()
-                .alloc(Oop::Instance(reg.new_instance(field_lc)))
+                .alloc(Oop::Instance(reg.new_instance(&field_lc)))
         };
         let type_mirror = vm.intern_class_mirror(&field_type_internal(&desc));
         let name_ref = super::super::string::intern(vm, &name)?;
@@ -1064,7 +1064,7 @@ fn get_declared_methods0(
         let m_lc = reg
             .get("java/lang/reflect/Method")
             .ok_or(VmError::BadConstant("java/lang/reflect/Method 未预载"))?;
-        let flat = reg.flattened_instance_fields(m_lc);
+        let flat = reg.flattened_instance_fields(&m_lc);
         let find = |n: &str| {
             flat.iter().position(|f| f.name == n).ok_or(VmError::BadConstant(
                 "java/lang/reflect/Method 缺 clazz/slot/name/returnType/parameterTypes/exceptionTypes/modifiers 之一",
@@ -1104,7 +1104,7 @@ fn get_declared_methods0(
                 .get("java/lang/reflect/Method")
                 .ok_or(VmError::BadConstant("java/lang/reflect/Method 未预载"))?;
             vm.heap_mut()
-                .alloc(Oop::Instance(reg.new_instance(m_lc)))
+                .alloc(Oop::Instance(reg.new_instance(&m_lc)))
         };
         if let Some(Oop::Instance(inst)) = vm.heap_mut().get_mut(inst_ref) {
             inst.set_field(ords.clazz, Slot::Reference(this));
@@ -1174,7 +1174,7 @@ fn get_declared_constructors0(
         let c_lc = reg
             .get("java/lang/reflect/Constructor")
             .ok_or(VmError::BadConstant("java/lang/reflect/Constructor 未预载"))?;
-        let flat = reg.flattened_instance_fields(c_lc);
+        let flat = reg.flattened_instance_fields(&c_lc);
         let find = |n: &str| {
             flat.iter().position(|f| f.name == n).ok_or(VmError::BadConstant(
                 "java/lang/reflect/Constructor 缺 clazz/slot/parameterTypes/exceptionTypes/modifiers 之一",
@@ -1212,7 +1212,7 @@ fn get_declared_constructors0(
                 .get("java/lang/reflect/Constructor")
                 .ok_or(VmError::BadConstant("java/lang/reflect/Constructor 未预载"))?;
             vm.heap_mut()
-                .alloc(Oop::Instance(reg.new_instance(c_lc)))
+                .alloc(Oop::Instance(reg.new_instance(&c_lc)))
         };
         if let Some(Oop::Instance(inst)) = vm.heap_mut().get_mut(inst_ref) {
             inst.set_field(ords.clazz, Slot::Reference(this));
@@ -1357,7 +1357,7 @@ public class Worker extends Thread {
         let w = {
             let reg = vm.registry().expect("须注册表");
             let lc = reg.get("Worker").expect("Worker 须已加载");
-            let inst = reg.new_instance(lc);
+            let inst = reg.new_instance(&lc);
             vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
         };
 
@@ -1384,7 +1384,7 @@ public class Worker extends Thread {
         };
         vm.registry().and_then(|reg| {
             reg.get(&cn).and_then(|lc| {
-                reg.flattened_instance_fields(lc)
+                reg.flattened_instance_fields(&lc)
                     .iter()
                     .position(|f| f.name == "referent")
             })
@@ -1413,7 +1413,7 @@ public class Worker extends Thread {
         let new_obj = |vm: &mut Vm| -> Reference {
             let reg = vm.registry().expect("须有注册表");
             let lc = reg.get("java/lang/Object").expect("Object 须已加载");
-            let inst = reg.new_instance(lc);
+            let inst = reg.new_instance(&lc);
             vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
         };
         let a = new_obj(&mut vm);
@@ -1424,7 +1424,7 @@ public class Worker extends Thread {
             let lc = reg
                 .get("java/lang/ref/Reference")
                 .expect("Reference 须已加载");
-            let inst = reg.new_instance(lc);
+            let inst = reg.new_instance(&lc);
             vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
         };
         let ord = referent_ord(&vm, r).expect("Reference 须有 referent 字段");
@@ -1478,7 +1478,7 @@ public class Worker extends Thread {
         let new_obj = |vm: &mut Vm| -> Reference {
             let reg = vm.registry().expect("须有注册表");
             let lc = reg.get("java/lang/Object").expect("Object 须已加载");
-            let inst = reg.new_instance(lc);
+            let inst = reg.new_instance(&lc);
             vm.heap_mut().alloc(crate::oops::Oop::Instance(inst))
         };
         let a = new_obj(&mut vm);

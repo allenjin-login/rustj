@@ -229,10 +229,11 @@ mod tests {
     fn bootstrap_stubs_have_findable_init() {
         let reg = ClassRegistry::new();
         for name in ["java/lang/Object", "java/lang/RuntimeException", "java/lang/Throwable"] {
-            let (lc, m) = reg
+            let (lc, m_idx) = reg
                 .find_exact_method(name, "<init>", "()V")
                 .unwrap_or_else(|| panic!("{name} 应有可查 <init>()V"));
             assert_eq!(lc.name(), name);
+            let m = &lc.cf.methods[m_idx];
             assert_eq!(
                 m.code.as_ref().unwrap().code,
                 vec![0xb1],

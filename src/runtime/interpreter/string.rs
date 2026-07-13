@@ -50,12 +50,12 @@ fn build(vm: &mut Vm, text: &str) -> Result<Reference, VmError> {
             .get(STRING)
             .ok_or(VmError::BadConstant("java/lang/String 未加载(原始类须预载)"))?;
         let value_ord = registry
-            .instance_field(lc, "value", &value_ft)
+            .instance_field(&lc, "value", &value_ft)
             .ok_or(VmError::BadConstant("String.value 字段未找到"))?;
         let coder_ord = registry
-            .instance_field(lc, "coder", &coder_ft)
+            .instance_field(&lc, "coder", &coder_ft)
             .ok_or(VmError::BadConstant("String.coder 字段未找到"))?;
-        (registry.new_instance(lc), value_ord, coder_ord)
+        (registry.new_instance(&lc), value_ord, coder_ord)
     };
 
     // value: byte[](描述符 `[B`;每字节以有符号 int 入槽;baload 的 (v as i8) as i32 会归一,
@@ -95,10 +95,10 @@ pub(crate) fn read_text(vm: &Vm, r: Reference) -> Result<Option<String>, VmError
             .get(STRING)
             .ok_or(VmError::BadConstant("java/lang/String 未加载"))?;
         let v = registry
-            .instance_field(lc, "value", &value_ft)
+            .instance_field(&lc, "value", &value_ft)
             .ok_or(VmError::BadConstant("String.value 字段未找到"))?;
         let c = registry
-            .instance_field(lc, "coder", &coder_ft)
+            .instance_field(&lc, "coder", &coder_ft)
             .ok_or(VmError::BadConstant("String.coder 字段未找到"))?;
         (v, c)
     };

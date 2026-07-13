@@ -33,7 +33,7 @@ pub fn initialize_system_class(vm: &mut Vm) -> Result<(), VmError> {
             .get("java/util/HashMap")
             .ok_or(VmError::BadConstant("Phase 1 须预载 java/util/HashMap"))?;
         vm.heap_mut()
-            .alloc(Oop::Instance(reg.new_instance(hm_lc)))
+            .alloc(Oop::Instance(reg.new_instance(&hm_lc)))
     };
 
     // invokestatic VM.saveProperties(Ljava/util/Map;)V —— 真字节码:置 savedProps=map、
@@ -148,15 +148,15 @@ fn install_system_props(vm: &mut Vm) -> Result<(), VmError> {
             return Ok(());
         };
         vm.heap_mut()
-            .alloc(Oop::Instance(reg.new_instance(hm_lc)))
+            .alloc(Oop::Instance(reg.new_instance(&hm_lc)))
     };
 
     // 2) Properties Instance,置 map 字段 = HashMap。flattened_instance_fields 含继承字段;按名查
     //    `map`(Properties 自身声明的 CHM 字段)序号。字段未见(桩精简)→ 跳过置入但仍写 System.props。
     let props_ref = {
-        let mut inst = reg.new_instance(props_lc);
+        let mut inst = reg.new_instance(&props_lc);
         if let Some(ord) = reg
-            .flattened_instance_fields(props_lc)
+            .flattened_instance_fields(&props_lc)
             .iter()
             .position(|f| f.name == "map")
         {
@@ -257,7 +257,7 @@ fn put_property(
         .get("java/util/Properties")
         .ok_or(VmError::BadConstant("put_property:Properties 须预载"))?;
     let m = find_method_by_sig(
-        lc,
+        &lc,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
     )
@@ -326,7 +326,7 @@ pub fn bootstrap_module_system(vm: &mut Vm) -> Result<(), VmError> {
             .get("java/lang/ModuleLayer")
             .ok_or(VmError::BadConstant("Phase 2 须预载 java/lang/ModuleLayer"))?;
         vm.heap_mut()
-            .alloc(Oop::Instance(reg.new_instance(ml_lc)))
+            .alloc(Oop::Instance(reg.new_instance(&ml_lc)))
     };
 
     // 2) System.bootLayer = layer(对应 `bootLayer = ModuleBootstrap.boot();`)。沿超类链
@@ -508,7 +508,7 @@ fn build_exported_packages(
             return Ok(Reference::null());
         };
         vm.heap_mut()
-            .alloc(Oop::Instance(reg.new_instance(hm_lc)))
+            .alloc(Oop::Instance(reg.new_instance(&hm_lc)))
     };
 
     for exp in desc.exports() {
@@ -539,7 +539,7 @@ fn hash_map_put(
         .get("java/util/HashMap")
         .ok_or(VmError::BadConstant("hash_map_put:HashMap 须预载"))?;
     let m = find_method_by_sig(
-        lc,
+        &lc,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
     )
@@ -573,7 +573,7 @@ fn alloc_module_descriptor(vm: &mut Vm, module_name: &str) -> Result<Reference, 
             return Ok(Reference::null());
         };
         vm.heap_mut()
-            .alloc(Oop::Instance(reg.new_instance(md_lc)))
+            .alloc(Oop::Instance(reg.new_instance(&md_lc)))
     };
     if desc_ref.is_null() {
         return Ok(desc_ref);
@@ -604,7 +604,7 @@ where
     let lc = reg
         .get(class)
         .ok_or(VmError::BadConstant("Phase 1 引导:目标类未预载"))?;
-    let m = find_static_method(lc, name)
+    let m = find_static_method(&lc, name)
         .ok_or(VmError::BadConstant("Phase 1 引导:目标方法未找到"))?;
     let code = m
         .code
@@ -672,7 +672,7 @@ mod tests {
         let lc = reg
             .get("java/lang/Module")
             .ok_or(VmError::BadConstant("Module 须预载"))?;
-        let m = find_method_by_sig(lc, "isExported", "(Ljava/lang/String;)Z")
+        let m = find_method_by_sig(&lc, "isExported", "(Ljava/lang/String;)Z")
             .ok_or(VmError::BadConstant("Module.isExported(String)Z 未找到"))?;
         let code = m
             .code

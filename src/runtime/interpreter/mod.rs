@@ -60,7 +60,7 @@ pub(super) fn throw_exception(vm: &mut Vm, class_name: &str) -> VmError {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("{class_name} 应作为引导桩已加载(内部不变量)"));
-    let oop = Oop::Instance(reg.new_instance(lc));
+    let oop = Oop::Instance(reg.new_instance(&lc));
     let reference = vm.heap_mut().alloc(oop);
     // 捕获抛出点 backtrace(快照调用链 + 置真 Throwable 的 backtrace/depth 字段),
     // 供 format_trace / 真 getStackTrace / 顶层自动打印。
@@ -119,10 +119,10 @@ pub(super) fn capture_backtrace(vm: &mut Vm, exc: Reference) {
         let Some(lc) = reg.get("java/lang/Throwable") else {
             return;
         };
-        let Some(bt) = reg.instance_field(lc, "backtrace", &object_ft) else {
+        let Some(bt) = reg.instance_field(&lc, "backtrace", &object_ft) else {
             return;
         };
-        let Some(d) = reg.instance_field(lc, "depth", &FieldType::Int) else {
+        let Some(d) = reg.instance_field(&lc, "depth", &FieldType::Int) else {
             return;
         };
         (bt, d)
@@ -153,7 +153,7 @@ pub(super) fn set_throwable_field(
         let Some(lc) = reg.get("java/lang/Throwable") else {
             return;
         };
-        let Some(ord) = reg.instance_field(lc, name, &ft) else {
+        let Some(ord) = reg.instance_field(&lc, name, &ft) else {
             return;
         };
         ord
@@ -2057,7 +2057,7 @@ mod tests {
         let lc = reg.get("SubExc").unwrap();
         let inst = vm
             .heap_mut()
-            .alloc(crate::oops::Oop::Instance(reg.new_instance(lc)));
+            .alloc(crate::oops::Oop::Instance(reg.new_instance(&lc)));
         // [aload0(0) athrow(1) iconst1(2) ireturn(3)];try [0,2) handler=2 catch SubExc(#6)
         let code = [
             Opcode::Aload0 as u8,
@@ -2088,7 +2088,7 @@ mod tests {
         let lc = reg.get("SubExc").unwrap();
         let inst = vm
             .heap_mut()
-            .alloc(crate::oops::Oop::Instance(reg.new_instance(lc)));
+            .alloc(crate::oops::Oop::Instance(reg.new_instance(&lc)));
         let code = [Opcode::Aload0 as u8, Opcode::Athrow as u8];
         let mut frame = Frame::new(1, 2);
         frame.locals.set_reference(0, inst).unwrap();

@@ -140,15 +140,37 @@ fn is_direct_method_handle(vm: &Vm, runtime_class: &str) -> bool {
     false
 }
 
-/// MethodHandle 签名多态调用钩子(B.5.2):receiver 为字段 DirectMethodHandle 时,直读其 `member`
-/// (MemberName)按 refKind 做 getfield/putfield/getstatic/putstatic。
+/// `runtime_class` 是否为 `java/lang/invoke/MethodHandle` 的(子)类(G.2 LF 解释前置)。
+/// 同 [`is_direct_method_handle`] 沿超类链上行比对;到链顶仍未命中 → false。覆盖 DMH/BMH/
+/// 转换 adapter(AsTypeInstance 等)等所有 MH 子类——皆须拦截 invoke 族走 LF 解释或字段 shortcut。
+fn is_method_handle(vm: &Vm, runtime_class: &str) -> bool {
+    let Some(reg) = vm.registry() else {
+        return false;
+    };
+    let mut cur_name = Some(runtime_class.to_string());
+    while let Some(name) = cur_name {
+        match reg.get(&name) {
+            Some(lc) => {
+                if lc.name() == "java/lang/invoke/MethodHandle" {
+                    return true;
+                }
+                cur_name = lc.super_class_name().map(|s| s.to_string());
+            }
+            None => break,
+        }
+    }
+    false
+}
+
+/// MethodHandle 签名多态调用钩子(B.5.2 字段 DMH 短路 + G.2 LambdaForm 解释):
+/// receiver 为 `java/lang/invoke/MethodHandle`(子)类、方法名 ∈ {invoke, invokeExact,
+/// invokeBasic} 时拦截:
+/// - 字段 DirectMethodHandle(refKind 1-4)→ 直读 `member` 做字段访问(设计 §2 shortcut,B.5.2);
+/// - 其余 MH(方法 DMH / BMH / 转换 adapter / identity 等)→ [`interpret_lambda_form`](G.2)。
 ///
-/// 设计 §2 shortcut:rustj **不解释 LambdaForm**;`objectFieldOffset`/`staticFieldOffset`/
-/// `staticFieldBase` 均返 dummy(B.5.1),钩子只读 `member` 的 clazz/name/flags → 字段访问,语义等价。
-///
-/// 返 `Ok(Some(value))` = 已处理(调用方 `finish_invoke` 回填);`Ok(None)` = 非字段 DMH 或方法名非
-/// invoke 族 → 调用方走正常虚分派(方法 DMH 经 NativeAccessor.invoke0,4.15b,不经此)。
-fn try_method_handle_field_hook(
+/// `Ok(Some(value))` = 已处理(调用方 `finish_invoke` 回填);`Ok(None)` = 非 MH 或方法名非
+/// invoke 族 → 调用方走正常虚分派。
+fn try_method_handle_invoke_hook(
     vm: &mut Vm,
     method_name: &str,
     runtime_class: &str,
@@ -158,11 +180,94 @@ fn try_method_handle_field_hook(
     if !matches!(method_name, "invoke" | "invokeExact" | "invokeBasic") {
         return Ok(None);
     }
-    if !is_direct_method_handle(vm, runtime_class) {
+    if !is_method_handle(vm, runtime_class) {
         return Ok(None);
     }
-    let v = dispatch_method_handle_field(vm, mh_ref, args)?;
-    Ok(Some(v))
+    // 字段 DMH 快路(refKind 1-4);非字段 refKind 返 None 落 LF 解释。
+    if is_direct_method_handle(vm, runtime_class)
+        && let Some(v) = dispatch_method_handle_field(vm, mh_ref, args)?
+    {
+        return Ok(Some(v));
+    }
+    // 任意非字段 MH → 解释其 LambdaForm(G.2)。
+    Ok(Some(interpret_lambda_form(vm, mh_ref, args)?))
+}
+
+/// 解释 MethodHandle 的 LambdaForm(G.2)。读 `mh.form`(LambdaForm)的 `arity`/`result`/
+/// `names(Name[])`,按拓扑序求值:先绑入口参数(param 0 = MH 本身,param i = args[i-1]),
+/// 再遍历计算节点 `names[arity..]`(function != null),最后返 `names[result]`。
+///
+/// **G.2.1 骨架**:identity MH 的 LF 无计算节点(`names` = 仅 MH param + arg param,
+/// arity = names.len(),result = arg 下标)→ 绑参数后直接返 `names[result]`。计算节点的
+/// NamedFunction 分派(`invoke_named_function`)G.2.2+ 填;遇 function != null 暂抛错。
+///
+/// 入口参数 1:1 绑定(LF 每个 Name 占一位,与 JVM 栈 category-2 翻倍无关);`args` 不含
+/// receiver(MH 经 `mh_ref` 单独传),故 param i ∈ 1..arity 对应 args[i-1]。
+fn interpret_lambda_form(
+    vm: &mut Vm,
+    mh_ref: Reference,
+    args: &[Arg],
+) -> Result<Value, VmError> {
+    // form = MethodHandle.form(MethodHandle.java:460 final 字段)。
+    let form = vm
+        .instance_reference_field(mh_ref, "java/lang/invoke/MethodHandle", "form")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("LF 解释:mh.form 缺失"))?;
+    // arity/result/names(LambdaForm.java:128/129/132)。
+    let arity = vm
+        .instance_int_field(form, "java/lang/invoke/LambdaForm", "arity")
+        .ok_or(VmError::BadConstant("LF 解释:form.arity 缺失"))? as usize;
+    let result = vm
+        .instance_int_field(form, "java/lang/invoke/LambdaForm", "result")
+        .unwrap_or(-1);
+    let names_arr = vm
+        .instance_reference_field(form, "java/lang/invoke/LambdaForm", "names")
+        .filter(|r| !r.is_null())
+        .ok_or(VmError::BadConstant("LF 解释:form.names 缺失"))?;
+    let names_len = match vm.heap().get(names_arr) {
+        Some(Oop::Array(a)) => a.length(),
+        _ => return Err(VmError::BadConstant("LF 解释:form.names 非数组")),
+    };
+    // values[i] = 第 i 个 Name 的求值结果。先绑入口参数:param 0 = MH;param i = args[i-1]。
+    let mut values: Vec<Slot> = vec![Slot::Top; names_len];
+    values[0] = Slot::Reference(mh_ref);
+    for (i, slot) in values.iter_mut().enumerate().take(arity).skip(1) {
+        let arg_idx = i - 1;
+        if arg_idx >= args.len() {
+            return Err(VmError::BadConstant("LF 解释:入口参数不足"));
+        }
+        *slot = arg_to_slot(args.get(arg_idx))?;
+    }
+    // 计算节点 names[arity..](function != null)。G.2.1 identity 无计算节点;遇计算节点暂抛错(G.2.2+)。
+    for idx in arity..names_len {
+        let name_ref = match vm.heap().get(names_arr) {
+            Some(Oop::Array(a)) => match a.element(idx) {
+                Slot::Reference(r) if !r.is_null() => r,
+                _ => return Err(VmError::BadConstant("LF 解释:Name[] 元素非引用")),
+            },
+            _ => return Err(VmError::BadConstant("LF 解释:form.names 非数组")),
+        };
+        let function = vm.instance_reference_field(
+            name_ref,
+            "java/lang/invoke/LambdaForm$Name",
+            "function",
+        );
+        if matches!(function, Some(r) if !r.is_null()) {
+            return Err(VmError::BadConstant(
+                "LF 解释:计算节点(NamedFunction)分派未实现 —— G.2.2+",
+            ));
+        }
+        // function == null → 参数/常量节点:参数已绑;常量 G.2.2 处理(暂留默认 Top)。
+    }
+    // result < 0(LambdaForm.VOID_RESULT)→ void;否则返 names[result]。
+    if result < 0 {
+        return Ok(Value::Void);
+    }
+    let r = result as usize;
+    if r >= names_len {
+        return Err(VmError::BadConstant("LF 解释:result 下标越界"));
+    }
+    Ok(slot_to_value(values[r]))
 }
 
 /// 读 DMH.`member` → MemberName.{clazz,name,flags} → 按 refKind 做字段访问。
@@ -173,7 +278,7 @@ fn dispatch_method_handle_field(
     vm: &mut Vm,
     mh_ref: Reference,
     args: &[Arg],
-) -> Result<Value, VmError> {
+) -> Result<Option<Value>, VmError> {
     // member = DirectMethodHandle.member(DirectMethodHandle.java:55 final 字段)。
     let member = vm
         .instance_reference_field(mh_ref, "java/lang/invoke/DirectMethodHandle", "member")
@@ -184,6 +289,13 @@ fn dispatch_method_handle_field(
         .instance_int_field(member, "java/lang/invoke/MemberName", "flags")
         .ok_or(VmError::BadConstant("MH 钩子:MemberName.flags 缺失"))?;
     let ref_kind = ((flags as u32) >> 24) as u8 & 0x0F;
+    // 字段 refKind(1-4)→ 字段访问;方法 refKind(5-9)→ None 交 LF 解释(G.2)。
+    if !matches!(
+        ref_kind,
+        REF_GET_FIELD | REF_PUT_FIELD | REF_GET_STATIC | REF_PUT_STATIC
+    ) {
+        return Ok(None);
+    }
     // clazz → 声明类内部名(镜像经 mirror_class 反查)。
     let clazz_mirror = vm
         .instance_reference_field(member, "java/lang/invoke/MemberName", "clazz")
@@ -200,11 +312,12 @@ fn dispatch_method_handle_field(
     let field_name = string::read_text(vm, name_ref)?
         .ok_or(VmError::BadConstant("MH 钩子:MemberName.name 非字符串"))?;
 
-    match ref_kind {
-        REF_GET_FIELD | REF_PUT_FIELD => access_instance_field(vm, &declaring, &field_name, ref_kind, args),
-        REF_GET_STATIC | REF_PUT_STATIC => access_static_field(vm, &declaring, &field_name, ref_kind, args),
-        _ => Err(VmError::BadConstant("MH 钩子仅支持字段 refKind(1-4)")),
-    }
+    let v = match ref_kind {
+        REF_GET_FIELD | REF_PUT_FIELD => access_instance_field(vm, &declaring, &field_name, ref_kind, args)?,
+        REF_GET_STATIC | REF_PUT_STATIC => access_static_field(vm, &declaring, &field_name, ref_kind, args)?,
+        _ => unreachable!(),
+    };
+    Ok(Some(v))
 }
 
 /// 实例字段访问:getField 读 obj.field;putField 写 obj.field=value。obj 经 args[0],value 经 args[1]。
@@ -1217,7 +1330,7 @@ pub(super) fn invoke_virtual(
 
     // MethodHandle 签名多态短路(B.5.2):receiver 为字段 DirectMethodHandle → 直读 member 做
     // getfield/putfield/getstatic/putstatic。非字段 DMH / 非 invoke 族 → None,走下方正常虚分派。
-    if let Some(v) = try_method_handle_field_hook(vm, &method_name, &runtime_class, objref, &args)? {
+    if let Some(v) = try_method_handle_invoke_hook(vm, &method_name, &runtime_class, objref, &args)? {
         return finish_invoke(interp, frame, vm, caller_pc, Ok(v), md.return_type);
     }
 
@@ -1307,7 +1420,7 @@ pub(super) fn invoke_interface(
     };
 
     // MethodHandle 签名多态短路(B.5.2):同 invoke_virtual;DMH 经接口类型调用亦走此路。
-    if let Some(v) = try_method_handle_field_hook(vm, &method_name, &runtime_class, objref, &args)? {
+    if let Some(v) = try_method_handle_invoke_hook(vm, &method_name, &runtime_class, objref, &args)? {
         return finish_invoke(interp, frame, vm, caller_pc, Ok(v), md.return_type);
     }
 

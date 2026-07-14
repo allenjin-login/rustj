@@ -73,6 +73,23 @@ impl Vm {
         // 对应 Class.java:1011 `private transient Module module;`,getModule() 仅 `return module`。
         let module = self.module_for_class(internal);
         self.set_class_instance_field(mirror, "module", Slot::Reference(module));
+        // Class.modifiers(Class.java:1020 `private final transient char modifiers; // Set by the VM`):
+        // VM 置类访问标志位(ACC_ENUM/ACC_FINAL/ACC_INTERFACE/ACC_ANNOTATION/…),供 `getModifiers()`
+        //(Class.java:1364 `return modifiers;` 直接读字段)→ `isEnum()`(3365 `getModifiers()&ENUM`)、
+        // `isAnnotation()`、`isInterface()` 等。对应 HotSpot `JVM_GetClassModifiers`→
+        // `InstanceKlass::compute_modifier_flags`:据 `access_flags` 屏蔽到 JVM_RECOGNIZED_CLASS_MODIFIERS
+        //(嵌套类另经 InnerClasses 精修可见性位——rustj 暂未解析 InnerClasses,顺延;ENUM 位在
+        // access_flags 中故 isEnum 已正确)。数组/原语 → `ACC_PUBLIC|ACC_FINAL|ACC_ABSTRACT`=0x0411
+        //(JVM 约定,同 `Reflection.getClassAccessFlags` 原语分支)。实类未加载(异常态)→ 0 兜底。
+        // owned i32 取出后 Arc 即释,再 `&mut self` 写槽(NLL,无借用冲突)。
+        let mods: i32 = if internal.starts_with('[') || is_primitive_keyword(internal) {
+            0x0411
+        } else {
+            self.registry()
+                .and_then(|r| r.get(internal).map(|lc| lc.cf.access_flags.bits() as i32))
+                .unwrap_or(0)
+        };
+        self.set_class_instance_field(mirror, "modifiers", Slot::Int(mods));
     }
 
     /// 按**字段名**(忽略描述符)在 `java/lang/Class` 扁平实例字段中查序号并写槽。

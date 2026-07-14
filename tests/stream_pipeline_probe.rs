@@ -1,13 +1,14 @@
-//! 集成探针(Phase G.4 目标):真 `java.util.stream` 流水线端到端。
+//! 集成闸门(Phase G.4 / G.4.1):真 `java.util.stream` 流水线端到端。
 //!
-//! **进度(G.4-partial)**:`Stream.of(1,2,3).count()` == 3L ✅;`Stream.of(1,2,3,4)
-//! .map(x->x*2).filter(x->x>4).count()` == 2L ✅(真 Stream 中间+终端操作经 invokedynamic
-//! lambda 端到端通)。`reduce(0, Integer::sum)` 顺延 G.4.1(见该测试注释:原语方法引用的
-//! 装箱/拆箱适配墙)。
+//! **进度(G.4 全完成)**:`Stream.of(1,2,3).count()` == 3L ✅;`Stream.of(1,2,3,4)
+//! .map(x->x*2).filter(x->x>4).count()` == 2L ✅;`Stream.of(1,2,3,4).reduce(0, Integer::sum)`
+//! == 10 ✅(G.4.1 lambda 签名适配:原语方法引用的拆箱/装箱)。真 Stream 中间+终端操作经
+//! invokedynamic lambda + 方法引用端到端通。
 //!
-//! 解锁墙(已修):`Class.modifiers` 字段未由 VM 置 → `isEnum()` false →
-//! `getEnumConstantsShared()` null → `EnumMap.<init>` NPE(StreamOpFlag.<clinit>)。修复见
-//! `populate_class_mirror_fields` 置 `modifiers = cf.access_flags.bits()`。
+//! 解锁墙(已修):(1) G.4 `Class.modifiers` 字段未由 VM 置 → `isEnum()` false →
+//! `getEnumConstantsShared()` null → `EnumMap.<init>` NPE(StreamOpFlag.<clinit>)→ `populate_class_mirror_fields`
+//! 置 `modifiers = cf.access_flags.bits()`;(2) G.4.1 `dispatch_lambda` 对 `Integer::sum` 等
+//! 原语方法引用做 SAM 实参拆箱 + 原语返回装箱(对应 LambdaForm box/unbox 节点)。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -189,18 +190,14 @@ fn stream_map_filter_count_end_to_end() {
     }
 }
 
-/// **Phase G.4(顺延 G.4.1)**:`reduce(0, Integer::sum)`(方法引用 + 归约)。
+/// **GREEN(Phase G.4.1)**:`reduce(0, Integer::sum)`(方法引用 + 归约)。
 /// `Stream.of(1,2,3,4).reduce(0, Integer::sum)` == 10。
 ///
-/// **阻塞墙**:`Integer::sum` 是真 `(II)I` 原语方法;SAM `BiFunction.apply` 传两个装箱 `Integer`
-/// 引用。`dispatch_lambda`(invoke.rs:1342)把 SAM 实参**原样**转交实现方法,不做装箱/拆箱适配
-/// → `Integer.sum` 的 `iload_0`/`iload_1` 在 Reference 槽上 `get_int` → `Frame(TypeMismatch)`。
-///
-/// 对比:`map(x->x*2)`/`filter(x->x>4)` 通,因 javac 为其生成**装箱签名** synthetic
-/// `(Ljava/lang/Integer;)Ljava/lang/Integer;`,synthetic 内部自行拆箱,故直接传 Integer 引用即可。
-/// `Integer::sum` 是现成原语方法,无 synthetic 包裹,适配须由 lambda 派发层做(G.4.1:按
-/// impl_desc 形参类型对 SAM 实参拆箱、按 SAM 返回类型对原语返回装箱)。
-#[ignore]
+/// **解锁**:G.4.1 lambda 适配器签名适配。`Integer::sum` 为真 `(II)I` 原语方法;SAM
+/// `BiFunction.apply` 传两个装箱 `Integer` 引用。`dispatch_lambda` 现按 impl_desc 形参类型对
+/// SAM 实参拆箱(读 `value` 字段 → int)、按 SAM 返回类型对原语返回装箱(int → Integer),
+/// 对应 LambdaForm 的 unbox/box 节点。原直传致 `iload` 在 Reference 槽 `get_int` →
+/// `Frame(TypeMismatch)`。
 #[test]
 fn stream_reduce_with_method_ref_end_to_end() {
     let Some(mut vm) = setup_vm() else { return };

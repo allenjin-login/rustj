@@ -31,6 +31,10 @@ mod jdk_internal_loader;
 mod jdk_internal_reflect;
 mod sun_nio_fs;
 
+/// 反射装箱/拆箱原语族(G.4.1 lambda 适配器复用):`unbox_arg`(引用→原语读 value 字段)、
+/// `alloc_wrapper`(原语→包装实例)、`primitive_wrapper`(原语→包装类名)。
+pub(crate) use jdk_internal_reflect::{alloc_wrapper, primitive_wrapper, unbox_arg};
+
 /// native 方法分派入口(对应 HotSpot `prims/jvm.cpp` 的 `JVM_*` 桥 + `nativeLookup.cpp`
 /// 解析到的 JDK 侧 `Java_*` 桥)。
 ///

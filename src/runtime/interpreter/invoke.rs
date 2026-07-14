@@ -1174,18 +1174,16 @@ fn dispatch_native(
 ///
 /// 参数多系 4 处调用点统一 fan-in 的必然结果;同 [`dispatch_native`] 豁免 `too_many_arguments`。
 #[allow(clippy::too_many_arguments)]
-fn run_callee(
-    interp: &Interpreter<'_>,
-    frame: &mut Frame,
+/// 跑被调用者解释帧至返回,得原始 `Value`(**不** `finish_invoke`)。供 [`run_callee`] 与
+/// [`dispatch_lambda`] 共用——后者须在返回前做 lambda 装箱/拆箱适配(G.4.1),故拆出原始值。
+fn run_callee_to_value(
     vm: &mut Vm,
-    caller_pc: usize,
     target_lc: &LoadedClass,
     target_method: &MethodInfo,
     code: &CodeAttribute,
     objref: Option<Reference>,
     args: Vec<Arg>,
-    return_type: ReturnDescriptor,
-) -> Result<InvokeFlow, VmError> {
+) -> Result<Value, VmError> {
     let mut callee = Frame::new(code.max_locals, code.max_stack);
     let mut slot: u16 = match objref {
         Some(r) => {
@@ -1206,7 +1204,26 @@ fn run_callee(
             target_lc.name(),
             cp_utf8(&target_lc.cf.constant_pool, target_method.name_index)?,
         );
-    let result = run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm));
+    run_with_depth(vm, |vm| callee_interp.interpret_with(&mut callee, vm))
+}
+
+/// 跑被调用者解释帧 + `finish_invoke` 回填/捕获(正常 invoke 系列直接调用点)。
+/// lambda 派发(`dispatch_lambda`)**不**经此法——须做返回装箱适配(G.4.1),改走
+/// [`run_callee_to_value`] + [`adapt_lambda_return`] + [`finish_invoke`]。
+#[allow(clippy::too_many_arguments)]
+fn run_callee(
+    interp: &Interpreter<'_>,
+    frame: &mut Frame,
+    vm: &mut Vm,
+    caller_pc: usize,
+    target_lc: &LoadedClass,
+    target_method: &MethodInfo,
+    code: &CodeAttribute,
+    objref: Option<Reference>,
+    args: Vec<Arg>,
+    return_type: ReturnDescriptor,
+) -> Result<InvokeFlow, VmError> {
+    let result = run_callee_to_value(vm, target_lc, target_method, code, objref, args);
     finish_invoke(interp, frame, vm, caller_pc, result, return_type)
 }
 
@@ -1328,18 +1345,72 @@ fn dispatch_lambda(
     };
     let target_method = &target_lc.cf.methods[target_method_idx];
 
-    // 实现为 native(方法引用到 native,如 Object::hashCode)→ 内置 native 分派。
+    // G.4.1 lambda 适配器(签名适配):按 impl 形参类型对 SAM 实参拆箱。`Integer::sum` 为
+    // `(II)I`,SAM `BiFunction.apply` 传装箱 `Integer` 引用 → 读 `value` 字段拆箱为 int,
+    // 否则 `iload` 在 Reference 槽 `get_int` → `Frame(TypeMismatch)`。类型已匹配(引用→引用 /
+    // 原语→原语)→ 直传;捕获前置按 factoryType 类型,同适配无害(引用形参+引用实参→直传)。
+    let impl_md = parse_method_descriptor(&impl_desc)?;
+    let impl_args = adapt_lambda_args(vm, impl_args, &impl_md.parameters)?;
+
+    // 实现为 native(方法引用到 native,如 Object::hashCode)→ 内置 native 分派 + 返回装箱。
     if target_method.access_flags.is_native() {
-        return dispatch_native(
-            interp, frame, vm, caller_pc, &impl_class, &impl_name, &impl_desc, objref, impl_args,
-            return_type,
-        );
+        let nargs: Vec<Value> = impl_args.into_iter().map(Value::from).collect();
+        let raw = native::invoke(vm, &impl_class, &impl_name, &impl_desc, objref, &nargs);
+        let adapted = match raw {
+            Ok(v) => adapt_lambda_return(vm, v, &impl_md.return_type, &return_type),
+            Err(e) => Err(e),
+        };
+        return finish_invoke(interp, frame, vm, caller_pc, adapted, return_type);
     }
     let code = target_method
         .code
         .as_ref()
         .ok_or(VmError::BadConstant("lambda 实现方法无 Code(抽象)"))?;
-    run_callee(interp, frame, vm, caller_pc, &target_lc, target_method, code, objref, impl_args, return_type)
+    let raw = run_callee_to_value(vm, &target_lc, target_method, code, objref, impl_args)?;
+    let adapted = adapt_lambda_return(vm, raw, &impl_md.return_type, &return_type)?;
+    finish_invoke(interp, frame, vm, caller_pc, Ok(adapted), return_type)
+}
+
+/// G.4.1 lambda 适配器:按 impl 形参类型对 SAM 实参做拆箱。SAM 传装箱引用、impl 形参为原语 →
+/// 读包装类 `value` 字段拆箱(I/Z/B/C/S→Int、J→Long、F→Float、D→Double,null→NPE);类型已匹配
+/// → 直传。对应 LambdaForm 的 unbox 节点(`LambdaForm$NamedFunction` 适配)。
+fn adapt_lambda_args(
+    vm: &mut Vm,
+    args: Vec<Arg>,
+    impl_params: &[FieldType],
+) -> Result<Vec<Arg>, VmError> {
+    args.into_iter()
+        .enumerate()
+        .map(|(i, arg)| match (arg, impl_params.get(i)) {
+            (Arg::Reference(r), Some(pt)) if native::primitive_wrapper(pt).is_some() => {
+                let slot = native::unbox_arg(vm, r, pt)?;
+                slot_to_arg(slot)
+            }
+            (other, _) => Ok(other),
+        })
+        .collect()
+}
+
+/// G.4.1 lambda 适配器:按 SAM 返回类型对 impl 原语返回装箱。impl 返原语、SAM 返引用 → 分配包装
+/// 实例置 `value`(int→Integer 等);类型已匹配(引用→引用 / 原语→原语 / void)→ 直传。
+/// 对应 LambdaForm 的 box 节点。
+fn adapt_lambda_return(
+    vm: &mut Vm,
+    raw: Value,
+    impl_ret: &ReturnDescriptor,
+    sam_ret: &ReturnDescriptor,
+) -> Result<Value, VmError> {
+    match (impl_ret, sam_ret) {
+        (
+            ReturnDescriptor::FieldType(prim),
+            ReturnDescriptor::FieldType(FieldType::Class(_) | FieldType::Array(_)),
+        ) if native::primitive_wrapper(prim).is_some() => {
+            let wrapper = native::primitive_wrapper(prim).expect("原语已判");
+            let r = native::alloc_wrapper(vm, wrapper, value_to_slot(raw))?;
+            Ok(Value::Reference(r))
+        }
+        _ => Ok(raw),
+    }
 }
 
 /// `Value → Arg`(闭包捕获还原为实参)。void 不可能是捕获值。

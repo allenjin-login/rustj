@@ -176,7 +176,8 @@ fn read_object_array(vm: &Vm, arr_ref: Reference) -> Result<Vec<Reference>, VmEr
 }
 
 /// 原语 `FieldType` → 其包装类内部名(供拆箱/装箱);非原语 → `None`。
-fn primitive_wrapper(ft: &crate::metadata::descriptor::FieldType) -> Option<&'static str> {
+/// `pub(crate)`:G.4.1 lambda 适配器复用。
+pub(crate) fn primitive_wrapper(ft: &crate::metadata::descriptor::FieldType) -> Option<&'static str> {
     use crate::metadata::descriptor::FieldType;
     match ft {
         FieldType::Boolean => Some("java/lang/Boolean"),
@@ -193,7 +194,8 @@ fn primitive_wrapper(ft: &crate::metadata::descriptor::FieldType) -> Option<&'st
 
 /// 按 `param_type` 拆箱一个实参:引用/数组类型 → 原引用(null 保留);原语类型 → 读包装实例 `value`
 /// 字段(I/Z/B/C/S→Int、J→Long、F→Float、D→Double)。null 拆箱原语 → NPE(JLS 拆箱语义)。
-fn unbox_arg(vm: &mut Vm, arg: Reference, param_type: &crate::metadata::descriptor::FieldType) -> Result<Slot, VmError> {
+/// `pub(crate)`:G.4.1 lambda 适配器(`dispatch_lambda`)对 SAM 装箱实参拆箱复用。
+pub(crate) fn unbox_arg(vm: &mut Vm, arg: Reference, param_type: &crate::metadata::descriptor::FieldType) -> Result<Slot, VmError> {
     use crate::metadata::descriptor::FieldType;
     match param_type {
         FieldType::Class(_) | FieldType::Array(_) => Ok(Slot::Reference(arg)),
@@ -272,7 +274,8 @@ fn box_return(
 
 /// 分配包装类实例并置 `value` 字段(供 `box_return`)。`new_instance` 不跑 `<init>`,
 /// 直接写字段(对应 HotSpot `box()` 经 `ReflectionFactory` 的反射装箱;Integer 等已 <clinit>)。
-fn alloc_wrapper(vm: &mut Vm, wrapper: &str, value: Slot) -> Result<Reference, VmError> {
+/// `pub(crate)`:G.4.1 lambda 适配器对 impl 原语返回装箱复用。
+pub(crate) fn alloc_wrapper(vm: &mut Vm, wrapper: &str, value: Slot) -> Result<Reference, VmError> {
     let (inst_ref, ord) = {
         let reg = vm
             .registry()

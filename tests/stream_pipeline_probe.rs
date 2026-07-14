@@ -1,14 +1,14 @@
-//! 集成闸门(Phase G.4 / G.4.1):真 `java.util.stream` 流水线端到端。
+//! 集成闸门(Phase G.4 / G.4.1 / G.5):真 `java.util.stream` 流水线端到端。
 //!
-//! **进度(G.4 全完成)**:`Stream.of(1,2,3).count()` == 3L ✅;`Stream.of(1,2,3,4)
-//! .map(x->x*2).filter(x->x>4).count()` == 2L ✅;`Stream.of(1,2,3,4).reduce(0, Integer::sum)`
-//! == 10 ✅(G.4.1 lambda 签名适配:原语方法引用的拆箱/装箱)。真 Stream 中间+终端操作经
+//! **进度(G.5 全完成)**:`count` ✅ / `map+filter+count` ✅ / `reduce(0,Integer::sum)` ✅ /
+//! `collect(toList())` ✅ / `forEach` ✅。真 Stream 中间+终端操作(含内部迭代 + Collector)经
 //! invokedynamic lambda + 方法引用端到端通。
 //!
 //! 解锁墙(已修):(1) G.4 `Class.modifiers` 字段未由 VM 置 → `isEnum()` false →
 //! `getEnumConstantsShared()` null → `EnumMap.<init>` NPE(StreamOpFlag.<clinit>)→ `populate_class_mirror_fields`
-//! 置 `modifiers = cf.access_flags.bits()`;(2) G.4.1 `dispatch_lambda` 对 `Integer::sum` 等
-//! 原语方法引用做 SAM 实参拆箱 + 原语返回装箱(对应 LambdaForm box/unbox 节点)。
+//! 置 `modifiers = cf.access_flags.bits()`;(2) G.4.1 `dispatch_lambda` 对原语方法引用做 SAM 实参拆箱 +
+//! 原语返回装箱(`Integer::sum`);(3) G.5 void-SAM 返回丢弃(`List::add`(boolean)作 `BiConsumer.accept`
+//! void,`adapt_lambda_return` 增 void 分支)。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -97,6 +97,7 @@ fn run_static(vm: &mut Vm, name: &str, desc: &str) -> Result<Value, VmError> {
 
 const SOURCE: &str = r#"
 import java.util.stream.Stream;
+import java.util.stream.Collectors;
 public class Probe {
     public static long countThree() {
         return Stream.of(1, 2, 3).count();
@@ -106,6 +107,16 @@ public class Probe {
     }
     public static int sumReduce() {
         return Stream.of(1, 2, 3, 4).reduce(0, Integer::sum);
+    }
+    // G.5 探针:内部迭代 + Collector(collect(toList()))。
+    public static int collectSize() {
+        return Stream.of(1, 2, 3).map(x -> x * 2).collect(Collectors.toList()).size();
+    }
+    // G.5 探针:forEach 终端(capturing lambda,写捕获数组)。
+    public static int forEachSum() {
+        int[] sum = {0};
+        Stream.of(1, 2, 3).forEach(x -> sum[0] += x);
+        return sum[0];
     }
 }
 "#;
@@ -132,6 +143,8 @@ fn setup_vm() -> Option<Vm> {
         "java/util/stream/AbstractPipeline",
         "java/util/stream/ReferencePipeline",
         "java/util/stream/StreamSupport",
+        "java/util/stream/Collectors",
+        "java/util/stream/Collector",
         "java/util/Spliterators",
         "java/util/Arrays",
         "java/lang/invoke/MethodHandles",
@@ -209,5 +222,40 @@ fn stream_reduce_with_method_ref_end_to_end() {
             panic!("sumReduce 抛异常:\n{trace}");
         }
         Err(e) => panic!("sumReduce 内部错误:{e:?}"),
+    }
+}
+
+/// **GREEN(Phase G.5)**:内部迭代 + `Collector`。`Stream.of(1,2,3).map(x->x*2)
+/// .collect(Collectors.toList()).size()` == 3(元素 2,4,6)。验证 collect 终端(supplier/
+/// accumulator/combiner 三元 + Collector 接口)端到端。解锁:G.5 void-SAM 返回丢弃——
+/// `Collectors.toList()` 累加器 `List::add`(boolean)作 `BiConsumer.accept` void,impl 返值
+/// 须丢弃(`adapt_lambda_return` 增 void 分支)。
+#[test]
+fn stream_collect_to_list_end_to_end() {
+    let Some(mut vm) = setup_vm() else { return };
+    match run_static(&mut vm, "collectSize", "()I") {
+        Ok(Value::Int(v)) => assert_eq!(v, 3, "collect(toList()).size() 须 3"),
+        Ok(other) => panic!("期望 Int,得 {other:?}"),
+        Err(VmError::ThrownException(exc)) => {
+            let trace = vm.format_trace(exc);
+            panic!("collectSize 抛异常:\n{trace}");
+        }
+        Err(e) => panic!("collectSize 内部错误:{e:?}"),
+    }
+}
+
+/// **GREEN(Phase G.5)**:`forEach` 终端(capturing lambda 写捕获数组)。
+/// `Stream.of(1,2,3).forEach(x -> sum[0] += x)` 后 sum[0] == 6。
+#[test]
+fn stream_for_each_end_to_end() {
+    let Some(mut vm) = setup_vm() else { return };
+    match run_static(&mut vm, "forEachSum", "()I") {
+        Ok(Value::Int(v)) => assert_eq!(v, 6, "forEach 求和须 6"),
+        Ok(other) => panic!("期望 Int,得 {other:?}"),
+        Err(VmError::ThrownException(exc)) => {
+            let trace = vm.format_trace(exc);
+            panic!("forEachSum 抛异常:\n{trace}");
+        }
+        Err(e) => panic!("forEachSum 内部错误:{e:?}"),
     }
 }

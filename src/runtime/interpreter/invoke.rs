@@ -1391,9 +1391,10 @@ fn adapt_lambda_args(
         .collect()
 }
 
-/// G.4.1 lambda 适配器:按 SAM 返回类型对 impl 原语返回装箱。impl 返原语、SAM 返引用 → 分配包装
-/// 实例置 `value`(int→Integer 等);类型已匹配(引用→引用 / 原语→原语 / void)→ 直传。
-/// 对应 LambdaForm 的 box 节点。
+/// G.4.1 lambda 适配器:按 SAM 返回类型对 impl 返回装箱/丢弃。impl 返原语、SAM 返引用 → 分配包装
+/// 实例置 `value`(int→Integer 等);impl 返值、SAM 返 void → 丢弃(方法引用到 void SAM,如
+/// `List::add`(boolean)作 `BiConsumer.accept` void);类型已匹配(引用→引用 / 原语→原语 /
+/// void→void)→ 直传。对应 LambdaForm 的 box / void 节点。
 fn adapt_lambda_return(
     vm: &mut Vm,
     raw: Value,
@@ -1409,6 +1410,8 @@ fn adapt_lambda_return(
             let r = native::alloc_wrapper(vm, wrapper, value_to_slot(raw))?;
             Ok(Value::Reference(r))
         }
+        // impl 返值(原语/引用)、SAM 返 void → 丢弃返回(方法引用到 void SAM,如 List::add)。
+        (ReturnDescriptor::FieldType(_), ReturnDescriptor::Void) => Ok(Value::Void),
         _ => Ok(raw),
     }
 }

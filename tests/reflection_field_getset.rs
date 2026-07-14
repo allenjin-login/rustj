@@ -217,14 +217,14 @@ fn field_get_set_static_end_to_end() {
     );
 }
 
-/// **RED(顺延候选 g)**:实例 `Field.get`/`Field.set`。accessor 对 getter/setter 做非恒等
-/// `asType((LObject;)I)` / `((LObject;I)V)` → `MethodHandleImpl.makePairwiseConvert` 包成
-/// `BoundMethodHandle`(非 DMH);asType 路径触发 `BoundMethodHandle.<clinit>`→`ClassSpecializer`
-/// →`ConstantUtils.referenceClassDesc`→`Class.descriptorString`→`Class.isHidden`(native 缺)→
-/// `ExceptionInInitializerError`;且即使越过,`invokeExact` 于 BMH 须解释 LambdaForm
-/// (rustj 不解释)→ 阻塞于「MethodHandle 直接调用」(CLAUDE.md §9.4 候选 g)。待该层解锁后去 ignore。
+/// **GREEN(Phase G.2.3/G.3)**:实例 `Field.get`/`Field.set` 端到端经真 java.base 字节码 + 完整
+/// LambdaForm 解释。accessor 对实例 getter/setter 做非恒等 `asType((LObject;)I)` /
+/// `((LObject;I)V)` → `MethodHandleImpl.makePairwiseConvert` 包成转换 BMH(Species_LL);其 LF
+/// 读绑定底层 DMH(argL1)再 `invokeBasic(DMH, receiver)`;DMH 的 prepared 字段 LF 为
+/// `fieldOffset → checkBase → UNSAFE → Unsafe.getInt(base, ord)`(`putInt` 同构)。解锁链:
+/// `objectFieldOffset` native 返实例字段 ord → DMH `Accessor.fieldOffset` 存之 →
+/// `invoke_method_ref` 路由 native(原抛 AME)→ `Unsafe.getInt` Instance 分支按 ord 直读实例槽。
 #[test]
-#[ignore = "实例 Field.get/set 阻塞于 MethodHandle 直接调用(顺延候选 g);静态已通见 field_get_set_static_end_to_end"]
 fn field_get_set_instance_end_to_end() {
     let Some(mut vm) = setup_vm() else { return };
     assert_eq!(run_static_int(&mut vm, "instanceGet"), Ok(7), "Field.get(p) 读 Probe.x==7");

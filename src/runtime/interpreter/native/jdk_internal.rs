@@ -83,6 +83,10 @@ pub(super) fn dispatch(
         ("jdk/internal/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S") => get_short(vm, args),
         ("jdk/internal/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I") => get_int(vm, args),
         ("jdk/internal/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J") => get_long(vm, args),
+        // jdk.internal.misc.Unsafe.putInt(Object,long,int) —— Unsafe.java native。**Phase G.2.3**:
+        // DMH 实例字段 putField prepared LF(Field.set 路径)经之写实例 int 槽:offset = ord
+        //(由 `MethodHandleNatives.objectFieldOffset` 给)→ `write_slot`(Instance=ord/Array=对齐单元素)。
+        ("jdk/internal/misc/Unsafe", "putInt", "(Ljava/lang/Object;JI)V") => put_int(vm, args),
 
         // jdk.internal.misc.Unsafe.objectFieldOffset1(Ljava/lang/Class;Ljava/lang/String;)J
         // —— Unsafe.java:1100 `objectFieldOffset(Class, String)`(jmod 内部转调 `objectFieldOffset1`,
@@ -293,16 +297,36 @@ fn get_short(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
 /// `Unsafe.getInt(Object o, long offset)I`(Unsafe.java:164 native):读 4 字节,小端拼为 int。
 /// 经 `getLongUnaligned`(4 对齐分支)/`getIntUnaligned`(4 对齐分支)及 vectorizedMismatch 尾部调用。
 fn get_int(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
-    let (arr, offset) = match (args.first(), args.get(1)) {
+    let (base, offset) = match (args.first(), args.get(1)) {
         (Some(Value::Reference(r)), Some(Value::Long(o))) => (*r, *o),
         _ => return Err(VmError::BadConstant("Unsafe.getInt 参数形状不符")),
     };
-    let bytes = array_le_bytes(vm, arr, byte_index(offset), 4)?;
+    // Instance 字段:offset = ord → 读实例 int 槽(解锁 DMH 实例字段 LF)。Array 走多字节路径
+    //(vectorizedMismatch / getIntUnaligned 需未对齐多字节读,故不能复用 read_slot 的单元素语义)。
+    if matches!(vm.heap().get(base), Some(Oop::Instance(_))) {
+        return match read_slot(vm, base, offset) {
+            Some(Slot::Int(v)) => Ok(Value::Int(v)),
+            _ => Err(throw_exception(vm, "java/lang/InternalError")),
+        };
+    }
+    let bytes = array_le_bytes(vm, base, byte_index(offset), 4)?;
     let mut v: u32 = 0;
     for (i, &b) in bytes.iter().enumerate() {
         v |= (b as u32) << (8 * i);
     }
     Ok(Value::Int(v as i32))
+}
+
+/// `Unsafe.putInt(Object o, long offset, int x)V`(Unsafe.java native)。**Phase G.2.3**:DMH
+/// 实例字段 putField prepared LF(Field.set 路径):offset = ord → `write_slot`(Instance=ord 写
+/// 实例 int 槽;Array=(offset-ABASE)/scale 对齐单元素写)。单线程 volatile=plain。
+fn put_int(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+    let (base, offset, value) = match (args.first(), args.get(1), args.get(2)) {
+        (Some(Value::Reference(r)), Some(Value::Long(o)), Some(Value::Int(v))) => (*r, *o, *v),
+        _ => return Err(VmError::BadConstant("Unsafe.putInt 参数形状不符")),
+    };
+    write_slot(vm, base, offset, Slot::Int(value))?;
+    Ok(Value::Void)
 }
 
 /// `Unsafe.getLong(Object o, long offset)J`(Unsafe.java:243 native):读 8 字节,小端拼为 long。

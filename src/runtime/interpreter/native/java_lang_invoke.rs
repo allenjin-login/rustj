@@ -70,10 +70,14 @@ pub(super) fn dispatch(
             Ok(Value::Reference(mname))
         }
 
-        // objectFieldOffset(MemberName)J —— DirectMethodHandle.make 字段分支调(DirectMethodHandle.java:116)
-        // 取偏移。rustj shortcut **不读** offset(B.5.2 钩子直读 member);返 0 作 dummy。
+        // objectFieldOffset(MemberName)J —— DirectMethodHandle.make 实例字段分支调(DirectMethodHandle.java:120)
+        // 取偏移,存入 `Accessor.fieldOffset`(DMH 实例字段),供 prepared 字段 LF 的 `fieldOffset(dmh)`
+        // 节点读出、再喂 `Unsafe.getInt(base, ord)`。rustj 无真实内存偏移:**返字段在声明类扁平实例
+        // 布局中的序号(ord)**(同 `objectFieldOffset1` 的内部自洽模型),`Unsafe.getInt` 据 base 为
+        // Instance 时按 ord 直读实例槽。读 MemberName.clazz(声明类镜像)+ name(字段名)→
+        // `resolve_instance_field_by_name`(仅名匹配)。未找到 → -1。
         ("java/lang/invoke/MethodHandleNatives", "objectFieldOffset", "(Ljava/lang/invoke/MemberName;)J") => {
-            Ok(Value::Long(0))
+            object_field_offset(vm, args)
         }
 
         // staticFieldOffset(MemberName)J —— HotSpot `init_field_MemberName` 填的 vmindex(fd.offset()
@@ -164,6 +168,39 @@ fn static_field_offset(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
     let ord = vm
         .registry()
         .and_then(|reg| reg.resolve_static_field_by_name(&internal, &field_name))
+        .map(|(_, o)| o as i64)
+        .unwrap_or(-1);
+    Ok(Value::Long(ord))
+}
+
+/// `MethodHandleNatives.objectFieldOffset(MemberName)`:返实例字段在声明类扁平实例布局中的
+/// **序号**(ord;rustj 无真实内存偏移,以 ord 代之,与 `Unsafe.getInt` 的 Instance 路径自洽)。
+/// DMH 实例字段 Accessor 存此 ord 作 `fieldOffset`,prepared 字段 LF 经 `fieldOffset(dmh)` 读出、
+/// 喂 `Unsafe.getInt(base, ord)`。读 MemberName.clazz(声明类 Class 镜像)+ name(字段名 String)→
+/// `resolve_instance_field_by_name`(仅名匹配)。各步 `&self`/`&mut self` 读出块即释放。未找到 → -1。
+fn object_field_offset(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+    let mname = match args.first().copied() {
+        Some(Value::Reference(r)) if !r.is_null() => r,
+        _ => return Ok(Value::Long(-1)),
+    };
+    let Some(clazz_mirror) = vm.instance_reference_field(mname, "java/lang/invoke/MemberName", "clazz")
+    else {
+        return Ok(Value::Long(-1));
+    };
+    let Some(name_ref) = vm.instance_reference_field(mname, "java/lang/invoke/MemberName", "name")
+    else {
+        return Ok(Value::Long(-1));
+    };
+    let Some(internal) = vm.mirror_internal_name(clazz_mirror) else {
+        return Ok(Value::Long(-1));
+    };
+    let field_name = match super::super::string::read_text(vm, name_ref)? {
+        Some(t) => t,
+        None => return Ok(Value::Long(-1)),
+    };
+    let ord = vm
+        .registry()
+        .and_then(|reg| reg.resolve_instance_field_by_name(&internal, &field_name))
         .map(|(_, o)| o as i64)
         .unwrap_or(-1);
     Ok(Value::Long(ord))

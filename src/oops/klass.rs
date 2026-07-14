@@ -382,6 +382,25 @@ impl ClassRegistry {
         None
     }
 
+    /// 在 `class_name` 的**扁平实例布局**(含超类字段前缀)中按名定位实例字段 → 全局序号。
+    /// 供 `MethodHandleNatives.objectFieldOffset` 用:MemberName.type 对字段存 `Class` 对象
+    /// 非描述符串,故按名定位(同一类内实例字段名唯一足够)。序号 = `flattened_instance_fields`
+    /// 中的位置,与 `InstanceOop` 实际槽位对齐(`objectFieldOffset` 给出的 ord 即
+    /// `Unsafe.getInt(base, ord)` 的偏移)。返 `(lc, ord)`,`lc` 仅为承载扁平布局(实例槽位
+    /// 已含超类前缀,ord 直接索引目标实例,不区分手声明类)。
+    pub fn resolve_instance_field_by_name(
+        &self,
+        class_name: &str,
+        name: &str,
+    ) -> Option<(Arc<LoadedClass>, usize)> {
+        let lc = self.get(class_name)?;
+        let ord = self
+            .flattened_instance_fields(&lc)
+            .iter()
+            .position(|f| f.name == name)?;
+        Some((lc, ord))
+    }
+
     /// 虚分派:从 `class_name` 沿超类链找首个 (name, desc) 方法 → (声明类, 方法在 `cf.methods`
     /// 的下标)。声明类返 owned `Arc`,方法下标由调用方经 `&lc.cf.methods[idx]` 再取(`lc: Arc`
     /// 持有数据,借用其 methods 平凡合法——owned Arc 解耦,无需 `&'a self` 绑定)。

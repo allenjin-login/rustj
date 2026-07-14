@@ -313,10 +313,23 @@ fn eval_compute_node(
                 .ok_or(VmError::BadConstant("internalMemberName:receiver 无 member 字段"))?;
             Ok(Slot::Reference(m))
         }
-        // linkTo*/invokeBasic:末参为 MemberName,以其派发前置实参(HotSpot linkTo 内联)。
-        ("java/lang/invoke/MethodHandle", m)
-            if m.starts_with("linkTo") || m == "invokeBasic" =>
-        {
+        // invokeBasic(targetMH, args...):签名多态原语 —— arg[0] 为目标 MethodHandle,语义 = 递归
+        // 解释目标 MH 的 LambdaForm,arg[1..] 为其入口参数(无 MemberName、无类型检查)。对应 HotSpot
+        // LF 解释 `Name(invokeBasic,[mh,a1,...])` = `mh.invokeBasic(a1,...)`。转换 BMH 的 LF 即用此
+        // 调所绑定的底层 DMH(`Name(argL1)` 取出 → `invokeBasic(DMH, receiver)`)。
+        ("java/lang/invoke/MethodHandle", "invokeBasic") => {
+            let target = match arg_slots.first() {
+                Some(Slot::Reference(r)) if !r.is_null() => *r,
+                _ => return Err(VmError::BadConstant("invokeBasic:缺目标 MH")),
+            };
+            let rest: Vec<Arg> = arg_slots[1..]
+                .iter()
+                .map(|s| slot_to_arg(*s))
+                .collect::<Result<_, _>>()?;
+            Ok(value_to_slot(interpret_lambda_form(vm, target, &rest)?))
+        }
+        // linkTo*:末参为 MemberName,以其派发前置实参(HotSpot linkTo 内联)。
+        ("java/lang/invoke/MethodHandle", m) if m.starts_with("linkTo") => {
             link_to_member(vm, &arg_slots)
         }
         // 直接节点:getterFunction/方法 NamedFunction —— member 自身的 refKind 决定字段读/方法调。
@@ -552,6 +565,22 @@ fn invoke_method_ref(
         }
     };
     let target_method = &target_lc.cf.methods[target_idx];
+    // ACC_NATIVE(无 Code;如 `Unsafe.getInt(Object,J)`)→ 内置 native 分派表(同正常 invoke 路径):
+    // 静态 this=None nargs=全部实参;实例 this=receiver、nargs=实参去 receiver。声明类 = 解析目标类。
+    if target_method.access_flags.is_native() {
+        let this = if is_static { None } else { receiver };
+        let nargs: Vec<Value> = if is_static {
+            method_args.iter().copied().map(Value::from).collect()
+        } else {
+            method_args
+                .iter()
+                .skip(1)
+                .copied()
+                .map(Value::from)
+                .collect()
+        };
+        return native::invoke(vm, &resolve_class, &method_name, &desc, this, &nargs);
+    }
     let Some(code) = target_method.code.as_ref() else {
         return Err(throw_exception(vm, "java/lang/AbstractMethodError"));
     };

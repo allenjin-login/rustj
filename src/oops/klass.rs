@@ -6,7 +6,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
 
 use crate::classfile::ClassFileError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
@@ -38,6 +39,15 @@ pub enum InitState {
     Failed,
 }
 
+/// 类初始化锁槽(JVMS §5.5 并发初始化):`state` 与 `owner`(正在跑 `<clinit>` 的线程)同锁,
+/// 使"检查状态 → 置 InProgress(owner=cur)"原子化;`owner==cur` 区分**重入**(同线程递归触发
+/// 本类 init,直接返)与**他线程进行中**(须 `init_cvar` 等待至 Done/Failed)。`<clinit>` 执行
+/// 期间**不持本锁**(释放后跑,免重入死锁;对应 JVMS §5.5 step 6 释放 LC)。
+pub(crate) struct InitSlot {
+    pub(crate) state: InitState,
+    pub(crate) owner: Option<ThreadId>,
+}
+
 /// 已加载的类:`ClassFile` + 本类实例/静态字段布局 + 静态字段存储 + 超类关系。
 ///
 /// `instance_fields` 为**本类声明**的实例字段;**继承字段**经
@@ -56,8 +66,12 @@ pub struct LoadedClass {
     pub static_storage: Mutex<Vec<Slot>>,
     super_class_name: Option<String>,
     flat_cache: Mutex<Option<Vec<ResolvedField>>>,
-    /// 类初始化状态(4.9 `<clinit>`):首次 active use 时由解释器推进。
-    init_state: Mutex<InitState>,
+    /// 类初始化状态(JVMS §5.5):`state` + `owner` 同锁原子推进;`<clinit>` 执行期释放本锁
+    ///(`ensure_class_initialized` 置 InProgress 后释锁跑 clinit,完后再锁置 Done/Failed + notify)。
+    pub(crate) init: Mutex<InitSlot>,
+    /// 类初始化等待条件变量:他线程正跑 `<clinit>`(state=InProgress 且 owner≠cur)时,
+    /// 调用方 `wait` 至 owner 线程置 Done/Failed 并 `notify_all`。
+    pub(crate) init_cvar: Condvar,
     /// 是否为**合成引导桩**(非从真实 `.class` 解析)。由 [`ClassRegistry::load_stub`] 置位;
     /// 真类(经 `load`/`load_or_replace` 从容器解析)恒为 `false`。闭包加载器据此识别「待真类
     /// 覆盖」的桩并跳过已是真类者(幂等)。
@@ -93,14 +107,17 @@ impl LoadedClass {
         self.super_class_name.as_deref()
     }
 
-    /// 类初始化状态(4.9)。
+    /// 类初始化状态(JVMS §5.5)。读 `init` 锁槽的 `state` 字段(供 `Unsafe.shouldBeInitialized0`
+    /// 等外部判定;`!= Done` 即未完成)。
     pub fn init_state(&self) -> InitState {
-        *self.init_state.lock().unwrap()
+        self.init.lock().unwrap().state
     }
 
-    /// 设置类初始化状态(4.9)。经 `Mutex` 内部可变性。
+    /// 设置类初始化状态(测试用;置 `state` 并清 `owner`,免遗留不一致)。
     pub fn set_init_state(&self, state: InitState) {
-        *self.init_state.lock().unwrap() = state;
+        let mut slot = self.init.lock().unwrap();
+        slot.state = state;
+        slot.owner = None;
     }
 
     /// 是否为合成引导桩(非真实 `.class`)。真类恒为 `false`。
@@ -135,7 +152,11 @@ impl LoadedClass {
             static_storage: Mutex::new(layout.static_storage),
             super_class_name,
             flat_cache: Mutex::new(None),
-            init_state: Mutex::new(InitState::NotStarted),
+            init: Mutex::new(InitSlot {
+                state: InitState::NotStarted,
+                owner: None,
+            }),
+            init_cvar: Condvar::new(),
             is_synthetic_stub: false,
         })
     }

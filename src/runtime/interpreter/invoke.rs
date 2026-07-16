@@ -729,7 +729,7 @@ fn dispatch_method_handle_field(
     ) {
         return Ok(None);
     }
-    // clazz → 声明类内部名(镜像经 mirror_class 反查)。
+    // clazz → 声明类内部名(镜像经 ClassMirrors 反查 ref→name)。
     let clazz_mirror = vm
         .instance_reference_field(member, "java/lang/invoke/MemberName", "clazz")
         .filter(|r| !r.is_null())

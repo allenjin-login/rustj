@@ -208,16 +208,12 @@ pub(crate) struct Vm {
     /// 异常 → 元数据(帧 / cause / detailMessage),键 = 异常对象句柄。Mutex(B.2.3b 共享态)。
     /// `ExceptionMeta` 在 [`exceptions`](`pub(super)` 供本字段命名类型)。
     exception_meta: Mutex<HashMap<Reference, exceptions::ExceptionMeta>>,
-    /// Class 镜像 intern 表(4.10t):内部类名(`java/lang/Foo`、`int`、`[I` …)→ 唯一 Class
-    /// 镜像引用。对应 HotSpot 每个 `Klass` 持有单一 `_java_mirror`(Class 对象)。保证
-    /// `Foo.class == Foo.class`、`obj.getClass() == Foo.class` 等 Class 对象身份相等。
-    /// Mutex(B.2.3b 共享态)。
-    class_mirrors: Mutex<HashMap<String, Reference>>,
-    /// Class 镜像反查表(4.12):镜像引用 → 所表示类型的内部名。供 Class native
-    /// (`getSuperclass`/`isInstance`/`isAssignableFrom`/`initClassName`…)由镜像反查类。
-    /// 镜像现为真 `java/lang/Class` Instance,Instance 本身不记所表示的类 → 须此表。
-    /// Mutex(B.2.3b 共享态)。
-    mirror_class: Mutex<HashMap<Reference, String>>,
+    /// Class 镜像**双向表**(4.10t/4.12):内部类名 ↔ 唯一 Class 镜像引用,两方向皆查
+    ///(name→ref intern + ref→name Class native 反查)。两方向同把 `Mutex` **原子**插入,
+    /// 保证「同生共灭」不变量(取代旧 `class_mirrors`+`mirror_class` 双 `Mutex` 双表)。
+    /// 对应 HotSpot 每 `Klass` 的单一 `_java_mirror`。见 [`mirrors::ClassMirrors`]。
+    /// Module 反向走 Instance 字段(`module_mirrors` 单向,无需双向表)。
+    class_mirrors: mirrors::ClassMirrors,
     /// 命名 Module 镜像表(4.14a):模块名(`java.base`)→ 真 `java/lang/Module` Instance 引用。
     /// 同名模块恒同引用(对应 HotSpot 每个 `Module` 类实例单例)。`name` 字段填模块名;
     /// 无名模块走 [`Vm::unnamed_module`](单例,`name` 字段 null)。Mutex(B.2.3b 共享态)。
@@ -244,8 +240,7 @@ impl Vm {
             monitors: Mutex::new(HashMap::new()),
             threads: threads::ThreadManager::new(),
             exception_meta: Mutex::new(HashMap::new()),
-            class_mirrors: Mutex::new(HashMap::new()),
-            mirror_class: Mutex::new(HashMap::new()),
+            class_mirrors: mirrors::ClassMirrors::new(),
             module_mirrors: Mutex::new(HashMap::new()),
             unnamed_module: Mutex::new(None),
             phase: Mutex::new(VmPhase::Created),

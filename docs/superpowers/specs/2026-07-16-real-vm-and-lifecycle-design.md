@@ -14,7 +14,7 @@
 
 | 缺失 | 现状 | 补 |
 |---|---|---|
-| 生命周期状态 | 无;Phase1/2/3 由 `launch.rs` 自由函数散调,无统一入口、无幂等保证 | `VmPhase` 状态机 + `Vm::bootstrap()` 幂等入口 |
+| 生命周期状态 | 无;Phase1/2/3 由 `launch.rs` 自由函数散调,无统一入口、无幂等保证 | `VmPhase` 状态机 + `VmThread::bootstrap()` 幂等入口 |
 | 真线程注册表 | `ThreadManager.handles`(JoinHandle 表,join 后删除)非可遍历活线程集 | `ThreadManager` + `live` 活线程集(register/unregister/iter) |
 | Shutdown | 完全没有 | `Runtime.addShutdownHook` 等 native + `Vm::shutdown()`(跑 hooks + join-all) |
 
@@ -92,29 +92,37 @@ pub(crate) enum VmPhase { Created, Bootstrapping, Running, ShuttingDown }
 
 ## 3. 生命周期
 
-### 3.1 `Vm::bootstrap(&self) -> Result<(), VmError>`(幂等)
+### 3.1 `VmThread::bootstrap(&mut self) -> Result<(), VmError>`(幂等)
 
-唯一入口,串行驱动现有 `launch.rs` 三步:
+唯一入口,串行驱动现有 `launch.rs` 三步。**签名抉择(2026-07-16 定 B)**:`launch.rs` 三步须
+`&mut VmThread`(跑字节码),而 `Vm` 是 `Arc` 共享(无 `&mut Vm`)。两候选:
+
+- (A) `Vm::bootstrap(&self)` 内部自建一次性主 VmThread —— HotSpot faithful(`Threads::create_vm`
+  自建主线程),但调用方 VmThread 与 bootstrap 主 VmThread 分离,main_thread 身份须另存字段。
+- (B) `VmThread::bootstrap(&mut self)` 复用调用方 VmThread —— 无一次性 VmThread;三步本就接
+  `&mut VmThread`,签名零阻力;契合 rustj 当前「首个 VmThread = main」假设(`alloc_main_thread`)。
+
+**选 B**:调用方的 VmThread 直接跑三步、即为主线程;phase 经 `self.vm.phase`(Mutex)跟踪。
 
 ```rust
-pub fn bootstrap(&self) -> Result<(), VmError> {
-    let mut p = self.phase.lock().unwrap();
-    match *p {
-        VmPhase::Created => *p = VmPhase::Bootstrapping,
-        VmPhase::Running | VmPhase::ShuttingDown => return Ok(()),  // 幂等
-        VmPhase::Bootstrapping => return Err(InternalError("bootstrap 重入")),  // 同线程不应重入
+impl VmThread {
+    pub fn bootstrap(&mut self) -> Result<(), VmError> {
+        {
+            let mut p = self.vm.phase.lock().unwrap();
+            match *p {
+                VmPhase::Created => *p = VmPhase::Bootstrapping,
+                VmPhase::Running | VmPhase::ShuttingDown => return Ok(()),  // 幂等
+                VmPhase::Bootstrapping => return Err(InternalError("bootstrap 重入")),
+            }
+        }
+        launch::initialize_system_class(self)?;         // Phase 1
+        launch::bootstrap_module_system(self)?;         // Phase 2
+        launch::bootstrap_java_lang_invoke(self)?;      // Phase 3 lite
+        *self.vm.phase.lock().unwrap() = VmPhase::Running;
+        Ok(())
     }
-    drop(p);
-    // 须在主 VmThread 上跑(经解释器执行真字节码)——调用方传入,或 bootstrap 自建一个主 VmThread。
-    launch::initialize_system_class(&mut main_vt)?;   // Phase 1
-    launch::bootstrap_module_system(&mut main_vt)?;   // Phase 2
-    launch::bootstrap_java_lang_invoke(&mut main_vt)?;// Phase 3 lite
-    *self.phase.lock().unwrap() = VmPhase::Running;
-    Ok(())
 }
 ```
-
-**签名抉择**:`launch.rs` 三步须 `&mut VmThread`(跑字节码),而 `Vm` 是 `Arc` 共享(无 `&mut Vm`)。故 `bootstrap` 内部自建一个**主 `VmThread`**(`VmThread::from_vm(Arc::clone(&self))`)承载执行,跑完丢弃。`Vm` 不长期持有该 VmThread(主线程身份经 `main_thread` 单例字段保留,§4.3)。
 
 ### 3.2 `Vm::shutdown(&self)`(§5)
 
@@ -216,7 +224,7 @@ pub fn shutdown(&self) -> Result<(), VmError> {
 
 - **V-2 `VmPhase` + `bootstrap()` 幂等入口**
   - RED:`bootstrap()` 第二次调用须幂等返 Ok(不重跑 Phase1/2/3);首调前置 `Running`。lib 测:mock 注册表断 phase 转换 + 幂等。
-  - GREEN:实现 `phase` + `bootstrap`(自建主 VmThread 跑 launch 三步)。
+  - GREEN:实现 `phase` + `VmThread::bootstrap`(复用 self 跑 launch 三步;Option B)。
   - 闸门:`bootstrap` 跑后 `initLevel==2`、`javaLangInvokeInited==true`(复用 launch.rs tests 的断言)+ 幂等。
 
 - **V-3 `ThreadManager` 活线程集 + `main_thread` 单例**
@@ -241,7 +249,7 @@ pub fn shutdown(&self) -> Result<(), VmError> {
 
 **风险**
 - V-1 改动面大(~439 类型位)——靠 IDE 符号重命名 + 既有测试安全网;rust-analyzer 诊断过期,以 `cargo build --lib --tests`/clippy 为准(memory)。
-- `bootstrap` 自建主 VmThread 跑 launch 三步——launch.rs 内部 `&mut VmThread` 假设(§6 NLL trick)须仍成立;`Arc<Vm>` deref 后 `self.vm.heap` 等透明,预期无借用回归,但须验。
+- `VmThread::bootstrap` 复用调用方 VmThread(Option B)跑 launch 三步——launch.rs 内部 `&mut VmThread` 假设(§6 NLL trick)须仍成立;phase 经 `self.vm.phase`(Mutex),`Arc<Vm>` deref 后 `self.vm.heap` 等透明,预期无借用回归,但须验。
 - shutdown hook 串行跑(不真起 OS 线程)——与 HotSpot「hook 各自线程并发」不同;记为已知简化。
 
 **非目标(顺延)**

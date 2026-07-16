@@ -811,4 +811,69 @@ mod tests {
             "SharedSecrets.javaLangInvokeAccess 须非 null(MethodHandleImpl <clinit> 须装 JLIA)"
         );
     }
+
+    /// **RED→GREEN**(Phase V-2):`VmThread::bootstrap()` 串行驱动 Phase1/2/3 + `VmPhase` 状态机
+    /// (Created→Bootstrapping→Running)+ 幂等(二次调 no-op 返 Ok)。证明 bootstrap 真跑三步
+    /// (非仅翻 phase):闸门 `VM.initLevel==2`(Phase2 置)+ `VM.javaLangInvokeInited==true`(Phase3 置)。
+    #[test]
+    fn bootstrap_orchestrates_phases_and_is_idempotent() {
+        use crate::metadata::descriptor::FieldType;
+        use crate::runtime::vm::VmPhase;
+        use crate::runtime::Slot;
+
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        // Phase1/2/3 所需种子类并集(各 launch 单测种子 + ModuleLayer[Phase2 显式 get])。
+        for c in [
+            "java/lang/Module",
+            "java/lang/ModuleLayer",
+            "java/lang/Integer",
+            "java/util/HashMap",
+            "java/lang/module/ModuleDescriptor",
+            "java/lang/Object",
+            "java/lang/invoke/MethodHandleImpl",
+            "java/lang/invoke/MethodHandleNatives",
+            "jdk/internal/misc/VM",
+            "jdk/internal/access/SharedSecrets",
+        ] {
+            load_closure(&mut registry, &cp, c).unwrap();
+        }
+
+        let mut vm = VmThread::new(registry);
+        assert_eq!(vm.phase(), VmPhase::Created, "初始 phase 须 Created");
+
+        vm.bootstrap().expect("bootstrap 须跑通 Phase1/2/3");
+        assert_eq!(vm.phase(), VmPhase::Running, "bootstrap 后 phase 须 Running");
+
+        // bootstrap 须真跑三步(非仅翻 phase):Phase2 置 initLevel==2、Phase3 置 javaLangInvokeInited==1。
+        let reg = vm.registry().expect("须注册表");
+        let (lc, ord) = reg
+            .resolve_static_field("jdk/internal/misc/VM", "initLevel", &FieldType::Int)
+            .expect("VM.initLevel 静态字段未找到");
+        assert!(
+            matches!(lc.static_storage.lock().unwrap()[ord], Slot::Int(2)),
+            "Phase2 须置 VM.initLevel==2"
+        );
+        let (lc, ord) = reg
+            .resolve_static_field(
+                "jdk/internal/misc/VM",
+                "javaLangInvokeInited",
+                &FieldType::Boolean,
+            )
+            .expect("VM.javaLangInvokeInited 静态字段未找到");
+        assert!(
+            matches!(lc.static_storage.lock().unwrap()[ord], Slot::Int(1)),
+            "Phase3 须置 VM.javaLangInvokeInited==true"
+        );
+
+        // 幂等:二次 bootstrap no-op 返 Ok,phase 仍 Running(reg 为 owned Arc clone,不借 vm)。
+        vm.bootstrap().expect("二次 bootstrap 须幂等返 Ok");
+        assert_eq!(vm.phase(), VmPhase::Running, "幂等二次调 phase 须仍 Running");
+    }
 }

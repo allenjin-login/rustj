@@ -19,6 +19,20 @@ use crate::oops::ClassRegistry;
 use crate::runtime::heap::Heap;
 use crate::runtime::string_pool::StringPool;
 use crate::runtime::Reference;
+use crate::runtime::interpreter::{launch, VmError};
+
+/// VM 生命周期阶段(Phase V)。粗粒度跟踪 Rust 侧生命周期——Java 侧 `initLevel` 0..3 仍由
+/// `launch.rs` 经字节码置(Java 层事实源,不复刻到 Rust 避免双源真相)。`VmThread::bootstrap`
+/// Created→Bootstrapping→Running;`Vm::shutdown`(V-5)Running→ShuttingDown。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VmPhase {
+    Created,
+    Bootstrapping,
+    Running,
+    /// `Vm::shutdown`(V-5)构造;本层 bootstrap 幂等匹配已引用,暂无构造点。
+    #[allow(dead_code)]
+    ShuttingDown,
+}
 
 mod exceptions;
 mod mirrors;
@@ -211,6 +225,8 @@ pub(crate) struct Vm {
     /// 无名模块单例引用(惰性分配,4.14a)。`Module.getName()` 返 null → `isNamed()`=false。
     /// Mutex(B.2.3b 共享态)。
     unnamed_module: Mutex<Option<Reference>>,
+    /// VM 生命周期阶段(Phase V)。`bootstrap` Created→Bootstrapping→Running;`shutdown`→ShuttingDown。
+    phase: Mutex<VmPhase>,
 }
 
 impl Vm {
@@ -228,6 +244,7 @@ impl Vm {
             mirror_class: Mutex::new(HashMap::new()),
             module_mirrors: Mutex::new(HashMap::new()),
             unnamed_module: Mutex::new(None),
+            phase: Mutex::new(VmPhase::Created),
         }
     }
 }
@@ -280,6 +297,36 @@ impl VmThread {
     /// B.3.0:返 `Arc<Runtime>`(`'static`),B.3b `start_thread` `move` 进 `thread::spawn` 闭包。
     pub(crate) fn vm_arc(&self) -> Arc<Vm> {
         Arc::clone(&self.vm)
+    }
+
+    /// 当前 VM 生命周期阶段(Phase V)。
+    #[allow(dead_code)] // 仅 #[cfg(test)] 闸门引用 → 非 test lib 构建视为 dead(V-3/V-4 起常途消费)。
+    pub(crate) fn phase(&self) -> VmPhase {
+        *self.vm.phase.lock().unwrap()
+    }
+
+    /// **VM 引导入口(Phase V-2,Option B)**:串行驱动 `launch.rs` Phase1/2/3 + `VmPhase` 状态机
+    /// (Created→Bootstrapping→Running)。**幂等**:phase 已 `Running`/`ShuttingDown` 时 no-op 返 Ok
+    /// (不重跑三步);`Bootstrapping`(同线程重入)→ `Err`。调用方 VmThread 直接跑三步、即为主线程
+    /// (phase 经 `self.vm.phase` 跨 `from_vm` 派生线程共享)。
+    pub fn bootstrap(&mut self) -> Result<(), VmError> {
+        {
+            let mut p = self.vm.phase.lock().unwrap();
+            match *p {
+                VmPhase::Created => *p = VmPhase::Bootstrapping,
+                VmPhase::Running | VmPhase::ShuttingDown => return Ok(()), // 幂等
+                VmPhase::Bootstrapping => {
+                    return Err(VmError::BadConstant(
+                        "bootstrap 重入:phase Bootstrapping(同线程不应重入)",
+                    ))
+                }
+            }
+        }
+        launch::initialize_system_class(self)?; // Phase 1:savedProps 引导
+        launch::bootstrap_module_system(self)?; // Phase 2:模块层 + initLevel(2)
+        launch::bootstrap_java_lang_invoke(self)?; // Phase 3 lite:java.lang.invoke
+        *self.vm.phase.lock().unwrap() = VmPhase::Running;
+        Ok(())
     }
 
     /// 设置帧深度上限(builder)。SOE 测试用小值快速触发。

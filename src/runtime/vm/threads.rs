@@ -78,7 +78,7 @@ impl VmThread {
     /// `new Thread(r)` 构造器读 `parent.getThreadGroup()`/`getPriority()`/`isDaemon()`(均经 holder)。
     fn alloc_main_thread(&mut self) -> Reference {
         let inst = {
-            let Some(reg) = self.vm.registry.as_ref() else {
+            let Some(reg) = self.runtime.registry.as_ref() else {
                 return Reference::null();
             };
             let Some(lc) = reg.get("java/lang/Thread") else {
@@ -105,12 +105,12 @@ impl VmThread {
     /// 系统 ThreadGroup 单例(惰性;B.4a)。对应 HotSpot 顶层 "system"/"main" 组(`Threads::create_vm`)。
     /// 命中缓存即返;否则 [`Self::alloc_system_thread_group`] 分配并缓存。未加载 ThreadGroup → null。
     pub(crate) fn system_thread_group(&mut self) -> Reference {
-        if let Some(r) = *self.vm.threads.system_group.lock().unwrap() {
+        if let Some(r) = *self.runtime.threads.system_group.lock().unwrap() {
             return r;
         }
         let r = self.alloc_system_thread_group();
         if !r.is_null() {
-            *self.vm.threads.system_group.lock().unwrap() = Some(r);
+            *self.runtime.threads.system_group.lock().unwrap() = Some(r);
         }
         r
     }
@@ -120,7 +120,7 @@ impl VmThread {
     /// `new Thread(r)` 构造器经 `parent.getThreadGroup()` 复用此组。未加载 → null。
     fn alloc_system_thread_group(&mut self) -> Reference {
         let inst = {
-            let Some(reg) = self.vm.registry.as_ref() else {
+            let Some(reg) = self.runtime.registry.as_ref() else {
                 return Reference::null();
             };
             let Some(lc) = reg.get("java/lang/ThreadGroup") else {
@@ -151,7 +151,7 @@ impl VmThread {
             return;
         }
         let holder = {
-            let Some(reg) = self.vm.registry.as_ref() else {
+            let Some(reg) = self.runtime.registry.as_ref() else {
                 return;
             };
             let Some(lc) = reg.get("java/lang/Thread$FieldHolder") else {
@@ -200,7 +200,7 @@ impl VmThread {
     /// 取并递增下一线程 tid(供 Thread 镜像 tid 字段;main 线程取首值 1,后续递增)。
     /// T7:`next_tid` 从 `VmShared` 顶层迁入 [`ThreadManager`](`self.shared.threads`)。
     pub(crate) fn next_thread_tid(&mut self) -> u64 {
-        let mut tid = self.vm.threads.next_tid.lock().unwrap();
+        let mut tid = self.runtime.threads.next_tid.lock().unwrap();
         let v = *tid;
         *tid += 1;
         v
@@ -209,13 +209,13 @@ impl VmThread {
     /// 读堆外「下一线程 tid」计数器(`Unsafe.getLongVolatile(null, NEXT_THREAD_ID_OFFSET)`,
     /// 经 `ThreadIdentifiers.next()→getAndAddLong`)。返回当前值(自增前)。见 [`Vm::next_thread_tid`]。
     pub(crate) fn read_next_thread_id(&self) -> i64 {
-        *self.vm.threads.next_tid.lock().unwrap() as i64
+        *self.runtime.threads.next_tid.lock().unwrap() as i64
     }
 
     /// CAS 堆外「下一线程 tid」计数器(`Unsafe.compareAndSetLong(null, NEXT_THREAD_ID_OFFSET, e, x)`)。
     /// 当前 == expected → 写 new 返 true,否则 false。单线程构造期首 CAS 必中。供 `getAndAddLong` 循环。
     pub(crate) fn cas_next_thread_id(&self, expected: i64, new: i64) -> bool {
-        let mut g = self.vm.threads.next_tid.lock().unwrap();
+        let mut g = self.runtime.threads.next_tid.lock().unwrap();
         if *g as i64 == expected {
             *g = new as u64;
             true
@@ -227,20 +227,20 @@ impl VmThread {
     /// 注册线程入活线程集(Phase V-3a;对应 HotSpot `Threads::add`,threads.hpp)。`start_thread`
     /// spawn 前同步调(父线程),保证 start0 返时线程已在表(先于子线程 terminate)。
     pub(crate) fn register_thread(&self, r: Reference) {
-        self.vm.threads.live.lock().unwrap().push(r);
+        self.runtime.threads.live.lock().unwrap().push(r);
     }
 
     /// 注销线程出活线程集(Phase V-3a;对应 HotSpot `Threads::remove`)。`terminate_thread` 调;
     /// 幂等(`retain`,不在表亦无副作用)。
     pub(crate) fn unregister_thread(&self, r: Reference) {
-        self.vm.threads.live.lock().unwrap().retain(|x| *x != r);
+        self.runtime.threads.live.lock().unwrap().retain(|x| *x != r);
     }
 
     /// 活线程集快照(Phase V-3a;owned `Vec<Reference>`,锁内 clone 释锁返)。对应 HotSpot
     /// `Threads::threads_do` 访问器子集。供未来 GC 根集扫描 / `Thread.enumerate` / shutdown join-all。
     #[allow(dead_code)] // 仅 #[cfg(test)] 闸门引用 → 非 test lib 构建视为 dead(V-4/V-5 起常途消费)。
     pub(crate) fn iter_live(&self) -> Vec<Reference> {
-        self.vm.threads.live.lock().unwrap().clone()
+        self.runtime.threads.live.lock().unwrap().clone()
     }
 
     /// `Thread.start0` 真起线程(Phase B.3b;移植 `JVM_StartThread`,jvm.cpp)。`this` = Thread
@@ -286,7 +286,7 @@ impl VmThread {
             // B.4b 终止:ensure_join——set TERMINATED + eetop=0 + notifyAll 唤醒 join() 等待者。
             child.terminate_thread(this);
         });
-        self.vm
+        self.runtime
             .threads
             .handles
             .lock()
@@ -301,7 +301,7 @@ impl VmThread {
     /// 非本 Rust 直 join;本方法为 VM 内部确定性等待(测试用)。
     #[allow(dead_code)] // 仅 #[cfg(test)] 闸门引用 → 非 test lib 构建视为 dead。
     pub(crate) fn join_thread(&self, this: Reference) {
-        if let Some(h) = self.vm.threads.handles.lock().unwrap().remove(&this) {
+        if let Some(h) = self.runtime.threads.handles.lock().unwrap().remove(&this) {
             let _ = h.join();
         }
     }
@@ -398,7 +398,7 @@ impl VmThread {
         &self,
         thread: Reference,
     ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        let mut flags = self.vm.threads.interrupt_flags.lock().unwrap();
+        let mut flags = self.runtime.threads.interrupt_flags.lock().unwrap();
         flags
             .entry(thread)
             .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
@@ -420,7 +420,7 @@ impl VmThread {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // 若目标在 Object.wait 中,取其锁对象 → monitor → wait_cvar.notify_all 唤醒(谓词查中断)。
         let lock_obj = self
-            .vm
+            .runtime
             .threads
             .wait_targets
             .lock()
@@ -428,7 +428,7 @@ impl VmThread {
             .get(&target)
             .copied();
         if let Some(lock) = lock_obj
-            && let Some(mon) = self.vm.monitors.lock().unwrap().get(&lock).cloned()
+            && let Some(mon) = self.runtime.monitors.lock().unwrap().get(&lock).cloned()
         {
             mon.wait_cvar.notify_all();
         }
@@ -444,7 +444,7 @@ impl VmThread {
         if cur.is_null() {
             return;
         }
-        if let Some(flag) = self.vm.threads.interrupt_flags.lock().unwrap().get(&cur) {
+        if let Some(flag) = self.runtime.threads.interrupt_flags.lock().unwrap().get(&cur) {
             flag.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -455,7 +455,7 @@ impl VmThread {
     pub(crate) fn clear_interrupt_status(&mut self, thread: Reference) {
         // Java 字段 interrupted = false(真 Thread 写;桩无此字段静默跳过)。
         self.set_instance_field_by_name(thread, "java/lang/Thread", "interrupted", Slot::Int(0));
-        if let Some(flag) = self.vm.threads.interrupt_flags.lock().unwrap().get(&thread) {
+        if let Some(flag) = self.runtime.threads.interrupt_flags.lock().unwrap().get(&thread) {
             flag.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -499,7 +499,7 @@ impl VmThread {
         let trace = self.format_trace(throwable);
         let body = if trace.is_empty() {
             // 无轨迹元数据:退化为仅运行时类名(防御;正常 throw_exception 路径必有元数据)。
-            match self.vm.heap.lock().unwrap().get(throwable) {
+            match self.runtime.heap.lock().unwrap().get(throwable) {
                 Some(Oop::Instance(i)) => i.class_name().to_string(),
                 _ => "java/lang/Throwable".to_string(),
             }

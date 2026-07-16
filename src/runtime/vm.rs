@@ -265,7 +265,7 @@ impl Vm {
 /// → `Arc<Runtime>: 'static` → B.3b `thread::spawn(move || …)` 跨线程共享 `Arc::clone`。
 pub struct VmThread {
     /// 跨线程共享态(堆/注册表/池/管程/镜像表/线程管理器)。`Arc` 共享;字段全 Mutex(`Arc::clone` 派生线程)。
-    vm: Arc<Vm>,
+    runtime: Arc<Vm>,
     /// 当前线程隔离态(调用栈/帧深度/线程镜像)。
     pub(crate) thread: ThreadContext,
 }
@@ -278,7 +278,7 @@ impl VmThread {
     /// → `Vm::new(reg)`(去 `&`,owned 移交)。
     pub fn new(registry: impl Into<Arc<ClassRegistry>>) -> Self {
         Self {
-            vm: Arc::new(Vm::new(Some(registry.into()))),
+            runtime: Arc::new(Vm::new(Some(registry.into()))),
             thread: ThreadContext::new_main(),
         }
     }
@@ -286,9 +286,9 @@ impl VmThread {
     /// 从既有共享态派生新 Vm(B.3b 真线程:每线程各持 `Arc::clone` 的共享态 + 独立 `ThreadContext`)。
     /// 调用方先 [`Vm::shared_arc`] 取 `Arc::clone(&vm.shared)`,再经本方法构造派生线程的 Vm。
     /// 共享态(堆/池/管程/镜像表)跨线程共享;线程隔离态(调用栈/帧深度/线程镜像)各独立。
-    pub(crate) fn from_vm(vm: Arc<Vm>) -> Self {
+    pub(crate) fn from_vm(runtime: Arc<Vm>) -> Self {
         Self {
-            vm,
+            runtime,
             thread: ThreadContext::new_main(),
         }
     }
@@ -296,13 +296,13 @@ impl VmThread {
     /// 取共享态的 `Arc::clone`(供 [`Vm::from_shared`] 派生线程 Vm;`shared` 字段私有)。
     /// B.3.0:返 `Arc<Runtime>`(`'static`),B.3b `start_thread` `move` 进 `thread::spawn` 闭包。
     pub(crate) fn vm_arc(&self) -> Arc<Vm> {
-        Arc::clone(&self.vm)
+        Arc::clone(&self.runtime)
     }
 
     /// 当前 VM 生命周期阶段(Phase V)。
     #[allow(dead_code)] // 仅 #[cfg(test)] 闸门引用 → 非 test lib 构建视为 dead(V-3/V-4 起常途消费)。
     pub(crate) fn phase(&self) -> VmPhase {
-        *self.vm.phase.lock().unwrap()
+        *self.runtime.phase.lock().unwrap()
     }
 
     /// **VM 引导入口(Phase V-2,Option B)**:串行驱动 `launch.rs` Phase1/2/3 + `VmPhase` 状态机
@@ -311,7 +311,7 @@ impl VmThread {
     /// (phase 经 `self.vm.phase` 跨 `from_vm` 派生线程共享)。
     pub fn bootstrap(&mut self) -> Result<(), VmError> {
         {
-            let mut p = self.vm.phase.lock().unwrap();
+            let mut p = self.runtime.phase.lock().unwrap();
             match *p {
                 VmPhase::Created => *p = VmPhase::Bootstrapping,
                 VmPhase::Running | VmPhase::ShuttingDown => return Ok(()), // 幂等
@@ -325,7 +325,7 @@ impl VmThread {
         launch::initialize_system_class(self)?; // Phase 1:savedProps 引导
         launch::bootstrap_module_system(self)?; // Phase 2:模块层 + initLevel(2)
         launch::bootstrap_java_lang_invoke(self)?; // Phase 3 lite:java.lang.invoke
-        *self.vm.phase.lock().unwrap() = VmPhase::Running;
+        *self.runtime.phase.lock().unwrap() = VmPhase::Running;
         Ok(())
     }
 
@@ -338,23 +338,23 @@ impl VmThread {
     /// 对象堆(Mutex 守卫;Phase B.2.3b)。inline 调用经 `Deref` 不破;跨语句绑定 须提取 owned
     ///(`.cloned()`)——`MutexGuard` 借 `&self`,持 guard 跨 `&mut vm` 会 E0502。
     pub fn heap(&self) -> MutexGuard<'_, Heap> {
-        self.vm.heap.lock().unwrap()
+        self.runtime.heap.lock().unwrap()
     }
 
     /// 对象堆(可变访问经 Mutex 内部可变性;`&self` 即可,调用方 `&mut vm` 自动协变)。
     pub fn heap_mut(&self) -> MutexGuard<'_, Heap> {
-        self.vm.heap.lock().unwrap()
+        self.runtime.heap.lock().unwrap()
     }
 
     /// 字符串 intern 池(4.8/4.10i):文本 → 堆引用的纯备忘;真 String 实例构造在
     /// interpreter(`string::intern`),本池仅保证「同文本恒同引用」。
     pub(crate) fn string_pool(&self) -> MutexGuard<'_, StringPool> {
-        self.vm.string_pool.lock().unwrap()
+        self.runtime.string_pool.lock().unwrap()
     }
 
     /// 字符串 intern 池(可变;经 MutexGuard 内部可变性,`&self` 即可,同 `heap_mut`)。
     pub(crate) fn string_pool_mut(&self) -> MutexGuard<'_, StringPool> {
-        self.vm.string_pool.lock().unwrap()
+        self.runtime.string_pool.lock().unwrap()
     }
 
     /// 类注册表(若启用)。**B.3.0**:返 owned `Arc<ClassRegistry>`(cheap refcount clone)。
@@ -362,7 +362,7 @@ impl VmThread {
     ///(保 §6 NLL trick:递归 `interpret_with` 等)。`ClassRegistry` 经 deref 透明用(`.get`/…);
     /// `load_or_replace` 须 `&mut`,故 registry 须**建 Vm 前** owned 载入完毕。
     pub fn registry(&self) -> Option<Arc<ClassRegistry>> {
-        self.vm.registry.clone()
+        self.runtime.registry.clone()
     }
 
     // ---- 栈帧法(T8 下沉 impl ThreadContext;Vm 薄转发,保调用点零改动)----
@@ -391,7 +391,7 @@ impl VmThread {
 impl Default for VmThread {
     fn default() -> Self {
         Self {
-            vm: Arc::new(Vm::new(None)),
+            runtime: Arc::new(Vm::new(None)),
             thread: ThreadContext::new_main(),
         }
     }

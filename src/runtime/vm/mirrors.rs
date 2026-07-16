@@ -18,19 +18,19 @@ impl VmThread {
     /// `name` 由 `getName` 真字节码首次调用时经 `initClassName` 懒填。
     pub(crate) fn intern_class_mirror(&mut self, name: &str) -> Reference {
         // 缓存命中:单次锁取 owned Reference,释 guard 再返(drop-before-recurse;B.2.3b)。
-        if let Some(r) = self.vm.class_mirrors.lock().unwrap().get(name).copied() {
+        if let Some(r) = self.runtime.class_mirrors.lock().unwrap().get(name).copied() {
             return r;
         }
         // 分配真 java/lang/Class Instance(须已加载:引导 Class 桩或经闭包预载的真 Class)。
         let r = self.alloc_class_mirror_instance();
         // 先缓存再填字段:数组组件互递归([LC→C、[[I→[I)经缓存命中终止。
         // 两表分别单语句锁 insert,释 guard 后再 populate(其递归 intern 会再锁→须 drop)。
-        self.vm
+        self.runtime
             .class_mirrors
             .lock()
             .unwrap()
             .insert(name.to_string(), r);
-        self.vm
+        self.runtime
             .mirror_class
             .lock()
             .unwrap()
@@ -42,7 +42,7 @@ impl VmThread {
     /// 镜像所表示类型的内部名(供 Class native 反查)。非镜像引用 → `None`。
     /// 返 owned `String`(mirror_class 已 Mutex 化,无法返借用 &str;B.2.3b)。
     pub(crate) fn mirror_internal_name(&self, r: Reference) -> Option<String> {
-        self.vm.mirror_class.lock().unwrap().get(&r).cloned()
+        self.runtime.mirror_class.lock().unwrap().get(&r).cloned()
     }
 
     /// 分配一个默认初始化的 `java/lang/Class` Instance。无注册表或 `java/lang/Class` 未加载
@@ -55,7 +55,7 @@ impl VmThread {
             return Reference::null();
         };
         let inst = reg.new_instance(&class_lc);
-        self.vm.heap.lock().unwrap().alloc(Oop::Instance(inst))
+        self.runtime.heap.lock().unwrap().alloc(Oop::Instance(inst))
     }
 
     /// 置 VM 管理的 Class 实例字段:`componentType`(数组→组件镜像)、`primitive`(原语→true)、
@@ -137,7 +137,7 @@ impl VmThread {
             .flattened_instance_fields(&lc)
             .iter()
             .position(|f| f.name == field_name)?;
-        let heap = self.vm.heap.lock().unwrap();
+        let heap = self.runtime.heap.lock().unwrap();
         match heap.get(obj)? {
             Oop::Instance(i) => match i.field(ord) {
                 Slot::Reference(r) => Some(r),
@@ -161,7 +161,7 @@ impl VmThread {
             .flattened_instance_fields(&lc)
             .iter()
             .position(|f| f.name == field_name)?;
-        let heap = self.vm.heap.lock().unwrap();
+        let heap = self.runtime.heap.lock().unwrap();
         match heap.get(obj)? {
             Oop::Instance(i) => match i.field(ord) {
                 Slot::Int(v) => Some(v),
@@ -182,14 +182,14 @@ impl VmThread {
             return Reference::null();
         };
         let inst = reg.new_instance(&lc);
-        self.vm.heap.lock().unwrap().alloc(Oop::Instance(inst))
+        self.runtime.heap.lock().unwrap().alloc(Oop::Instance(inst))
     }
 
     /// 命名 Module 镜像(intern:同名恒同引用)。分配真 `java/lang/Module` Instance,置 `name`
     /// 字段 = intern(模块名)。对应 HotSpot 每个 `Module` 单例(JVM 侧 `java_lang_Module`)。
     /// `Module.getName()` 真字节码读 `name` 字段即得模块名;`isNamed()` = `name != null`。
     fn intern_named_module(&mut self, name: &str) -> Reference {        // 缓存命中:单次锁取 owned Reference,释 guard 再返(B.2.3b)。
-        if let Some(r) = self.vm.module_mirrors.lock().unwrap().get(name).copied() {
+        if let Some(r) = self.runtime.module_mirrors.lock().unwrap().get(name).copied() {
             return r;
         }
         let r = self.alloc_module_instance();
@@ -197,7 +197,7 @@ impl VmThread {
             return r;
         }
         // 单语句锁 insert,释 guard 后再 intern/set_field(其内部 &mut self;B.2.3b)。
-        self.vm
+        self.runtime
             .module_mirrors
             .lock()
             .unwrap()
@@ -213,12 +213,12 @@ impl VmThread {
     /// `getName()` 返 null、`isNamed()`=false。用户类(非模块源)经 [`Self::module_for_class`] 归此。
     fn unnamed_module(&mut self) -> Reference {
         // 命中:单次锁取 owned Option<Reference>(Copy),释 guard 再返(B.2.3b)。
-        if let Some(r) = *self.vm.unnamed_module.lock().unwrap() {
+        if let Some(r) = *self.runtime.unnamed_module.lock().unwrap() {
             return r;
         }
         let r = self.alloc_module_instance();
         if !r.is_null() {
-            *self.vm.unnamed_module.lock().unwrap() = Some(r);
+            *self.runtime.unnamed_module.lock().unwrap() = Some(r);
         }
         r
     }

@@ -1473,6 +1473,14 @@ public class Worker extends Thread {
             42,
             "start0 须起子线程跑 run() 写 v=42"
         );
+
+        // 7) Phase V-3a 接线闸门:join 后子线程 terminate_thread 已跑 → 须从活线程集注销
+        //    (确定性:join 等到 run() 完 → terminate → unregister;start→register 半侧由
+        //    threads.rs `live_registry_register_unregister_iter` 单测 + start_thread 同步 register 保证)。
+        assert!(
+            !vm.iter_live().contains(&w),
+            "join 后线程须已 unregister 出 live"
+        );
     }
 
     /// 取实例 `referent` 字段序号(声明于 Reference;子类扁平布局同序)。

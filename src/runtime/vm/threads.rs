@@ -30,6 +30,11 @@ pub(crate) struct ThreadManager {
     /// 每线程**正在 Object.wait 的锁对象**(B.4c):`interrupt0` 据此找目标线程阻塞的 monitor →
     /// `wait_cvar.notify_all` 唤醒(谓词查中断标志 → 抛 InterruptedException)。无条目 = 未在 wait 中。
     pub(crate) wait_targets: std::sync::Mutex<std::collections::HashMap<Reference, Reference>>,
+    /// 活线程集(Phase V-3a):`start_thread` spawn 前同步 register,`terminate_thread` 注销。对应
+    /// HotSpot `Threads::_thread_list`(活 JavaThread 单链)+ `add`/`remove`(threads.hpp)。
+    /// `iter_live` 返 owned 快照(锁内 clone、释锁),供未来 GC 根集扫描 / `Thread.enumerate` /
+    /// shutdown join-all。
+    pub(crate) live: std::sync::Mutex<Vec<Reference>>,
 }
 
 impl ThreadManager {
@@ -41,6 +46,7 @@ impl ThreadManager {
             system_group: std::sync::Mutex::new(None),
             interrupt_flags: std::sync::Mutex::new(std::collections::HashMap::new()),
             wait_targets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            live: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -218,6 +224,25 @@ impl VmThread {
         }
     }
 
+    /// 注册线程入活线程集(Phase V-3a;对应 HotSpot `Threads::add`,threads.hpp)。`start_thread`
+    /// spawn 前同步调(父线程),保证 start0 返时线程已在表(先于子线程 terminate)。
+    pub(crate) fn register_thread(&self, r: Reference) {
+        self.vm.threads.live.lock().unwrap().push(r);
+    }
+
+    /// 注销线程出活线程集(Phase V-3a;对应 HotSpot `Threads::remove`)。`terminate_thread` 调;
+    /// 幂等(`retain`,不在表亦无副作用)。
+    pub(crate) fn unregister_thread(&self, r: Reference) {
+        self.vm.threads.live.lock().unwrap().retain(|x| *x != r);
+    }
+
+    /// 活线程集快照(Phase V-3a;owned `Vec<Reference>`,锁内 clone 释锁返)。对应 HotSpot
+    /// `Threads::threads_do` 访问器子集。供未来 GC 根集扫描 / `Thread.enumerate` / shutdown join-all。
+    #[allow(dead_code)] // 仅 #[cfg(test)] 闸门引用 → 非 test lib 构建视为 dead(V-4/V-5 起常途消费)。
+    pub(crate) fn iter_live(&self) -> Vec<Reference> {
+        self.vm.threads.live.lock().unwrap().clone()
+    }
+
     /// `Thread.start0` 真起线程(Phase B.3b;移植 `JVM_StartThread`,jvm.cpp)。`this` = Thread
     /// 实例。null → NPE。取 `Arc::clone(&self.shared)` → `std::thread::spawn` 子 OS 线程:子
     /// `Vm::from_shared` 派生(共享堆/注册表/管程;独立调用栈)→ 置 `thread_ref = this`(子线程
@@ -242,6 +267,8 @@ impl VmThread {
         // 必在 spawn 前——start0 返后 join() 的 isAlive() 须恒 true(无子线程调度竞态)。
         self.set_eetop(this, 1);
         self.set_thread_status(this, crate::runtime::vm::THREAD_STATUS_RUNNABLE);
+        // Phase V-3a:入活线程集(父线程同步 register,先于 spawn;对应 Threads::add)。
+        self.register_thread(this);
         let shared = self.vm_arc();
         let handle = std::thread::spawn(move || {
             let mut child = Self::from_vm(shared);
@@ -361,6 +388,8 @@ impl VmThread {
         self.set_eetop(this, 0);
         let _ = self.object_notify_all(this);
         let _ = self.monitor_exit(this);
+        // Phase V-3a:出活线程集(对应 Threads::remove;幂等 retain)。
+        self.unregister_thread(this);
     }
 
     /// 取/建线程的中断标志镜像(B.4c)。惰性建条目(首次访问,默认 false)。返 `Arc` clone
@@ -556,5 +585,28 @@ mod tests {
             "须附线程名前缀: {s}"
         );
         assert!(s.contains("Thread-N"), "无名线程回退 Thread-N: {s}");
+    }
+
+    /// 活线程集表机制(Phase V-3a):register 累加、unregister 幂等移除、iter_live owned 快照。
+    /// 对应 HotSpot `Threads::add`/`remove`/`_thread_list`(`threads.hpp`)。无类加载,纯表往返钉死语义,
+    /// 驱动 `register_thread`/`unregister_thread`/`iter_live` 三法。
+    #[test]
+    fn live_registry_register_unregister_iter() {
+        let vm = VmThread::default();
+        let r1 = Reference::from_id(100);
+        let r2 = Reference::from_id(200);
+        assert!(vm.iter_live().is_empty(), "初始 live 须空");
+        vm.register_thread(r1);
+        vm.register_thread(r2);
+        let live = vm.iter_live();
+        assert_eq!(live.len(), 2, "register r1/r2 后 live 须含 2");
+        assert!(live.contains(&r1) && live.contains(&r2), "须含 r1 与 r2");
+        vm.unregister_thread(r1);
+        let live = vm.iter_live();
+        assert_eq!(live.len(), 1, "unregister r1 后 live 须剩 1");
+        assert!(!live.contains(&r1) && live.contains(&r2), "r1 移除、r2 保留");
+        // 幂等:重复 unregister 已不在表的 r1 无副作用(retain)。
+        vm.unregister_thread(r1);
+        assert_eq!(vm.iter_live().len(), 1, "重复 unregister 须幂等");
     }
 }

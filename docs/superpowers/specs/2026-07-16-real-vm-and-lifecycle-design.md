@@ -232,11 +232,11 @@ pub fn shutdown(&self) -> Result<(), VmError> {
   - GREEN:`live` register/unregister/iter_live;`main_thread` 上提。
   - 闸门:lib `threads_live_registry` 测(start N→live 见 N、join 后见 0)+ `main_thread_singleton` 测。
 
-- **V-4 spawn/terminate 编排上移到 `Vm`**
+- **V-4 spawn/terminate 编排上移到 `Vm`** —— ⚠️ **实施决议(2026-07-16):不强制上移**(详见 §11)
   - `spawn_thread`/`join_thread`/中断族迁 `impl Vm`;`run_thread_body`/`terminate_thread`(调 unregister)/`dispatch_uncaught_exception` 留 VmThread。
   - 闸门:**既有线程闸门全绿**(thread_start_join / thread_interrupt / object_wait_notify / synchronized_block / thread_uncaught / thread_constructor)——行为保持。
 
-- **V-5 Shutdown hooks + `Vm::shutdown()`**
+- **V-5 Shutdown hooks + `Vm::shutdown()`** —— 🔧 **实施范围收敛(2026-07-16):仅 phase+join;hook 顺延**(详见 §11)
   - RED:绑 `Runtime.addShutdownHook`/`removeShutdownHook`;`Vm::shutdown()` 跑注册的 hook(断 hook.run 副作用发生)+ join-all live。
   - GREEN:`shutdown_hooks` 表 + `shutdown()` 串行跑 hook + join live 非守护。
   - 闸门:lib `shutdown_runs_hooks` + 集成 `tests/shutdown_hook.rs`(javac:注册一 hook 写 static flag,shutdown 后断 flag 置)。
@@ -268,3 +268,50 @@ pub fn shutdown(&self) -> Result<(), VmError> {
 - `JavaThread`(`src/hotspot/share/runtime/javaThread.hpp`):每线程栈 + `run`/`thread_entry`。
 - `System.initPhase1/2/3`(`System.java:1720/1929/1952`):Phase1/2/3 引导序列(rustj `launch.rs` 等价)。
 - `Runtime.addShutdownHook` / `ApplicationShutdownHooks` / `Shutdown.shutdown`。
+
+---
+
+## 11. 实施决议(2026-07-16):V-4 不上移 / V-5 范围收敛
+
+V-1..V-3b 按 §8 落地(commit 641c5b4/710bed6/571cc72/d6b29bc/1725fa9)。实施 V-4/V-5 时 Step 0
+核验发现两处原设计偏差,记录如下。
+
+### 11.1 V-4 不强制上移 spawn 到 `impl Vm`
+
+原 §4.1 表把 `start_thread` 归 `impl Vm`。实施核验两处阻点:
+
+1. **Arc 自引用**:`impl Vm` 的 `&self` 是「Arc 内部 Vm 的借用」,无法产出 owned `Arc<Vm>`
+   移入 `'static` `thread::spawn` 闭包(spawn 闭包须 owned Arc 经 `VmThread::from_vm` 派生子线程)。
+   stable Rust 禁 `self: &Arc<Vm>` 接收者(`arbitrary_self_types` 未稳),故 `&self` 拿不到 Arc。
+   须在 `Vm` 存 `Weak<Vm>` 自引用方可——为边际收益引入自引用弱引用,不划算。
+2. **HotSpot 保真**:`JVM_StartThread`(`prims/jvm.cpp`)在**调用线程**上下文执行(父 JavaThread
+   起子 JavaThread),即「起线程」本就由父线程发起。rustj 父线程句柄 = `VmThread`,故 `start_thread`
+   在 `impl VmThread` **忠实于 JVM_StartThread**,非缺陷。
+
+**决议**:`start_thread`/`run_thread_body`/`terminate_thread`/`dispatch_uncaught_exception`/中断族
+皆留 `impl VmThread`;表的纯操作(register/unregister/iter_live/join/interrupt_flag)经
+`self.runtime.threads.*` 转发已可达 `Vm.threads`——`Vm` 经 `ThreadManager` 字段已持线程管理态,
+无须 method 也上移。V-4 标记为「分析后不动」,既有线程闸门(350+)全绿即安全网。
+
+### 11.2 V-5 范围收敛:仅 phase→ShuttingDown + drain-join;hook 执行顺延
+
+原 §5 设计两路 hook 机制,实施核验**两路皆阻塞**:
+
+1. **§5.1 native 拦截 `addShutdownHook`**:rustj native 分派门为 `ACC_NATIVE`
+  (`invoke.rs:570/1677/1763/1857/1946`,仅 `target_method.access_flags.is_native()` 才查 native 表)。
+   而真 `Runtime.addShutdownHook`(Runtime.java:229)是**纯 Java**——委派 `ApplicationShutdownHooks.add`
+  (`IdentityHashMap`),非 `ACC_NATIVE` → 拦不到,native 绑定永不触发。
+2. **忠实跑 Java `Shutdown` 序列**(`Shutdown.shutdown`→`ApplicationShutdownHooks.runHooks`
+   →各 hook `Thread.start/join`→`VM.isShutdown/shutdown` native):牵入 `jdk.internal.misc.VM`
+   未绑 native + 完整 `synchronized(Shutdown.class)` + `ApplicationShutdownHooks` 全链——属 §9 非目标
+  (完整 Shutdown 序列顺延)。
+
+**决议**:V-5 仅交付**生命周期终止原语** `Vm::shutdown(&self)`(commit 见 §8 节奏):
+phase→`ShuttingDown`(幂等)+ drain-join `ThreadManager.handles` 全部已起线程(对应 HotSpot
+`Threads::destroy_vm` 等非 daemon 线程完)。闸门:lib `shutdown_tests`(phase 幂等 + drain-join
+副作用就位 + 表清空)。`VmPhase::ShuttingDown`(V-2 预留)本层起有构造点。
+
+**应用级 shutdown hook 执行**顺延至独立层(须先决:忠实 `Shutdown` 序列,或读
+`ApplicationShutdownHooks.hooks` 静态字段直跑——后者需 HashMap 迭代机制)。本层把
+`VmPhase::ShuttingDown` 用起来 + 提供关闭入口,即达成「VM 生命周期管理」核心。
+

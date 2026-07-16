@@ -29,8 +29,8 @@ pub(crate) enum VmPhase {
     Created,
     Bootstrapping,
     Running,
-    /// `Vm::shutdown`(V-5)构造;本层 bootstrap 幂等匹配已引用,暂无构造点。
-    #[allow(dead_code)]
+    /// `Vm::shutdown`(V-5)构造:phase Running→ShuttingDown。
+    #[allow(dead_code)] // 非 test lib 构建下 shutdown 路径无生产调用方 → 变体视为 dead;test/prod 关闭入口构造之。
     ShuttingDown,
 }
 
@@ -252,6 +252,33 @@ impl Vm {
             main_thread: Mutex::new(None),
         }
     }
+
+    /// **VM 关闭入口(Phase V-5)**:生命周期终止原语。phase → `ShuttingDown`(幂等:已
+    /// `ShuttingDown` → no-op 返 Ok),再 drain-join `ThreadManager.handles` 全部已起线程
+    ///(阻塞至各完)。对应 HotSpot `Threads::destroy_vm`(join 非 daemon 线程)+ `before_exit`。
+    ///
+    /// **本层范围**(spec §5/§9):仅 Rust 侧 phase + drain-join 已起线程。**不**跑 Java
+    /// `Shutdown` 序列(`Shutdown.shutdown`→`ApplicationShutdownHooks.runHooks`→各 hook
+    /// `Thread.start/join`→`VM.isShutdown/shutdown` native)——属 §9 非目标;亦**不**经 native
+    /// 拦截 `Runtime.addShutdownHook`(真该法纯 Java 委派 `ApplicationShutdownHooks`,而 native
+    /// 分派门为 `ACC_NATIVE`,拦不到)。故应用级 shutdown hook 执行顺延至「完整 Shutdown 序列」层。
+    pub(crate) fn shutdown(&self) -> Result<(), VmError> {
+        {
+            let mut p = self.phase.lock().unwrap();
+            if let VmPhase::ShuttingDown = *p {
+                return Ok(()); // 幂等:已关闭 → no-op。
+            }
+            *p = VmPhase::ShuttingDown;
+        }        // drain-join 全部已起线程的 JoinHandle(阻塞至各子线程完;已完即返)。键丢弃(= Thread 句柄)。
+        let handles: Vec<std::thread::JoinHandle<()>> = {
+            let mut h = self.threads.handles.lock().unwrap();
+            h.drain().map(|(_, handle)| handle).collect()
+        };
+        for handle in handles {
+            let _ = handle.join();
+        }
+        Ok(())
+    }
 }
 
 /// 执行上下文:拥有对象堆,借用类注册表,跟踪帧嵌套深度。
@@ -308,6 +335,13 @@ impl VmThread {
     #[allow(dead_code)] // 仅 #[cfg(test)] 闸门引用 → 非 test lib 构建视为 dead(V-3/V-4 起常途消费)。
     pub(crate) fn phase(&self) -> VmPhase {
         *self.runtime.phase.lock().unwrap()
+    }
+
+    /// VM 关闭(Phase V-5):转发 [`Vm::shutdown`](生命周期终止原语;phase→ShuttingDown +
+    /// drain-join 已起线程)。`&self` 即可(经 Mutex 内部可变性改 phase / handles)。
+    #[allow(dead_code)] // 仅 #[cfg(test)] 闸门引用 → 非 test lib 构建视为 dead(未来生产/CLI 关闭入口)。
+    pub(crate) fn shutdown(&self) -> Result<(), VmError> {
+        self.runtime.shutdown()
     }
 
     /// **VM 引导入口(Phase V-2,Option B)**:串行驱动 `launch.rs` Phase1/2/3 + `VmPhase` 状态机
@@ -785,5 +819,85 @@ mod concurrent_wait_tests {
             panic!("IAE 应为异常实例");
         };
         assert_eq!(i.class_name(), "java/lang/IllegalArgumentException");
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    //! Phase V-5:`Vm::shutdown()` 生命周期终止原语闸门。phase → `ShuttingDown`(幂等)+
+    //! drain-join `ThreadManager.handles` 全部已起线程(阻塞至各完)。对应 HotSpot
+    //! `Threads::destroy_vm`(等已起线程完)。**本层不跑 Java `Shutdown` 序列**(spec §9 非目标:
+    //! `Shutdown.shutdown`→`ApplicationShutdownHooks.runHooks`→`VM.isShutdown/shutdown` native);
+    //! 亦不经 native 拦截 `Runtime.addShutdownHook`(真该法纯 Java 委派 `ApplicationShutdownHooks`,
+    //! 而 native 分派门为 `ACC_NATIVE`,拦不到)→ 应用级 hook 执行顺延。
+    use super::*;
+    use crate::oops::ClassRegistry;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+    use std::time::Duration;
+
+    /// **RED→GREEN**(V-5):`shutdown()` phase→ShuttingDown;二次调用幂等(no-op、不 panic)。
+    #[test]
+    fn shutdown_transitions_phase_to_shutting_down_idempotent() {
+        let vm = VmThread::new(ClassRegistry::new());
+        assert_eq!(vm.phase(), VmPhase::Created, "新 Vm 须 Created");
+        vm.shutdown().expect("shutdown #1 须 Ok");
+        assert_eq!(
+            vm.phase(),
+            VmPhase::ShuttingDown,
+            "shutdown 后须 ShuttingDown"
+        );
+        vm.shutdown().expect("shutdown #2 须幂等 Ok");
+        assert_eq!(
+            vm.phase(),
+            VmPhase::ShuttingDown,
+            "二次 shutdown 后 phase 仍 ShuttingDown"
+        );
+    }
+
+    /// **RED→GREEN**(V-5):`shutdown()` drain-join `handles` 表全部 JoinHandle(阻塞至各子线程
+    /// 完,副作用就位),并清空表。
+    #[test]
+    fn shutdown_drains_and_joins_started_threads() {
+        let vm = VmThread::new(ClassRegistry::new());
+        // 两条「已起线程」:各自延时后置完成标志(模拟子线程副作用)。
+        let done1 = StdArc::new(AtomicBool::new(false));
+        let done2 = StdArc::new(AtomicBool::new(false));
+        let d1 = StdArc::clone(&done1);
+        let h1 = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            d1.store(true, Ordering::SeqCst);
+        });
+        let d2 = StdArc::clone(&done2);
+        let h2 = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            d2.store(true, Ordering::SeqCst);
+        });
+        // 句柄登记入 ThreadManager.handles(键 = 合成 Thread 引用;模拟 start_thread 已 spawn)。
+        vm.runtime
+            .threads
+            .handles
+            .lock()
+            .unwrap()
+            .insert(Reference::from_id(101), h1);
+        vm.runtime
+            .threads
+            .handles
+            .lock()
+            .unwrap()
+            .insert(Reference::from_id(102), h2);
+        vm.shutdown().expect("shutdown 须 join 全部已起线程");
+        assert!(
+            done1.load(Ordering::SeqCst),
+            "shutdown 须 join 至线程 1 副作用完成"
+        );
+        assert!(
+            done2.load(Ordering::SeqCst),
+            "shutdown 须 join 至线程 2 副作用完成"
+        );
+        assert!(
+            vm.runtime.threads.handles.lock().unwrap().is_empty(),
+            "shutdown 须 drain handles 表"
+        );
     }
 }

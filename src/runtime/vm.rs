@@ -211,9 +211,11 @@ pub(crate) struct Vm {
     /// Class 镜像**双向表**(4.10t/4.12):内部类名 ↔ 唯一 Class 镜像引用,两方向皆查
     ///(name→ref intern + ref→name Class native 反查)。两方向同把 `Mutex` **原子**插入,
     /// 保证「同生共灭」不变量(取代旧 `class_mirrors`+`mirror_class` 双 `Mutex` 双表)。
-    /// 对应 HotSpot 每 `Klass` 的单一 `_java_mirror`。见 [`mirrors::ClassMirrors`]。
-    /// Module 反向走 Instance 字段(`module_mirrors` 单向,无需双向表)。
-    class_mirrors: mirrors::ClassMirrors,
+    /// `bimap::BiMap` 双射(每 name 恰一 ref 且反之)→ 两方向同把 `Mutex` **原子**插入,
+    /// 「同生共灭」不变量由 BiMap 保证(取代旧 `class_mirrors`+`mirror_class` 双 `Mutex` 双表 +
+    /// 手写 `ClassMirrors`)。对应 HotSpot 每 `Klass` 的单一 `_java_mirror`。Module 反向走 Instance
+    /// 字段(`module_mirrors` 单向,无需双向表)。
+    class_mirrors: Mutex<bimap::BiMap<String, Reference>>,
     /// 命名 Module 镜像表(4.14a):模块名(`java.base`)→ 真 `java/lang/Module` Instance 引用。
     /// 同名模块恒同引用(对应 HotSpot 每个 `Module` 类实例单例)。`name` 字段填模块名;
     /// 无名模块走 [`Vm::unnamed_module`](单例,`name` 字段 null)。Mutex(B.2.3b 共享态)。
@@ -240,7 +242,7 @@ impl Vm {
             monitors: Mutex::new(HashMap::new()),
             threads: threads::ThreadManager::new(),
             exception_meta: Mutex::new(HashMap::new()),
-            class_mirrors: mirrors::ClassMirrors::new(),
+            class_mirrors: Mutex::new(bimap::BiMap::new()),
             module_mirrors: Mutex::new(HashMap::new()),
             unnamed_module: Mutex::new(None),
             phase: Mutex::new(VmPhase::Created),

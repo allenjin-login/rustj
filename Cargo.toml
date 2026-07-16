@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# bimap:Class 镜像双向表(name↔ref 双射;用户授权本次破零依赖,取代手写双 HashMap——
+# 双射不变量 + 双向查询由库保证)。
+bimap = "0.6"

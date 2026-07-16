@@ -6,61 +6,6 @@
 
 use crate::oops::Oop;
 use crate::runtime::{Reference, Slot, VmThread};
-use std::collections::HashMap;
-use std::sync::Mutex;
-
-/// Class 镜像**双向表**(BiMap):内部类名 ↔ Class 镜像引用,两方向皆查。两方向在同把 `Mutex`
-/// 下原子插入/查询,保证「两方向同生共灭」不变量——取代旧 `class_mirrors`(name→ref)+
-/// `mirror_class`(ref→name)双 `Mutex` 双表 + 调用方约定同插(两锁之间读者曾见瞬态不一致:
-/// 一方向在、另一方向不在)。对应 HotSpot 每 `Klass` 的单一 `_java_mirror`(name↔mirror 双向)。
-///
-/// **Module 反向不需此结构**:`Module.getName()` 读 Instance `name` 字段(Module.java:195),
-/// 故 `module_mirrors` 单向 intern 表即够(见 [`VmThread::intern_named_module`]);唯 Class 反向
-/// 不能读 `Class.name` 字段(internal vs binary name + `initClassName` 懒填,Class native 须早于
-/// 首次 `getName` 反查)→ 须独立侧表 → 双向表。
-pub(crate) struct ClassMirrors {
-    inner: Mutex<ClassMirrorsInner>,
-}
-
-/// 双向表载荷(私用;经 `ClassMirrors` 的 `Mutex` 保护)。
-struct ClassMirrorsInner {
-    /// 内部类名(`java/lang/Foo`/`int`/`[I`…)→ Class 镜像(intern 缓存;首次分配后命中直返)。
-    by_name: HashMap<String, Reference>,
-    /// Class 镜像 → 内部类名(Class native 反查:`getSuperclass`/`isInstance`/…)。
-    by_ref: HashMap<Reference, String>,
-}
-
-impl ClassMirrors {
-    /// 构造空双向表。
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: Mutex::new(ClassMirrorsInner {
-                by_name: HashMap::new(),
-                by_ref: HashMap::new(),
-            }),
-        }
-    }
-
-    /// name → Class 镜像(owned `Reference`;未命中 `None`)。锁内 `copied` 释锁返
-    ///(drop-before-recurse:B.2.3b;调用方后续 `&mut self` 不持本 guard)。
-    pub(crate) fn get_by_name(&self, name: &str) -> Option<Reference> {
-        self.inner.lock().unwrap().by_name.get(name).copied()
-    }
-
-    /// Class 镜像 → 内部类名(owned `String`;非镜像引用 `None`)。锁内 `cloned` 释锁返。
-    pub(crate) fn get_by_ref(&self, r: Reference) -> Option<String> {
-        self.inner.lock().unwrap().by_ref.get(&r).cloned()
-    }
-
-    /// **原子**双向插入(name↔r 两方向同把锁写入 → 不变量保证)。调用方须先判 `get_by_name`
-    /// 未命中(check-then-insert 两相位同既有 intern 流程;竞态下两线程同 intern 同名 → 第二个
-    /// 覆盖,无害:同名须恒同引用,与旧双表语义一致)。
-    pub(crate) fn insert(&self, name: String, r: Reference) {
-        let mut g = self.inner.lock().unwrap();
-        g.by_name.insert(name.clone(), r);
-        g.by_ref.insert(r, name);
-    }
-}
 
 impl VmThread {
     /// Class 镜像 intern(4.10t 起;4.12 退役 `Oop::Class`):同一内部类名恒返回同一 Class
@@ -73,22 +18,24 @@ impl VmThread {
     /// `name` 由 `getName` 真字节码首次调用时经 `initClassName` 懒填。
     pub(crate) fn intern_class_mirror(&mut self, name: &str) -> Reference {
         // 缓存命中:取 owned Reference 释锁再返(drop-before-recurse;B.2.3b)。
-        if let Some(r) = self.runtime.class_mirrors.get_by_name(name) {
+        let name_owned = name.to_string();
+        if let Some(r) = self.runtime.class_mirrors.lock().unwrap().get_by_left(&name_owned).copied() {
             return r;
         }
         // 分配真 java/lang/Class Instance(须已加载:引导 Class 桩或经闭包预载的真 Class)。
         let r = self.alloc_class_mirror_instance();
         // 先缓存再填字段:数组组件互递归([LC→C、[[I→[I)经缓存命中终止。
-        // 原子双向插入(name↔r 同把锁);释锁后再 populate(其递归 intern 会再锁→须 drop)。
-        self.runtime.class_mirrors.insert(name.to_string(), r);
+        // 原子双向插入(bimap::BiMap 保证双射不变量,name↔r 同把锁);释锁后再 populate
+        // (其递归 intern 会再锁→须 drop)。
+        self.runtime.class_mirrors.lock().unwrap().insert(name_owned, r);
         self.populate_class_mirror_fields(r, name);
         r
     }
 
     /// 镜像所表示类型的内部名(供 Class native 反查)。非镜像引用 → `None`。
-    /// 返 owned `String`(ClassMirrors 内 Mutex,无法返借用 &str;B.2.3b)。
+    /// 返 owned `String`(BiMap 经 Mutex 保护,无法返借用 &str;B.2.3b)。
     pub(crate) fn mirror_internal_name(&self, r: Reference) -> Option<String> {
-        self.runtime.class_mirrors.get_by_ref(r)
+        self.runtime.class_mirrors.lock().unwrap().get_by_right(&r).cloned()
     }
 
     /// 分配一个默认初始化的 `java/lang/Class` Instance。无注册表或 `java/lang/Class` 未加载

@@ -5,7 +5,7 @@
 //! `entry: Condvar` 阻塞至 owner 空闲再获取,`monitor_exit` 归零时 `notify_one` 唤醒等待者。
 //! Phase B.3c:`object_wait` 释管程后 `wait_cvar` 阻塞,`object_notify[_all]` 推 `wake_seq` 唤醒。
 //! 共享态 `VmShared.monitors`(`HashMap<Reference, Arc<JavaMonitor>>`,per-object 惰性分配);
-//! owner = 当前线程 Thread 镜像句柄(`main_thread`,经 [`super::threads`])。
+//! owner = 当前线程 Thread 镜像句柄(`current_thread`,经 [`super::threads`])。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use crate::runtime::{Reference, VmThread, VmError};
 use super::{JavaMonitor, MonitorInner};
 
 impl VmThread {
-    /// `monitorenter`(JVMS §6.5):进入 `obj` 管程。null → NPE;owner = 当前线程(`main_thread`)。
+    /// `monitorenter`(JVMS §6.5):进入 `obj` 管程。null → NPE;owner = 当前线程(`current_thread`)。
     /// 取/建该对象的 [`JavaMonitor`](锁表→取 `Arc` clone→**释表**),再锁 `inner`:owner==本线程→重入
     /// `count+1`;owner==None→占位 `owner+count=1`;owner==他人→`entry.wait` 循环至 owner 空闲/本线程。
     /// 释表锁后再锁 inner:持 inner 等待时不持表锁 → 不同对象不同 JavaMonitor → 无锁序死锁。
@@ -26,7 +26,7 @@ impl VmThread {
                 "java/lang/NullPointerException",
             ));
         }
-        let owner = self.main_thread();
+        let owner = self.current_thread();
         // 锁表取/建 JavaMonitor,克隆 Arc 后即释表 guard(drop-before-recurse;B.2.3b)。
         let mon = {
             let mut table = self.runtime.monitors.lock().unwrap();
@@ -54,7 +54,7 @@ impl VmThread {
                 "java/lang/NullPointerException",
             ));
         }
-        let owner = self.main_thread();
+        let owner = self.current_thread();
         // 锁表取 Arc clone(无该对象 → 未持有 → IMSE)。先提取 owned Option<Arc>、释表 guard,
         // 再 IMSE(throw_exception 须 &mut self,不能持表 guard)。
         let mon = self.runtime.monitors.lock().unwrap().get(&obj).cloned();
@@ -90,7 +90,7 @@ impl VmThread {
                 "java/lang/NullPointerException",
             ));
         }
-        let owner = self.main_thread();
+        let owner = self.current_thread();
         // 锁表取 Arc(无 → false),释表后锁 inner 读 owner==本线程 && count>0。
         let mon = {
             let table = self.runtime.monitors.lock().unwrap();
@@ -121,7 +121,7 @@ impl VmThread {
                 "java/lang/IllegalArgumentException",
             ));
         }
-        let owner = self.main_thread();
+        let owner = self.current_thread();
         // B.4c:入口中断检查——已中断则清标志 + 抛 IEE(`JVM_Object_wait` 入口检 is_interrupted)。
         if self
             .interrupt_flag(owner)
@@ -229,7 +229,7 @@ impl VmThread {
                 "java/lang/NullPointerException",
             ));
         }
-        let owner = self.main_thread();
+        let owner = self.current_thread();
         let mon = self.runtime.monitors.lock().unwrap().get(&obj).cloned();
         let Some(mon) = mon else {
             return Err(crate::runtime::interpreter::throw_exception(

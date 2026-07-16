@@ -52,19 +52,43 @@ impl ThreadManager {
 }
 
 impl VmThread {
-    /// main 线程单例(惰性,4.40):`Thread.currentThread()` 返此实例。rustj 单线程 → 唯一 "main"
-    /// 线程。`new_instance`(**不跑 `<init>`**)构造——默认字段(tid=0/name=null/threadLocals=null/
-    /// …),`Thread.<clinit>` 仅 `registerNatives()` 空操作故无重初始化负担。无注册表/Thread 未预载
-    /// → 返 null(防御,`currentThread` native 据 null 抛 InternalError)。
-    pub(crate) fn main_thread(&mut self) -> Reference {
+    /// **当前线程身份**(Phase V-3b;原 `main_thread`,正名):返 `self.thread.thread_ref`(本 VmThread
+    /// 绑定的 Thread 镜像)。`thread_ref` 未置 → 分配**独立**线程身份(每 VmThread 各异——管程 owner
+    /// 据此区分线程,故各派生线程不共用同一引用;旧 `main_thread` 同此「各自分配」语义)。子线程
+    /// 生产路径 `thread_ref` 由 `start_thread` spawn 前置位(不走此分支);此处主要服务主 VmThread 惰性
+    /// 及测试派生 VmThread。`new_instance`(**不跑 `<init>`**)构造——默认字段(tid=0/name=null/…),
+    /// `Thread.<clinit>` 仅 `registerNatives()` 空操作故无重初始化负担。无注册表/Thread 未预载 → 返
+    /// null(防御,`currentThread` native 据 null 抛 InternalError)。供 `Thread.currentThread` native /
+    /// 管程 owner / `clearInterruptEvent` 等「当前线程」语义。
+    ///
+    /// **VM 单例**(§4.3):首次分配者(主 VmThread,bootstrap 单线程先于任何 worker)记入
+    /// [`Self::main_thread_singleton`];后续派生线程各自的独立身份不再覆写 → 「主线程」引用跨
+    /// `from_vm` 派生 VmThread 稳定。first-writer-wins,TOCTOU 良性(主 VmThread 单线程 bootstrap 先于 worker)。
+    pub(crate) fn current_thread(&mut self) -> Reference {
         if let Some(r) = self.thread.thread_ref {
             return r;
         }
+        // 分配独立线程身份(每 VmThread 各异;不查单例——否则派生线程 owner 塌缩为同一引用,
+        // 破坏管程互斥)。子线程生产路径 thread_ref 由 start_thread 先置,不走此分支。
         let r = self.alloc_main_thread();
-        if !r.is_null() {
-            self.thread.thread_ref = Some(r);
+        if r.is_null() {
+            return r;
+        }
+        self.thread.thread_ref = Some(r);
+        // 首次分配者(主 VmThread)记入 VM 单例;后续派生线程不覆写。
+        let mut mt = self.runtime.main_thread.lock().unwrap();
+        if mt.is_none() {
+            *mt = Some(r);
         }
         r
+    }
+
+    /// VM 主线程单例(Phase V-3b):`current_thread` 首次于主 VmThread 分配后存此,跨 `from_vm`
+    /// 派生 VmThread 共享(去重)。区别 [`Self::current_thread`](每线程身份:主 == 单例;子 == 各自
+    /// Thread)。供未来跨线程「主线程」引用 + shutdown。未分配 → None。
+    #[allow(dead_code)] // 仅 #[cfg(test)] 闸门引用 → 非 test lib 构建视为 dead(V-4/V-5 起常途消费)。
+    pub(crate) fn main_thread_singleton(&self) -> Option<Reference> {
+        *self.runtime.main_thread.lock().unwrap()
     }
 
     /// 分配 main 线程 Thread Instance(`new_instance`,不跑 `<init>`),并置核心字段
@@ -440,7 +464,7 @@ impl VmThread {
     /// 对应 HotSpot `JVM_ClearInterruptEvent`(VM 记账清除)。与 [`Self::interrupt_thread`] 配对,
     /// 保持 Java 字段 ↔ 镜像标志同步(每次字段写后即调对应 native)。
     pub(crate) fn clear_interrupt_event(&mut self) {
-        let cur = self.main_thread();
+        let cur = self.current_thread();
         if cur.is_null() {
             return;
         }

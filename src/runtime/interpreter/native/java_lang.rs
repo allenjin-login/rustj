@@ -556,12 +556,12 @@ pub(super) fn dispatch(
 
         // Thread.currentThread()Ljava/lang/Thread; —— Thread.java:476 `public static native`。
         // 移植 `JVM_CurrentThread`(jvm.cpp):返当前线程的 Thread 实例。rustj 单线程 → 唯一 "main"
-        // 线程单例(`Vm::main_thread`,惰性 `new_instance` 不跑 `<init>`;Thread.<clinit> 仅
+        // 线程单例(`VmThread::current_thread`,惰性 `new_instance` 不跑 `<init>`;Thread.<clinit> 仅
         // registerNatives 空操作)。解锁 `VM.saveProperties`→`getStackTrace`(深处 Logging /
         // System props / Reflect 链触发的 Thread 路径)、`Thread.currentThread().getContextClassLoader()`
         // 等 NIO/反射/类加载链对线程上下文的依赖。
         ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;") => {
-            Ok(Value::Reference(vm.main_thread()))
+            Ok(Value::Reference(vm.current_thread()))
         }
 
         // Thread.holdsLock(Ljava/lang/Object;)Z —— Thread.java:2178 `public static native`。
@@ -591,7 +591,7 @@ pub(super) fn dispatch(
                 Value::Long(n) => n.max(0),
                 _ => 0,
             };
-            let cur = vm.main_thread();
+            let cur = vm.current_thread();
             let irq = vm.interrupt_flag(cur);
             let load = || irq.load(std::sync::atomic::Ordering::Relaxed);
             // 入口中断检查(已中断即清标志 + 抛)。
@@ -1797,6 +1797,45 @@ public class Worker extends Thread {
         assert_eq!(t1, t2, "currentThread 须返同一 main 线程单例");
     }
 
+    /// **RED→GREEN**(Phase V-3b):`main_thread` 单例跨 `from_vm` 派生 VmThread 稳定同引用。
+    /// 主 VmThread 首次 `current_thread()` 分配 main 线程 M 并存入 `Vm.main_thread` 单例;经
+    /// `from_vm` 派生的子 VmThread(共享 `Arc<Vm>`)见同一 M(非重新分配——单例去重)。对应
+    /// HotSpot `Threads::create_vm` 一次性建 main 线程、各 JavaThread 共享其引用。区别于
+    /// `current_thread`(每线程身份:主 VmThread == 单例 M;子 == 各自 Thread 实例)。
+    #[test]
+    fn main_thread_singleton_stable_across_derived_vmthread() {
+        let Some(jmod) = find_javabase_jmod() else {
+            eprintln!("跳过:无 java.base.jmod");
+            return;
+        };
+        let mut registry = ClassRegistry::new();
+        let bytes = std::fs::read(&jmod).unwrap();
+        let mut cp = ClassPath::new();
+        cp.add("java.base.jmod", &bytes).unwrap();
+        load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
+        let mut vm = VmThread::new(registry);
+
+        // 主 VmThread 首次取 current_thread → 分配 main 线程 M,存入 Vm 单例。
+        let m = vm.current_thread();
+        assert!(!m.is_null(), "须分配非 null main 线程");
+        // 派生子 VmThread(共享 Arc<Vm>)。
+        let child = VmThread::from_vm(vm.vm_arc());
+        // 子 VmThread 见同一 main 线程单例(非重新分配)。
+        assert_eq!(
+            child.main_thread_singleton(),
+            Some(m),
+            "main 线程单例须跨 from_vm 稳定同引用"
+        );
+        // 单例命中不再分配:next_tid 计数器在 M 分配时已递增,再读单例不增(无新 main 线程)。
+        let tid_before = vm.read_next_thread_id();
+        let _ = child.main_thread_singleton();
+        assert_eq!(
+            vm.read_next_thread_id(),
+            tid_before,
+            "单例命中须不再分配新 main 线程(无新 tid 消耗)"
+        );
+    }
+
     /// **RED→GREEN**(Layer 4.41 / Phase B.1):`Thread.holdsLock(Object)Z`
     /// (Thread.java:2178 `public static native`)。移植 `JVM_HoldsLock`:当前线程是否持有
     /// `obj` 管程。null → NPE(JDK:`holdsLock(null)` 抛 NPE)。先 `monitor_enter`(直接调 Vm)
@@ -1913,7 +1952,7 @@ public class Worker extends Thread {
         );
 
         // start0()V —— 实例方法,this = main 线程镜像;B.1 空操作桩,返 Void。
-        let main = vm.main_thread();
+        let main = vm.current_thread();
         assert_eq!(
             super::super::invoke(
                 &mut vm,

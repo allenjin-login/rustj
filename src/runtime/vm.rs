@@ -78,7 +78,7 @@ pub struct CallFrame {
 ///
 /// 持 Java 调用栈、帧深度(SOE 检测)、上限、线程镜像句柄——皆为**线程隔离态**(CLAUDE.md §6
 /// "调用栈归属线程"的落实,Phase B.1 起 call_stack 不再是 Vm 顶层字段)。镜像句柄惰性分配:
-/// `Vm::new` 时 Thread 类未必加载,首调 `currentThread` 时经 [`Vm::main_thread`] 填入。
+/// `Vm::new` 时 Thread 类未必加载,首调 `currentThread` 时经 [`VmThread::current_thread`] 填入。
 pub(crate) struct ThreadContext {
     /// 当前活动 Java 调用栈(逐帧 push/pop),供栈轨迹捕获。
     pub(crate) call_stack: Vec<CallFrame>,
@@ -227,6 +227,10 @@ pub(crate) struct Vm {
     unnamed_module: Mutex<Option<Reference>>,
     /// VM 生命周期阶段(Phase V)。`bootstrap` Created→Bootstrapping→Running;`shutdown`→ShuttingDown。
     phase: Mutex<VmPhase>,
+    /// VM 主线程单例(Phase V-3b):`current_thread` 首次于主 VmThread 分配后存此,跨 `from_vm`
+    /// 派生 VmThread 共享(去重,避免每 VmThread 各自重派)。对应 HotSpot 主线程单例
+    ///(`Threads::create_vm` 一次性建)。区别 `VmThread::current_thread`(每线程身份)。
+    main_thread: Mutex<Option<Reference>>,
 }
 
 impl Vm {
@@ -245,6 +249,7 @@ impl Vm {
             module_mirrors: Mutex::new(HashMap::new()),
             unnamed_module: Mutex::new(None),
             phase: Mutex::new(VmPhase::Created),
+            main_thread: Mutex::new(None),
         }
     }
 }
@@ -404,7 +409,7 @@ mod monitor_tests {
     use crate::oops::{ClassRegistry, InstanceOop, Oop};
     use crate::runtime::VmError;
 
-    /// 分配一个锁对象(裸 Instance,类名 "Lock")。owner 经 `main_thread` 解析(无 Thread 预载
+    /// 分配一个锁对象(裸 Instance,类名 "Lock")。owner 经 `current_thread` 解析(无 Thread 预载
     /// 时返 null——单线程下 owner 一致即可测重入/释放/IMSE 机制)。
     fn lock_obj(vm: &mut VmThread) -> Reference {
         vm.heap_mut()
@@ -611,7 +616,7 @@ mod concurrent_wait_tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    /// 分配一个裸 `Lock` Instance 作管程锁对象(`monitor_enter`/`object_wait` 据 `main_thread` 解析 owner)。
+    /// 分配一个裸 `Lock` Instance 作管程锁对象(`monitor_enter`/`object_wait` 据 `current_thread` 解析 owner)。
     fn lock_obj(vm: &mut VmThread) -> Reference {
         vm.heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("Lock".into(), vec![])))

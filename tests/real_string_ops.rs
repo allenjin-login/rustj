@@ -13,7 +13,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -76,7 +76,7 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
     dir
 }
 
-fn run_int(vm: &mut Vm, name: &str) -> Result<i32, VmError> {
+fn run_int(vm: &mut VmThread, name: &str) -> Result<i32, VmError> {
     use rustj::constant_pool::ConstantPoolEntry;
     let reg = vm.registry().expect("StrOps 须已加载");
     let lc = reg.get("StrOps").expect("StrOps 须已加载");
@@ -125,7 +125,7 @@ fn real_string_substring_and_charat() {
     cp.add("java.base.jmod", &bytes).unwrap();
     load_closure(&mut registry, &cp, "java/lang/String").unwrap();
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     let char_code = run_int(&mut vm, "charCode").unwrap_or_else(|e| {
         panic!("charCode 运行失败(真 String.charAt 链缺口):{e:?}")
     });

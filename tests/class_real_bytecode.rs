@@ -16,7 +16,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -66,7 +66,7 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
     dir
 }
 
-fn run_static_in(vm: &mut Vm, name: &str) -> Result<Value, String> {
+fn run_static_in(vm: &mut VmThread, name: &str) -> Result<Value, String> {
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("Cb").expect("Cb 须已加载");
     let method = lc.cf.methods.iter().find(|m| {
@@ -169,7 +169,7 @@ fn real_class_bytecode_on_real_mirror() {
         "java/lang/Class 须为真类(退役前提)"
     );
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
 
     // 3) 每法断言:正数=成功。
     assert_eq!(run_static_in(&mut vm, "nameOk"), Ok(Value::Int(1)), "getName 真字节码");

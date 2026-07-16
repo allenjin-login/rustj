@@ -18,7 +18,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -94,7 +94,7 @@ public class Cm {
 }
 "#;
 
-fn run_int(vm: &mut Vm, name: &str) -> i32 {
+fn run_int(vm: &mut VmThread, name: &str) -> i32 {
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("Cm").expect("Cm 须已加载");
     let m = find_method(&lc, name, "()I");
@@ -141,7 +141,7 @@ fn class_mirrors_are_canonical() {
     load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
     assert!(!registry.get("java/lang/Object").unwrap().is_synthetic_stub(), "Object 须为真类");
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
 
     // 3) 三法:1=两次 ldc 同引用;2=getClass==字面量;3=异类异镜像。
     assert_eq!(run_int(&mut vm, "literalTwice"), 1, "Cm.class 两次 ldc 须为同一 Class 镜像(intern)");

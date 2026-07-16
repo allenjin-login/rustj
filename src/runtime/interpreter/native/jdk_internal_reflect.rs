@@ -18,13 +18,13 @@
 //! 由 [`super::dispatch`] 按声明类路由至此(`jdk/internal/reflect/Reflection`)。
 
 use crate::oops::Oop;
-use crate::runtime::{Frame, Interpreter, LocalVars, Reference, Slot, Value, Vm, VmError};
+use crate::runtime::{Frame, Interpreter, LocalVars, Reference, Slot, Value, VmThread, VmError};
 
 use super::super::throw_exception;
 
 /// `jdk/internal/reflect/*` native 分派。未登记 → `UnsatisfiedLinkError`。
 pub(super) fn dispatch(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -82,7 +82,7 @@ pub(super) fn dispatch(
 /// - **原语**(`int`/`long`/…)→ `ACC_PUBLIC|ACC_ABSTRACT|ACC_FINAL` = 0x0411(javadoc:原语 → 此组合)。
 ///
 /// null 参 / 非 Class 镜像 → `NullPointerException`(`JVM_GetClassAccessFlags` 对 null Class 的处置)。
-fn get_class_access_flags(vm: &mut Vm, args: &[Value]) -> Result<i32, VmError> {
+fn get_class_access_flags(vm: &mut VmThread, args: &[Value]) -> Result<i32, VmError> {
     // class_arg_name 借 &vm 返 owned String,出 match 即释放 → 后续 throw_exception(&mut vm)/
     // registry() 无借用冲突。
     let internal = match super::class_arg_name(vm, args) {
@@ -120,7 +120,7 @@ fn get_class_access_flags(vm: &mut Vm, args: &[Value]) -> Result<i32, VmError> {
 /// 读 `Method`/`Constructor` 镜像的 `clazz`(Class 镜像)/`slot`(i32)/`modifiers`(i32)。
 /// 单次 heap 锁取 owned(meta 出块即释,后续可 `&mut vm`)。两类(Executable 子类)字段同名。
 fn read_executable_meta(
-    vm: &Vm,
+    vm: &VmThread,
     exec_ref: Reference,
     class_name: &str,
 ) -> Result<(Reference, i32, i32), VmError> {
@@ -159,7 +159,7 @@ fn read_executable_meta(
 }
 
 /// 读 Object[] 元素为 owned `Vec<Reference>`(null 数组 → 空)。持 heap 锁仅块内。
-fn read_object_array(vm: &Vm, arr_ref: Reference) -> Result<Vec<Reference>, VmError> {
+fn read_object_array(vm: &VmThread, arr_ref: Reference) -> Result<Vec<Reference>, VmError> {
     if arr_ref.is_null() {
         return Ok(Vec::new());
     }
@@ -195,7 +195,7 @@ pub(crate) fn primitive_wrapper(ft: &crate::metadata::descriptor::FieldType) -> 
 /// 按 `param_type` 拆箱一个实参:引用/数组类型 → 原引用(null 保留);原语类型 → 读包装实例 `value`
 /// 字段(I/Z/B/C/S→Int、J→Long、F→Float、D→Double)。null 拆箱原语 → NPE(JLS 拆箱语义)。
 /// `pub(crate)`:G.4.1 lambda 适配器(`dispatch_lambda`)对 SAM 装箱实参拆箱复用。
-pub(crate) fn unbox_arg(vm: &mut Vm, arg: Reference, param_type: &crate::metadata::descriptor::FieldType) -> Result<Slot, VmError> {
+pub(crate) fn unbox_arg(vm: &mut VmThread, arg: Reference, param_type: &crate::metadata::descriptor::FieldType) -> Result<Slot, VmError> {
     use crate::metadata::descriptor::FieldType;
     match param_type {
         FieldType::Class(_) | FieldType::Array(_) => Ok(Slot::Reference(arg)),
@@ -227,7 +227,7 @@ pub(crate) fn unbox_arg(vm: &mut Vm, arg: Reference, param_type: &crate::metadat
 
 /// 装箱反射返回值(void → null;引用 → 原 Reference;原语 → 分配包装实例置 `value`)。
 fn box_return(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     ret: &crate::metadata::descriptor::ReturnDescriptor,
     value: Value,
 ) -> Result<Reference, VmError> {
@@ -275,7 +275,7 @@ fn box_return(
 /// 分配包装类实例并置 `value` 字段(供 `box_return`)。`new_instance` 不跑 `<init>`,
 /// 直接写字段(对应 HotSpot `box()` 经 `ReflectionFactory` 的反射装箱;Integer 等已 <clinit>)。
 /// `pub(crate)`:G.4.1 lambda 适配器对 impl 原语返回装箱复用。
-pub(crate) fn alloc_wrapper(vm: &mut Vm, wrapper: &str, value: Slot) -> Result<Reference, VmError> {
+pub(crate) fn alloc_wrapper(vm: &mut VmThread, wrapper: &str, value: Slot) -> Result<Reference, VmError> {
     let (inst_ref, ord) = {
         let reg = vm
             .registry()
@@ -337,7 +337,7 @@ fn set_local_slot(locals: &mut LocalVars, index: u16, slot: Slot) -> Result<u16,
 /// 把目标异常 `cause` 包进 `InvocationTargetException`(设其 `target` 字段 = cause;
 /// `ITE.getCause()` 返 `target`,Throwable.java:557 / ITE.java)。对应 `Reflection::invoke`
 /// 的 `THROW_ARG(InvocationTargetException, &target_exception)`(reflection.cpp:1110)。
-fn wrap_in_invocation_target_exception(vm: &mut Vm, cause: Reference) -> VmError {
+fn wrap_in_invocation_target_exception(vm: &mut VmThread, cause: Reference) -> VmError {
     let err = throw_exception(vm, "java/lang/reflect/InvocationTargetException");
     let VmError::ThrownException(ite) = err else {
         return err;
@@ -366,7 +366,7 @@ fn wrap_in_invocation_target_exception(vm: &mut Vm, cause: Reference) -> VmError
 }
 
 /// `DirectMethodHandleAccessor$NativeAccessor.invoke0`(= `JVM_InvokeMethod`)实现。
-fn invoke_method_native(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn invoke_method_native(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     use crate::constant_pool::ConstantPoolEntry;
     use crate::metadata::access_flags::ACC_STATIC;
     use crate::metadata::descriptor::parse_method_descriptor;
@@ -494,7 +494,7 @@ fn invoke_method_native(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
 
 /// `DirectConstructorHandleAccessor$NativeAccessor.newInstance0`(= `JVM_NewInstanceFromConstructor`)
 /// 实现:分配裸实例 + 跑 `<init>`。
-fn new_instance_native(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn new_instance_native(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     use crate::constant_pool::ConstantPoolEntry;
     use crate::metadata::access_flags::ACC_ABSTRACT;
     use crate::metadata::descriptor::parse_method_descriptor;
@@ -598,7 +598,7 @@ mod tests {
     use crate::oops::{ArrayOop, ClassRegistry, Oop};
     use crate::runtime::class_loader::class_path::ClassPath;
     use crate::runtime::class_loader::loader::load_closure;
-    use crate::runtime::{Reference, Slot, Value, Vm, VmError};
+    use crate::runtime::{Reference, Slot, Value, VmThread, VmError};
 
     use std::path::{Path, PathBuf};
 
@@ -636,7 +636,7 @@ mod tests {
         // 闭包预载 Object(传递性载 Class)→ intern_class_mirror 可分配真 Class Instance。
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         // 底帧:调用者(期望返回其 Class)。顶帧:调用 getCallerClass 的方法。
         vm.push_frame("java/lang/Object", "testCaller");
         vm.push_frame("java/lang/String", "run");
@@ -670,7 +670,7 @@ mod tests {
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         // 仅一帧(无调用者的调用者)→ invoke 推 getCallerClass 后栈深 = 2 < 3 → null。
         vm.push_frame("java/lang/String", "run");
         let r = super::super::invoke(
@@ -705,7 +705,7 @@ mod tests {
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
 
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         let mirror = vm.intern_class_mirror("java/lang/Integer");
         let r = super::super::invoke(
             &mut vm,
@@ -750,7 +750,7 @@ mod tests {
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         let mirror = vm.intern_class_mirror("[B");
         let r = super::super::invoke(
             &mut vm,
@@ -781,7 +781,7 @@ mod tests {
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         let mirror = vm.intern_class_mirror("int");
         let r = super::super::invoke(
             &mut vm,
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn get_class_access_flags_null_arg_throws_npe() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         let err = super::super::invoke(
             &mut vm,
             "jdk/internal/reflect/Reflection",
@@ -828,7 +828,7 @@ mod tests {
     #[test]
     fn unbound_reflection_native_throws_ule() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         let err = super::super::invoke(
             &mut vm,
             "jdk/internal/reflect/Reflection",
@@ -868,7 +868,7 @@ mod tests {
     /// 找 `class.name(desc)` 在 `cf.methods` 的(原始下标 slot, access_flags)。4.15a
     /// `getDeclaredMethods0(false)` 无过滤 → slot == 原始下标;故 invoke0/newInstance0
     /// 据 slot 直索引 `cf.methods[slot]`。
-    fn find_method(vm: &Vm, class: &str, name: &str, desc: &str) -> (i32, i32) {
+    fn find_method(vm: &VmThread, class: &str, name: &str, desc: &str) -> (i32, i32) {
         let reg = vm.registry().expect("注册表");
         let lc = reg.get(class).unwrap_or_else(|| panic!("{class} 须加载"));
         lc.cf
@@ -892,7 +892,7 @@ mod tests {
     /// 构造 Executable(Method/Constructor)镜像:分配裸实例 + 按**字段名**写
     /// clazz/slot/modifiers(invoke0/newInstance0 的 read_executable_meta 据此三名读取)。
     fn build_executable_mirror(
-        vm: &mut Vm,
+        vm: &mut VmThread,
         class_name: &str,
         clazz_mirror: Reference,
         slot: i32,
@@ -921,7 +921,7 @@ mod tests {
     }
 
     /// 分配 `wrapper` 实例并置 `value`(供反射调用的原语实参装箱)。
-    fn box_primitive(vm: &mut Vm, wrapper: &str, value: Slot) -> Reference {
+    fn box_primitive(vm: &mut VmThread, wrapper: &str, value: Slot) -> Reference {
         let (inst, ord) = {
             let reg = vm.registry().expect("注册表");
             let lc = reg
@@ -942,7 +942,7 @@ mod tests {
     }
 
     /// 读包装实例的 `value` int 字段(供反射返回值断言)。
-    fn read_int_value(vm: &Vm, r: Reference, wrapper: &str) -> i32 {
+    fn read_int_value(vm: &VmThread, r: Reference, wrapper: &str) -> i32 {
         let ord = {
             let reg = vm.registry().expect("注册表");
             let lc = reg.get(wrapper).expect("包装类须加载");
@@ -961,7 +961,7 @@ mod tests {
     }
 
     /// 构造 `Object[]`(元素引用;空 → 长 0 数组)。null 数组由 invoke0 自身归一。
-    fn object_array(vm: &mut Vm, elems: Vec<Reference>) -> Reference {
+    fn object_array(vm: &mut VmThread, elems: Vec<Reference>) -> Reference {
         let slots: Vec<Slot> = elems.into_iter().map(Slot::Reference).collect();
         vm.heap_mut()
             .alloc(Oop::Array(ArrayOop::new("[Ljava/lang/Object;".to_string(), slots)))
@@ -969,11 +969,11 @@ mod tests {
 
     /// 预载反射调用所需的最小真 java.base 类簇(Integer/Method/Constructor/ITE +
     /// 传递性依赖)。lib 闸门直接调 native,绕开 Method.invoke 字节码,故无需 Phase1/2。
-    fn reflection_vm() -> Vm {
+    fn reflection_vm() -> VmThread {
         let Some(jmod) = find_javabase_jmod() else {
             eprintln!("跳过:无 java.base.jmod");
             // 返回空 Vm;调用方用 find_javabase_jmod 守卫提前 return。
-            return Vm::new(ClassRegistry::new());
+            return VmThread::new(ClassRegistry::new());
         };
         let mut registry = ClassRegistry::new();
         let bytes = std::fs::read(&jmod).unwrap();
@@ -988,7 +988,7 @@ mod tests {
         ] {
             load_closure(&mut registry, &cp, c).unwrap();
         }
-        Vm::new(registry)
+        VmThread::new(registry)
     }
 
     fn has_jmod() -> bool {

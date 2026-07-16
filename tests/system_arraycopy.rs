@@ -14,7 +14,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -90,7 +90,7 @@ public class ArrayCopyGate {
 "#;
 
 /// 跑 `ArrayCopyGate.<name>`,返回 `Ok(Value)` 或 `Err(异常内部名)`(供异常用例)。
-fn run_static(vm: &mut Vm, name: &str, desc: &str) -> Result<Value, String> {
+fn run_static(vm: &mut VmThread, name: &str, desc: &str) -> Result<Value, String> {
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("ArrayCopyGate").expect("ArrayCopyGate 须已注册");
     let method = lc
@@ -146,7 +146,7 @@ fn system_arraycopy_end_to_end() {
     load_closure(&mut registry, &cp, "java/lang/System").unwrap();
     assert!(registry.get("java/lang/System").is_some(), "System 须已预载");
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
 
     // 基本 int 拷贝 + 读回求和 → 28。
     match run_static(&mut vm, "copyAndSum", "()I") {

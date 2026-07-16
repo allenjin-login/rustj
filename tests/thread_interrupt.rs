@@ -23,7 +23,7 @@ use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -86,7 +86,7 @@ fn find_method<'a>(
 /// 解释执行一个静态方法(无参),返回值或 `VmError`。
 fn run_static(
     registry: &std::sync::Arc<ClassRegistry>,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -101,7 +101,7 @@ fn run_static(
 }
 
 /// 装载 Probe + java.base 关键类,返回 (registry, vm)。
-fn load() -> (std::sync::Arc<ClassRegistry>, Vm) {
+fn load() -> (std::sync::Arc<ClassRegistry>, VmThread) {
     let dir = compile_dir(SOURCE, "Probe");
     let mut registry = ClassRegistry::new();
     let pcf = parse(&std::fs::read(dir.join("Probe.class")).unwrap()).unwrap();
@@ -124,7 +124,7 @@ fn load() -> (std::sync::Arc<ClassRegistry>, Vm) {
         load_closure(&mut registry, &cp, cls).unwrap();
     }
     let registry = std::sync::Arc::new(registry);
-    let vm = Vm::new(std::sync::Arc::clone(&registry));
+    let vm = VmThread::new(std::sync::Arc::clone(&registry));
     (registry, vm)
 }
 
@@ -177,7 +177,7 @@ public class Probe implements Runnable {
 }
 "#;
 
-fn assert_int(reg: &std::sync::Arc<ClassRegistry>, vm: &mut Vm, name: &str, expected: i32) {
+fn assert_int(reg: &std::sync::Arc<ClassRegistry>, vm: &mut VmThread, name: &str, expected: i32) {
     let v = match run_static(reg, vm, "Probe", name, "()I").expect("{name} 应非抛") {
         Value::Int(v) => v,
         other => panic!("{name} 须返 int,得 {other:?}"),

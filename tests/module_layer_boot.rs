@@ -18,7 +18,7 @@ use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::{bootstrap_module_system, initialize_system_class};
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -69,7 +69,7 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
 }
 
 /// 解释执行一个无参静态 int 方法(共用传入 Vm)。抛 Java 异常时把类名带出。
-fn run_static_int(vm: &mut Vm, class: &str, name: &str) -> Result<i32, String> {
+fn run_static_int(vm: &mut VmThread, class: &str, name: &str) -> Result<i32, String> {
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc.cf.methods.iter().find(|m| {
@@ -144,7 +144,7 @@ fn module_layer_boot_returns_boot_layer() {
     load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
     load_closure(&mut registry, &cp, "java/lang/System").unwrap();
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     // Phase 1(savedProps 引导,4.13)+ Phase 2(模块系统引导,4.14b)。
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
     bootstrap_module_system(&mut vm).expect("Phase 2 引导应成功");

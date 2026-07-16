@@ -19,7 +19,7 @@ use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -83,7 +83,7 @@ fn find_method<'a>(
 /// 解释执行一个无参静态方法(带异常表——wait 字节码包装的 try-catch 依赖异常表)。
 fn run_static(
     registry: &std::sync::Arc<ClassRegistry>,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -169,7 +169,7 @@ fn object_wait_notify_end_to_end() {
         load_closure(&mut registry, &cp, cls).unwrap();
     }
     let registry = std::sync::Arc::new(registry);
-    let mut vm = Vm::new(std::sync::Arc::clone(&registry));
+    let mut vm = VmThread::new(std::sync::Arc::clone(&registry));
 
     // wait(80) 真阻塞 ~80ms:no-op wait 立返 → 差 < 40;真阻塞 → 差 >= 40(且 < 1000 防死锁)。
     match run_static(&registry, &mut vm, "WaitGate", "waitBlocksForTimeout", "()J").unwrap() {

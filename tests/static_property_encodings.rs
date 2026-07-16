@@ -16,7 +16,7 @@ use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::initialize_system_class;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
@@ -40,7 +40,7 @@ public class PathProbe {
 }
 "#;
 
-fn run_static_int(vm: &mut Vm, class: &str, name: &str) -> Result<i32, String> {
+fn run_static_int(vm: &mut VmThread, class: &str, name: &str) -> Result<i32, String> {
     let reg = vm.registry().unwrap_or_else(|| panic!("类注册表缺失"));
     let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc.cf.methods.iter().find(|m| {
@@ -91,7 +91,7 @@ fn static_property_encodings_populated_enables_path_of() {
     load_closure(&mut registry, &cp, "java/util/Properties").unwrap();
     load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
     assert_eq!(
         run_static_int(&mut vm, "PathProbe", "make"),

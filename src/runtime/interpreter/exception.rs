@@ -7,11 +7,11 @@
 use super::field::resolve_class_name;
 use super::{Interpreter, VmError};
 use crate::classfile::attributes::ExceptionTableEntry;
-use crate::runtime::{Reference, Vm};
+use crate::runtime::{Reference, VmThread};
 
 /// 取异常对象(非 null)的运行时类名(own String 避免借用纠缠)。
 /// athrow 对象必为实例(数组不能 throw);悬空 / 数组 → `BadConstant`。
-fn runtime_class_name(vm: &Vm, exc: Reference) -> Result<String, VmError> {
+fn runtime_class_name(vm: &VmThread, exc: Reference) -> Result<String, VmError> {
     use crate::oops::Oop;
     let heap = vm.heap();
     let obj = heap
@@ -29,7 +29,7 @@ fn runtime_class_name(vm: &Vm, exc: Reference) -> Result<String, VmError> {
 /// `catch_type == 0` → catch-all;否则解析目标类名,`is_instance(运行时类, 目标)`。
 pub(super) fn find_handler(
     interp: &Interpreter<'_>,
-    vm: &Vm,
+    vm: &VmThread,
     table: &[ExceptionTableEntry],
     pc: usize,
     exc: Reference,
@@ -62,7 +62,7 @@ mod tests {
     use crate::constant_pool::ConstantPool;
     use crate::metadata::{AccessFlags, ClassFile};
     use crate::oops::{ClassRegistry, Oop};
-    use crate::runtime::{Reference, Vm};
+    use crate::runtime::{Reference, VmThread};
 
     /// utf8: 1=Throwable 2=BaseExc 3=SubExc 4=OtherExc ; class: 5=Throwable 6=BaseExc 7=SubExc 8=OtherExc。
     fn cp_bytes() -> Vec<u8> {
@@ -102,7 +102,7 @@ mod tests {
         (reg, mk_cp())
     }
 
-    fn sub_instance(reg: &ClassRegistry, vm: &mut Vm) -> Reference {
+    fn sub_instance(reg: &ClassRegistry, vm: &mut VmThread) -> Reference {
         let lc = reg.get("SubExc").unwrap();
         vm.heap_mut().alloc(Oop::Instance(reg.new_instance(&lc)))
     }
@@ -124,7 +124,7 @@ mod tests {
     fn find_exact_type_matches() {
         let (reg, cp) = build();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm);
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 7)]; // catch SubExc(#7)
@@ -135,7 +135,7 @@ mod tests {
     fn find_out_of_range_no_match() {
         let (reg, cp) = build();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm);
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 7)];
@@ -146,7 +146,7 @@ mod tests {
     fn find_supertype_matches() {
         let (reg, cp) = build();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm); // SubExc 实例
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 6)]; // catch BaseExc(#6)
@@ -157,7 +157,7 @@ mod tests {
     fn find_unrelated_no_match() {
         let (reg, cp) = build();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm);
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 8)]; // catch OtherExc(#8)
@@ -168,7 +168,7 @@ mod tests {
     fn find_catch_all_matches_anything() {
         let (reg, cp) = build();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
         let exc = sub_instance(&reg, &mut vm);
         let interp = empty_interp(&cp);
         let table = [entry(0, 2, 2, 0)]; // catch_type 0 = catch-all

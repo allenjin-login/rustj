@@ -13,7 +13,7 @@ use rustj::classfile::parse;
 use rustj::constant_pool::ConstantPoolEntry;
 use rustj::metadata::{ClassFile, MethodInfo};
 use rustj::oops::ClassRegistry;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -89,7 +89,7 @@ fn run(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: 
     // 入口解释器必须带上本方法异常表:同帧 athrow 靠它找处理者;跨帧时它作为
     // 调用者表供 invoke 的 finish_invoke 扫描。
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(std::sync::Arc::clone(reg));
+    let mut vm = VmThread::new(std::sync::Arc::clone(reg));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
@@ -107,7 +107,7 @@ fn run_err(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, de
         .unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(std::sync::Arc::clone(reg));
+    let mut vm = VmThread::new(std::sync::Arc::clone(reg));
     interp
         .interpret_with(&mut frame, &mut vm)
         .expect_err("期望失败")

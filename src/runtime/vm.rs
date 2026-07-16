@@ -9,7 +9,7 @@
 //!
 //! Phase B.2.3b(T7)职责分解:Class/Module 镜像法 → [`mirrors`]、对象管程 →
 //! [`monitors`]、异常元数据 + 栈轨迹 → [`exceptions`]、线程管理器 + main 线程 → [`threads`]。
-//! 本模块留核心结构([`Vm`]/[`VmShared`]/[`ThreadContext`]/[`CallFrame`]/[`MonitorState`])、
+//! 本模块留核心结构([`Vm`]/[`Runtime`]/[`ThreadContext`]/[`CallFrame`]/[`MonitorState`])、
 //! 构造、堆/池/注册表 accessor、栈帧法(T8 下沉 [`ThreadContext`])。
 
 use std::collections::HashMap;
@@ -60,7 +60,7 @@ pub struct CallFrame {
 }
 
 /// 每线程执行上下文(对应 HotSpot `JavaThread` 的栈区 + 线程身份)。Vm 单线程入口下,Vm 持
-/// "当前线程"的 ThreadContext;Phase B.3 真并发后每 OS 线程一个,经 `Arc<Mutex<VmShared>>` 共享。
+/// "当前线程"的 ThreadContext;Phase B.3 真并发后每 OS 线程一个,经 `Arc<Mutex<Runtime>>` 共享。
 ///
 /// 持 Java 调用栈、帧深度(SOE 检测)、上限、线程镜像句柄——皆为**线程隔离态**(CLAUDE.md §6
 /// "调用栈归属线程"的落实,Phase B.1 起 call_stack 不再是 Vm 顶层字段)。镜像句柄惰性分配:
@@ -173,12 +173,12 @@ impl JavaMonitor {
 
 /// **跨线程共享态**(Phase B.2.3a/b):Vm 持有的「所有线程共享」字段集合——对象堆、类注册表、
 /// 字符串池、管程表、异常元数据、Class/Module 镜像表、线程管理器。逐字段 `Mutex` 包装,
-/// `Vm.shared` 持 `Arc<VmShared>`——多线程经 `Vm::from_shared(Arc::clone(&vm.shared))` 派生
+/// `Vm.shared` 持 `Arc<Runtime>`——多线程经 `Vm::from_shared(Arc::clone(&vm.shared))` 派生
 /// 各自 Vm、共享并发改写。对应 HotSpot 跨 `JavaThread` 共享的全局结构(`JavaHeap`/
 /// `SystemDictionary`/`StringTable`/`ObjectMonitor` 表等);线程隔离态留 [`Vm::thread`]。
 /// `pub(crate)`:`from_shared` 签名须命名。
-pub(crate) struct VmShared {
-    /// 对象堆(Mutex:Phase B.2.3b 共享态——`Arc<VmShared>` 多线程并发改堆的前置)。
+pub(crate) struct Vm {
+    /// 对象堆(Mutex:Phase B.2.3b 共享态——`Arc<Runtime>` 多线程并发改堆的前置)。
     heap: Mutex<Heap>,
     /// 类注册表。**B.3.0 移除 `'a`**:owned `Arc<ClassRegistry>`(`load_or_replace` 须 `&mut`,
     /// 故注册表先 owned 载入完毕、再 `Arc::new` 包后传 [`Vm::new`])。owned clone 经
@@ -213,7 +213,7 @@ pub(crate) struct VmShared {
     unnamed_module: Mutex<Option<Reference>>,
 }
 
-impl VmShared {
+impl Vm {
     /// 构造共享态(空堆、空池、空表;tid 起始 1)。`registry` = `Some` 经 [`Vm::new`],
     /// `None` 经 [`Vm::default`](无注册表纯数值测试)。B.3.0:`registry` 为 owned `Arc`(非借用)。
     fn new(registry: Option<Arc<ClassRegistry>>) -> Self {
@@ -234,26 +234,26 @@ impl VmShared {
 
 /// 执行上下文:拥有对象堆,借用类注册表,跟踪帧嵌套深度。
 ///
-/// Phase B.2.3a:共享字段归入 [`shared`](Self.shared)([`VmShared`]),线程隔离态
-///([`thread`](Self.thread))留本结构。B.2.3b:`shared: Arc<VmShared>`,每线程经
+/// Phase B.2.3a:共享字段归入 [`shared`](Self.shared)([`Runtime`]),线程隔离态
+///([`thread`](Self.thread))留本结构。B.2.3b:`shared: Arc<Runtime>`,每线程经
 /// [`Vm::from_shared`](`Vm::from_shared(Arc::clone(&vm.shared))`) 派生各自 Vm、共享同一
-/// `Arc<VmShared>`(字段全 Mutex → `VmShared: Send + Sync` → `Arc<VmShared>: Send + Sync`)。
+/// `Arc<Runtime>`(字段全 Mutex → `Runtime: Send + Sync` → `Arc<Runtime>: Send + Sync`)。
 /// 执行上下文:拥有对象堆,共享类注册表,跟踪帧嵌套深度。
 ///
-/// Phase B.2.3a:共享字段归入 [`shared`](Self.shared)([`VmShared`]),线程隔离态
-///([`thread`](Self.thread))留本结构。B.2.3b:`shared: Arc<VmShared>`,每线程经
+/// Phase B.2.3a:共享字段归入 [`shared`](Self.shared)([`Runtime`]),线程隔离态
+///([`thread`](Self.thread))留本结构。B.2.3b:`shared: Arc<Runtime>`,每线程经
 /// [`Vm::from_shared`](`Vm::from_shared(Arc::clone(&vm.shared))`) 派生各自 Vm、共享同一
-/// `Arc<VmShared>`(字段全 Mutex → `VmShared: Send + Sync` → `Arc<VmShared>: Send + Sync`)。
-/// **B.3.0**:无 `'a` lifetime(`registry` 为 owned `Arc<ClassRegistry>`)→ `VmShared: 'static`
-/// → `Arc<VmShared>: 'static` → B.3b `thread::spawn(move || …)` 跨线程共享 `Arc::clone`。
-pub struct Vm {
+/// `Arc<Runtime>`(字段全 Mutex → `Runtime: Send + Sync` → `Arc<Runtime>: Send + Sync`)。
+/// **B.3.0**:无 `'a` lifetime(`registry` 为 owned `Arc<ClassRegistry>`)→ `Runtime: 'static`
+/// → `Arc<Runtime>: 'static` → B.3b `thread::spawn(move || …)` 跨线程共享 `Arc::clone`。
+pub struct VmThread {
     /// 跨线程共享态(堆/注册表/池/管程/镜像表/线程管理器)。`Arc` 共享;字段全 Mutex(`Arc::clone` 派生线程)。
-    shared: Arc<VmShared>,
+    vm: Arc<Vm>,
     /// 当前线程隔离态(调用栈/帧深度/线程镜像)。
     pub(crate) thread: ThreadContext,
 }
 
-impl Vm {
+impl VmThread {
     /// 构造带类注册表的 Vm(空堆,默认深度上限)。**B.3.0**:`registry` 为 owned `Arc<ClassRegistry>`
     ///(`load_orreplace` 须 `&mut`,故注册表先 owned 载入完毕、再 `Arc::new` 包后传入)。
     /// 取 `impl Into<Arc<ClassRegistry>>`:调用方可传 owned `ClassRegistry`(`Arc::new` 由本方法包)
@@ -261,7 +261,7 @@ impl Vm {
     /// → `Vm::new(reg)`(去 `&`,owned 移交)。
     pub fn new(registry: impl Into<Arc<ClassRegistry>>) -> Self {
         Self {
-            shared: Arc::new(VmShared::new(Some(registry.into()))),
+            vm: Arc::new(Vm::new(Some(registry.into()))),
             thread: ThreadContext::new_main(),
         }
     }
@@ -269,17 +269,17 @@ impl Vm {
     /// 从既有共享态派生新 Vm(B.3b 真线程:每线程各持 `Arc::clone` 的共享态 + 独立 `ThreadContext`)。
     /// 调用方先 [`Vm::shared_arc`] 取 `Arc::clone(&vm.shared)`,再经本方法构造派生线程的 Vm。
     /// 共享态(堆/池/管程/镜像表)跨线程共享;线程隔离态(调用栈/帧深度/线程镜像)各独立。
-    pub(crate) fn from_shared(shared: Arc<VmShared>) -> Self {
+    pub(crate) fn from_vm(vm: Arc<Vm>) -> Self {
         Self {
-            shared,
+            vm,
             thread: ThreadContext::new_main(),
         }
     }
 
     /// 取共享态的 `Arc::clone`(供 [`Vm::from_shared`] 派生线程 Vm;`shared` 字段私有)。
-    /// B.3.0:返 `Arc<VmShared>`(`'static`),B.3b `start_thread` `move` 进 `thread::spawn` 闭包。
-    pub(crate) fn shared_arc(&self) -> Arc<VmShared> {
-        Arc::clone(&self.shared)
+    /// B.3.0:返 `Arc<Runtime>`(`'static`),B.3b `start_thread` `move` 进 `thread::spawn` 闭包。
+    pub(crate) fn vm_arc(&self) -> Arc<Vm> {
+        Arc::clone(&self.vm)
     }
 
     /// 设置帧深度上限(builder)。SOE 测试用小值快速触发。
@@ -291,23 +291,23 @@ impl Vm {
     /// 对象堆(Mutex 守卫;Phase B.2.3b)。inline 调用经 `Deref` 不破;跨语句绑定 须提取 owned
     ///(`.cloned()`)——`MutexGuard` 借 `&self`,持 guard 跨 `&mut vm` 会 E0502。
     pub fn heap(&self) -> MutexGuard<'_, Heap> {
-        self.shared.heap.lock().unwrap()
+        self.vm.heap.lock().unwrap()
     }
 
     /// 对象堆(可变访问经 Mutex 内部可变性;`&self` 即可,调用方 `&mut vm` 自动协变)。
     pub fn heap_mut(&self) -> MutexGuard<'_, Heap> {
-        self.shared.heap.lock().unwrap()
+        self.vm.heap.lock().unwrap()
     }
 
     /// 字符串 intern 池(4.8/4.10i):文本 → 堆引用的纯备忘;真 String 实例构造在
     /// interpreter(`string::intern`),本池仅保证「同文本恒同引用」。
     pub(crate) fn string_pool(&self) -> MutexGuard<'_, StringPool> {
-        self.shared.string_pool.lock().unwrap()
+        self.vm.string_pool.lock().unwrap()
     }
 
     /// 字符串 intern 池(可变;经 MutexGuard 内部可变性,`&self` 即可,同 `heap_mut`)。
     pub(crate) fn string_pool_mut(&self) -> MutexGuard<'_, StringPool> {
-        self.shared.string_pool.lock().unwrap()
+        self.vm.string_pool.lock().unwrap()
     }
 
     /// 类注册表(若启用)。**B.3.0**:返 owned `Arc<ClassRegistry>`(cheap refcount clone)。
@@ -315,7 +315,7 @@ impl Vm {
     ///(保 §6 NLL trick:递归 `interpret_with` 等)。`ClassRegistry` 经 deref 透明用(`.get`/…);
     /// `load_or_replace` 须 `&mut`,故 registry 须**建 Vm 前** owned 载入完毕。
     pub fn registry(&self) -> Option<Arc<ClassRegistry>> {
-        self.shared.registry.clone()
+        self.vm.registry.clone()
     }
 
     // ---- 栈帧法(T8 下沉 impl ThreadContext;Vm 薄转发,保调用点零改动)----
@@ -341,10 +341,10 @@ impl Vm {
     }
 }
 
-impl Default for Vm {
+impl Default for VmThread {
     fn default() -> Self {
         Self {
-            shared: Arc::new(VmShared::new(None)),
+            vm: Arc::new(Vm::new(None)),
             thread: ThreadContext::new_main(),
         }
     }
@@ -359,7 +359,7 @@ mod monitor_tests {
 
     /// 分配一个锁对象(裸 Instance,类名 "Lock")。owner 经 `main_thread` 解析(无 Thread 预载
     /// 时返 null——单线程下 owner 一致即可测重入/释放/IMSE 机制)。
-    fn lock_obj(vm: &mut Vm) -> Reference {
+    fn lock_obj(vm: &mut VmThread) -> Reference {
         vm.heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("Lock".into(), vec![])))
     }
@@ -369,7 +369,7 @@ mod monitor_tests {
     #[test]
     fn monitor_enter_reentry_and_exit_releases() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let obj = lock_obj(&mut vm);
         vm.monitor_enter(obj).expect("enter #1");
         vm.monitor_enter(obj).expect("enter #2 (重入)");
@@ -385,7 +385,7 @@ mod monitor_tests {
     #[test]
     fn monitor_exit_unheld_throws_imse() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let obj = lock_obj(&mut vm);
         let err = vm.monitor_exit(obj).unwrap_err();
         let VmError::ThrownException(r) = err else {
@@ -402,7 +402,7 @@ mod monitor_tests {
     #[test]
     fn monitor_enter_null_throws_npe() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let err = vm.monitor_enter(Reference::null()).unwrap_err();
         let VmError::ThrownException(r) = err else {
             panic!("期望 ThrownException,得 {err:?}");
@@ -417,7 +417,7 @@ mod monitor_tests {
 
 #[cfg(test)]
 mod sync_assertions {
-    //! Layer 4.42 / Phase B.2.1:`Vm` 须为 `Sync`——B.3 真并发(`Arc<Mutex<VmShared>>:
+    //! Layer 4.42 / Phase B.2.1:`Vm` 须为 `Sync`——B.3 真并发(`Arc<Mutex<Runtime>>:
     //! Send+Sync`)的前置。当前 `Vm` 经 `registry: Option<&'a ClassRegistry>` 借注册表,
     //! 而 `ClassRegistry`/`LoadedClass` 持 `RefCell`(static_storage/flat_cache/init_state/
     //! class_modules),`RefCell: !Sync` → `Vm: !Sync` → 此断言**编译失败**(RED)。把四处
@@ -425,77 +425,73 @@ mod sync_assertions {
     //!
     //! Phase B.2.1 续:`Vm: Send` 同理达成(`registry: &'a ClassRegistry: Send` ⟸
     //! `ClassRegistry: Sync`)。Heap→Mutex 的「`&Vm` 共享引用互斥改堆」能力顺延至 B.2.3
-    //! (VmShared 拆分):单独包 `Mutex<Heap>` 须把 ~30 处 `vm.heap().get()` match/let-else
+    //! (Runtime 拆分):单独包 `Mutex<Heap>` 须把 ~30 处 `vm.heap().get()` match/let-else
     //! 重构为「先提取 owned 再 `&mut vm`」(`MutexGuard` 的 `Drop` 延长 `&self` 借用到作用域末,
-    //! 破坏 §6 NLL 即用即释),无 VmShared 视图拆分上下文则成纯机械搅动,故并入 B.2.3。
+    //! 破坏 §6 NLL 即用即释),无 Runtime 视图拆分上下文则成纯机械搅动,故并入 B.2.3。
     //!
-    //! Phase B.2.3a(已落):`VmShared` 结构已内联提取(`Vm { shared, thread }`,owned、无 Mutex、
-    //! 行为保持)——确立「共享 vs 线程隔离」字段边界,本断言仍绿(`VmShared: Sync` ⟸ 各字段皆 Sync)。
-    //! B.2.3b 待做:`shared: &'a VmShared` 视图 + 逐字段 `Mutex` + `let heap = vm.heap();` 绑定修 E0716
-    //!(`MutexGuard` 借 VmShared(referent)非 vm → 持 guard 不阻塞 `&mut vm`,E0502 自动消失)。
-    use super::Vm;
+    //! Phase B.2.3a(已落):`Runtime` 结构已内联提取(`Vm { shared, thread }`,owned、无 Mutex、
+    //! 行为保持)——确立「共享 vs 线程隔离」字段边界,本断言仍绿(`Runtime: Sync` ⟸ 各字段皆 Sync)。
+    //! B.2.3b 待做:`shared: &'a Runtime` 视图 + 逐字段 `Mutex` + `let heap = vm.heap();` 绑定修 E0716
+    //!(`MutexGuard` 借 Runtime(referent)非 vm → 持 guard 不阻塞 `&mut vm`,E0502 自动消失)。
+    use super::VmThread;
     use crate::oops::ClassRegistry;
 
     fn assert_sync<T: ?Sized + Sync>() {}
     fn assert_send<T: ?Sized + Send>() {}
     fn assert_static<T: 'static>(_: &T) {}
 
-    /// **B.3.0**:`Arc<VmShared>` 须 `'static` —— B.3b `thread::spawn(move || …)` 跨线程共享
-    /// `Arc::clone(&vm.shared)` 的前置(spawn 闭包须 `'static`)。当前 `VmShared<'a>` 借
-    /// `&'a ClassRegistry`(`'a` 绑本地 `reg`)→ `Arc<VmShared<'a>>` 非 `'static` → 本断言
-    /// **编译失败**(RED:`reg` 寿命不足 `'static`)。移除 `'a`(`registry` → `Arc<ClassRegistry>`)
-    /// → `shared_arc()` 返 `Arc<VmShared>`(`'static`)→ 通过(GREEN)。
+    /// 断言 `vm_arc()` 返 `Arc<Vm>: 'static`(B.3b `thread::spawn(move || Arc::clone(&vt.vm))`
+    /// 的前置:spawn 闭包须 `'static`;Vm 无生命周期参数,registry 为 owned `Arc<ClassRegistry>`)。
     #[test]
-    fn vmshared_arc_is_static() {
+    fn vm_arc_is_static() {
         let reg = ClassRegistry::new();
-        let vm = Vm::new(reg);
-        assert_static(&vm.shared_arc());
+        let vm = VmThread::new(reg);
+        assert_static(&vm.vm_arc());
     }
 
     /// `Vm: Sync`(B.2.1):各共享字段全 `Mutex`,registry 为 `Arc<ClassRegistry>`(`ClassRegistry: Sync`)
-    /// → `VmShared: Sync` → `Vm: Sync`。B.3.0 移除 `'a` 后 Vm 无生命周期参数,直接断言即可。
+    /// → `Runtime: Sync` → `Vm: Sync`。B.3.0 移除 `'a` 后 Vm 无生命周期参数,直接断言即可。
     #[test]
     fn vm_is_sync() {
-        assert_sync::<Vm>();
+        assert_sync::<VmThread>();
     }
 
-    /// `Vm: Send`(B.2.1):B.3 `Arc<Mutex<VmShared>>: Send+Sync` 须 `VmShared: Send` → `Vm: Send`
+    /// `Vm: Send`(B.2.1):B.3 `Arc<Mutex<Runtime>>: Send+Sync` 须 `Runtime: Send` → `Vm: Send`
     ///(`ClassRegistry: Send+Sync`,B.2.1 已达)。B.3.0 后无生命周期参数,直接断言。
     #[test]
     fn vm_is_send() {
-        assert_send::<Vm>();
+        assert_send::<VmThread>();
     }
 
-    /// **T6**(B.2.3b):`Arc<VmShared<'a>>: Send + Sync`——B.3b `thread::spawn` 跨线程共享 `Arc::clone`
-    /// 的前置。各共享字段全 `Mutex`(registry 仍 `&'a` 不可变)→ `VmShared: Send+Sync` →
-    /// `Arc<VmShared>: Send+Sync`。RED(任一字段非 Send/Sync)→ 编译失败。
+    /// 断言 `Arc<Vm>: Send + Sync`(B.3b 跨线程 `Arc::clone` 共享 Vm 的前置:各共享字段全
+    /// `Mutex` → `Vm: Send+Sync` → `Arc<Vm>: Send+Sync`)。
     #[test]
-    fn arc_vmshared_is_send_sync() {
-        // B.3.0:VmShared 已无生命周期参数('a 移除——registry 为 owned Arc,不再借外部 ClassRegistry)。
-        assert_send::<std::sync::Arc<super::VmShared>>();
-        assert_sync::<std::sync::Arc<super::VmShared>>();
+    fn arc_vm_is_send_sync() {
+        // Vm 无生命周期参数(registry 为 owned Arc<ClassRegistry>)。
+        assert_send::<std::sync::Arc<super::Vm>>();
+        assert_sync::<std::sync::Arc<super::Vm>>();
     }
 
-    /// **T6**(B.2.3b):`from_shared(vm.shared_arc())` 派生的 Vm 与原 Vm **共享同一 `Arc<VmShared>`**
-    /// (堆/池/管程/镜像表)。在 vm 堆上分配的对象,经 vm2(from_shared)同引用可见。
+    /// `from_vm(vt.vm_arc())` 派生的 VmThread 与原 VmThread **共享同一 `Arc<Vm>`**(堆/池/
+    /// 管程/镜像表)。在 vt 堆上分配的对象,经 vm2(from_vm)同引用可见。
     #[test]
-    fn from_shared_shares_arc_vmshared() {
+    fn from_vm_shares_arc_vm() {
         use crate::oops::{InstanceOop, Oop};
         let reg = ClassRegistry::new();
-        let vm = Vm::new(reg);
+        let vm = VmThread::new(reg);
         // 在 vm 的共享堆上分配一个对象(无须经注册表/intern)。
         let r = vm
             .heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("probe".into(), vec![])));
-        // shared_arc + from_shared 派生共享态 vm2(各自独立 ThreadContext)。
-        let vm2 = Vm::from_shared(vm.shared_arc());
+        // vm_arc + from_vm 派生共享态 vm2(各自独立 ThreadContext)。
+        let vm2 = VmThread::from_vm(vm.vm_arc());
         let heap = vm2.heap();
         let oop = heap
             .get(r)
             .expect("共享堆:vm 分配的对象在 vm2 须可见");
         assert!(
             matches!(oop, Oop::Instance(i) if i.class_name() == "probe"),
-            "from_shared 须共享 VmShared 堆(同引用同对象)"
+            "from_vm 须共享 Vm 堆(同引用同对象)"
         );
     }
 }
@@ -503,7 +499,7 @@ mod sync_assertions {
 #[cfg(test)]
 mod concurrent_monitor_tests {
     //! Phase B.3a:真阻塞管程闸门。两 OS 线程经 [`Vm::from_shared`](`Arc::clone`)共享同一
-    //! [`VmShared`],对同一锁对象 `monitor_enter/exit` 包夹**非原子**读-改-写共享计数。阻塞管程
+    //! [`Runtime`],对同一锁对象 `monitor_enter/exit` 包夹**非原子**读-改-写共享计数。阻塞管程
     //! 串行化临界区 → 总数 == 2N;当前重入不阻塞(owner 不判 / 无 Condvar)→ 两线程同时进入临界区
     //! → 竞态丢失更新 → 总数 < 2N(RED)。GREEN:[`JavaMonitor`] + `Condvar` 阻塞至 owner 空闲。
     use super::*;
@@ -516,8 +512,8 @@ mod concurrent_monitor_tests {
     const ITERS: u64 = 2000;
 
     /// worker 线程体:派生共享 Vm,ITERS 次 enter → 非原子 RMW → exit。
-    fn worker(shared: Arc<VmShared>, lock: Reference, counter: &AtomicU64) {
-        let mut vm = Vm::from_shared(shared);
+    fn worker(shared: Arc<Vm>, lock: Reference, counter: &AtomicU64) {
+        let mut vm = VmThread::from_vm(shared);
         for _ in 0..ITERS {
             vm.monitor_enter(lock).expect("monitor_enter");
             // 非原子读-改-写:正确性**仅**靠管程串行化保证(yield_now 拉宽竞态窗口)。
@@ -531,8 +527,8 @@ mod concurrent_monitor_tests {
     /// **RED→GREEN**:两线程并发各 ITERS 次自增共享计数,管程须串行化 → 总数 == 2·ITERS。
     #[test]
     fn monitor_serializes_concurrent_increment() {
-        let vm = Vm::new(ClassRegistry::new());
-        let shared = vm.shared_arc();
+        let vm = VmThread::new(ClassRegistry::new());
+        let shared = vm.vm_arc();
         let lock = vm
             .heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("Lock".into(), vec![])));
@@ -569,7 +565,7 @@ mod concurrent_wait_tests {
     use std::time::{Duration, Instant};
 
     /// 分配一个裸 `Lock` Instance 作管程锁对象(`monitor_enter`/`object_wait` 据 `main_thread` 解析 owner)。
-    fn lock_obj(vm: &mut Vm) -> Reference {
+    fn lock_obj(vm: &mut VmThread) -> Reference {
         vm.heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("Lock".into(), vec![])))
     }
@@ -578,7 +574,7 @@ mod concurrent_wait_tests {
     /// GREEN:真 `wait_cvar.wait_timeout_while(150ms)` 阻塞满超时(`wake_seq` 谓词抗 spurious 唤醒)。
     #[test]
     fn object_wait_blocks_for_timeout() {
-        let mut vm = Vm::new(ClassRegistry::new());
+        let mut vm = VmThread::new(ClassRegistry::new());
         let lock = lock_obj(&mut vm);
         vm.monitor_enter(lock).expect("monitor_enter");
         let start = Instant::now();
@@ -595,14 +591,14 @@ mod concurrent_wait_tests {
     /// GREEN:waiter 在 < 2s 内被唤醒;notify 失效 → waiter 等 5000ms 超时 → elapsed > 2s。
     #[test]
     fn object_notify_wakes_waiting_thread() {
-        let mut vm = Vm::new(ClassRegistry::new());
+        let mut vm = VmThread::new(ClassRegistry::new());
         let lock = lock_obj(&mut vm);
-        let shared = vm.shared_arc();
+        let shared = vm.vm_arc();
         let done = Arc::new(AtomicU64::new(0));
 
         let (s_wait, d_wait) = (Arc::clone(&shared), Arc::clone(&done));
         let waiter = thread::spawn(move || {
-            let mut vm = Vm::from_shared(s_wait);
+            let mut vm = VmThread::from_vm(s_wait);
             vm.monitor_enter(lock).expect("waiter enter");
             vm.object_wait(lock, 5000).expect("waiter wait");
             vm.monitor_exit(lock).expect("waiter exit");
@@ -612,7 +608,7 @@ mod concurrent_wait_tests {
         thread::sleep(Duration::from_millis(100));
         let (s_not, d_not) = (Arc::clone(&shared), Arc::clone(&done));
         let notifier = thread::spawn(move || {
-            let mut vm = Vm::from_shared(s_not);
+            let mut vm = VmThread::from_vm(s_not);
             while d_not.load(Ordering::SeqCst) == 0 {
                 vm.monitor_enter(lock).expect("notifier enter");
                 vm.object_notify(lock).expect("notifier notify");
@@ -634,14 +630,14 @@ mod concurrent_wait_tests {
     /// notifyAll 唤醒**全部**等待者。两 waiter,notifier 循环 notify_all 直到两 waiter 都报完成。
     #[test]
     fn object_notify_all_wakes_all_waiters() {
-        let mut vm = Vm::new(ClassRegistry::new());
+        let mut vm = VmThread::new(ClassRegistry::new());
         let lock = lock_obj(&mut vm);
-        let shared = vm.shared_arc();
+        let shared = vm.vm_arc();
         let done = Arc::new(AtomicU64::new(0));
 
-        let spawn_waiter = |shared: Arc<VmShared>, done: Arc<AtomicU64>| {
+        let spawn_waiter = |shared: Arc<Vm>, done: Arc<AtomicU64>| {
             thread::spawn(move || {
-                let mut vm = Vm::from_shared(shared);
+                let mut vm = VmThread::from_vm(shared);
                 vm.monitor_enter(lock).expect("waiter enter");
                 vm.object_wait(lock, 5000).expect("waiter wait");
                 vm.monitor_exit(lock).expect("waiter exit");
@@ -654,7 +650,7 @@ mod concurrent_wait_tests {
         thread::sleep(Duration::from_millis(100));
         let (s_not, d_not) = (Arc::clone(&shared), Arc::clone(&done));
         let notifier = thread::spawn(move || {
-            let mut vm = Vm::from_shared(s_not);
+            let mut vm = VmThread::from_vm(s_not);
             while d_not.load(Ordering::SeqCst) < 2 {
                 vm.monitor_enter(lock).expect("notifier enter");
                 vm.object_notify_all(lock).expect("notifier notifyAll");
@@ -677,7 +673,7 @@ mod concurrent_wait_tests {
     /// 未持有管程调 wait → IllegalMonitorStateException(`ObjectSynchronizer::wait` CHECK_OWNER)。
     #[test]
     fn object_wait_without_monitor_throws_imse() {
-        let mut vm = Vm::new(ClassRegistry::new());
+        let mut vm = VmThread::new(ClassRegistry::new());
         let lock = lock_obj(&mut vm);
         let err = vm.object_wait(lock, 0).unwrap_err();
         let VmError::ThrownException(r) = err else {
@@ -693,7 +689,7 @@ mod concurrent_wait_tests {
     /// 未持有管程调 notify → IllegalMonitorStateException(`ObjectSynchronizer::notify` CHECK_OWNER)。
     #[test]
     fn object_notify_without_monitor_throws_imse() {
-        let mut vm = Vm::new(ClassRegistry::new());
+        let mut vm = VmThread::new(ClassRegistry::new());
         let lock = lock_obj(&mut vm);
         let err = vm.object_notify(lock).unwrap_err();
         let VmError::ThrownException(r) = err else {
@@ -709,7 +705,7 @@ mod concurrent_wait_tests {
     /// wait(null) → NullPointerException(jvm.cpp `JVM_MonitorWait`:handle==nullptr)。
     #[test]
     fn object_wait_null_throws_npe() {
-        let mut vm = Vm::new(ClassRegistry::new());
+        let mut vm = VmThread::new(ClassRegistry::new());
         let err = vm.object_wait(Reference::null(), 0).unwrap_err();
         let VmError::ThrownException(r) = err else {
             panic!("期望 ThrownException,得 {err:?}");
@@ -724,7 +720,7 @@ mod concurrent_wait_tests {
     /// wait(负 timeout) → IllegalArgumentException(`ObjectSynchronizer::wait`:516 millis<0)。
     #[test]
     fn object_wait_negative_timeout_throws_iae() {
-        let mut vm = Vm::new(ClassRegistry::new());
+        let mut vm = VmThread::new(ClassRegistry::new());
         let lock = lock_obj(&mut vm);
         vm.monitor_enter(lock).unwrap();
         let err = vm.object_wait(lock, -1).unwrap_err();

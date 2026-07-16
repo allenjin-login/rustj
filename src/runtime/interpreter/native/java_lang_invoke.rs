@@ -17,7 +17,7 @@
 //! MemberName flag 常数(MethodHandleNatives.java:88-96)+ REF_*(MethodHandleNatives.java:101-112)。
 
 use crate::oops::Oop;
-use crate::runtime::{Reference, Slot, Value, Vm, VmError};
+use crate::runtime::{Reference, Slot, Value, VmThread, VmError};
 
 use super::super::throw_exception;
 
@@ -37,7 +37,7 @@ const ACC_STATIC: i32 = 0x0008;
 
 /// `java/lang/invoke/*` native 分派。未登记 → `UnsatisfiedLinkError`。
 pub(super) fn dispatch(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -114,7 +114,7 @@ pub(super) fn dispatch(
 ///
 /// **仅 OR 进位**(不抹除现有 modifiers);不查方法/字段本身(TRUSTED lookup 绕 checkAccess;
 /// B.5.2 钩子只读 refKind)。flags 读/写经名查序号,MemberName 未加载/无 flags 字段 → 静默跳过。
-fn resolve_member_flags(vm: &mut Vm, mname: Reference) {
+fn resolve_member_flags(vm: &mut VmThread, mname: Reference) {
     let Some(flags) = vm.instance_int_field(mname, "java/lang/invoke/MemberName", "flags") else {
         return;
     };
@@ -145,7 +145,7 @@ fn resolve_member_flags(vm: &mut Vm, mname: Reference) {
 /// 中的序号(Phase G.1b 物种 SD 字段链接用)。读 MemberName.clazz(声明类 Class 镜像)+
 /// MemberName.name(字段名 String)→ `resolve_static_field_by_name`(仅名匹配)。各步 `&self`
 /// /`&mut self` 读出块即释放,无跨语句借用。MemberName 非法/字段未找到 → -1(putReference 越界兜底)。
-fn static_field_offset(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn static_field_offset(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     let mname = match args.first().copied() {
         Some(Value::Reference(r)) if !r.is_null() => r,
         _ => return Ok(Value::Long(-1)),
@@ -178,7 +178,7 @@ fn static_field_offset(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
 /// DMH 实例字段 Accessor 存此 ord 作 `fieldOffset`,prepared 字段 LF 经 `fieldOffset(dmh)` 读出、
 /// 喂 `Unsafe.getInt(base, ord)`。读 MemberName.clazz(声明类 Class 镜像)+ name(字段名 String)→
 /// `resolve_instance_field_by_name`(仅名匹配)。各步 `&self`/`&mut self` 读出块即释放。未找到 → -1。
-fn object_field_offset(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn object_field_offset(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     let mname = match args.first().copied() {
         Some(Value::Reference(r)) if !r.is_null() => r,
         _ => return Ok(Value::Long(-1)),
@@ -209,7 +209,7 @@ fn object_field_offset(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
 /// `MethodHandleNatives.staticFieldBase(MemberName)`:返声明类 Class 镜像(Phase G.1b)。
 /// 物种链接以此作 `Unsafe.putReference` 的 base;putReference 据「base 是 Class 镜像」
 /// 路由到静态字段。即 MemberName.clazz;无 clazz → null。
-fn static_field_base(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn static_field_base(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     let mname = match args.first().copied() {
         Some(Value::Reference(r)) if !r.is_null() => r,
         _ => return Ok(Value::Reference(Reference::null())),
@@ -222,7 +222,7 @@ fn static_field_base(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
 
 /// `MethodHandleNatives.init(self, ref)`:据 `ref` 类型填 MemberName。当前仅 **Field** 分支
 /// (Method/Constructor 反射走 NativeAccessor 4.15b,不经此);Field 分支移植 init_field_MemberName。
-fn mhn_init(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn mhn_init(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     let self_ref = match args.first().copied() {
         Some(Value::Reference(r)) => r,
         _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
@@ -248,7 +248,7 @@ fn mhn_init(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
 
 /// 字段分支:读 `Field.clazz`/`Field.modifiers` → 置 `MemberName.clazz` + `MemberName.flags`。
 /// 移植 methodHandles.cpp init_field_MemberName:367-368(flags 公式)+ :377 set_clazz。
-fn init_from_field(vm: &mut Vm, self_ref: Reference, fld: Reference) -> Result<(), VmError> {
+fn init_from_field(vm: &mut VmThread, self_ref: Reference, fld: Reference) -> Result<(), VmError> {
     // 读 Field.clazz(Class 镜像)+ Field.modifiers(int)。单次 heap 锁取 owned(同 read_executable_meta)。
     let (clazz, modifiers) = read_field_meta(vm, fld)?;
     let is_static = (modifiers & ACC_STATIC) != 0;
@@ -272,7 +272,7 @@ fn init_from_field(vm: &mut Vm, self_ref: Reference, fld: Reference) -> Result<(
 
 /// 读 `java/lang/reflect/Field` 镜像的 `clazz`(Class 镜像)+ `modifiers`(int)。单次 heap 锁取 owned。
 /// 模式同 jdk_internal_reflect::read_executable_meta(Field 亦同 Executable 字段布局:clazz/modifiers)。
-fn read_field_meta(vm: &Vm, fld: Reference) -> Result<(Reference, i32), VmError> {
+fn read_field_meta(vm: &VmThread, fld: Reference) -> Result<(Reference, i32), VmError> {
     let (clazz_ord, mod_ord) = {
         let reg = vm
             .registry()

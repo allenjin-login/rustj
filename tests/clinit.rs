@@ -11,7 +11,7 @@ use rustj::classfile::parse;
 use rustj::constant_pool::ConstantPoolEntry;
 use rustj::metadata::{ClassFile, MethodInfo};
 use rustj::oops::{ClassRegistry, Oop};
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -87,7 +87,7 @@ fn run_result(
     class_name: &str,
     name: &str,
     desc: &str,
-) -> (Result<Value, VmError>, Vm) {
+) -> (Result<Value, VmError>, VmThread) {
     let lc = reg
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -100,7 +100,7 @@ fn run_result(
     let interp =
         Interpreter::new(&code.code, &lc.cf.constant_pool)
             .with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(std::sync::Arc::clone(reg));
+    let mut vm = VmThread::new(std::sync::Arc::clone(reg));
     let result = interp.interpret_with(&mut frame, &mut vm);
     (result, vm)
 }
@@ -113,7 +113,7 @@ fn as_int(v: Value) -> i32 {
 }
 
 /// 断言结果为 `ThrownException`,其堆对象类名 == `expected`。
-fn assert_throws_class(result: Result<Value, VmError>, vm: &Vm, expected: &str) {
+fn assert_throws_class(result: Result<Value, VmError>, vm: &VmThread, expected: &str) {
     let Err(VmError::ThrownException(exc)) = result else {
         panic!("期望抛 ThrownException({expected}),得 {result:?}");
     };

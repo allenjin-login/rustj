@@ -10,7 +10,7 @@
 use crate::constant_pool::ConstantPoolEntry;
 use crate::metadata::MethodInfo;
 use crate::oops::{LoadedClass, Oop};
-use crate::runtime::{Frame, Interpreter, Reference, Vm, VmError};
+use crate::runtime::{Frame, Interpreter, Reference, VmThread, VmError};
 
 /// **VM 运行时初始化 Phase 1**(`System.initPhase1` 的等价最小子集,`System.java:1720-1836`)。
 ///
@@ -22,7 +22,7 @@ use crate::runtime::{Frame, Interpreter, Reference, Vm, VmError};
 ///
 /// **前置**:注册表须已闭包预载 `jdk/internal/misc/VM` + `java/util/HashMap`
 /// (Integer 等闭包会传递性载入 VM;HashMap 须显式预载,4.10h/real_integer.rs 同此)。
-pub fn initialize_system_class(vm: &mut Vm) -> Result<(), VmError> {
+pub fn initialize_system_class(vm: &mut VmThread) -> Result<(), VmError> {
     // 构造空 HashMap 实例:table=null 默认,HashMap.get 经 `table==null` 短路返 null
     //(等价旧 RustjBootstrap 的 `new HashMap<>()` 不跑 <init>;saveProperties 仅 .get 键)。
     let map_ref = {
@@ -89,7 +89,7 @@ pub fn initialize_system_class(vm: &mut Vm) -> Result<(), VmError> {
 ///
 /// **前置**:`java/lang/System` 已预载(由 `install_system_props` 保证;其内已 `get("java/lang/System")`)。
 /// System 未预载 → 静默跳过(保旧测试兼容,同 `install_system_props` 防御)。
-fn install_java_lang_access(vm: &mut Vm) -> Result<(), VmError> {
+fn install_java_lang_access(vm: &mut VmThread) -> Result<(), VmError> {
     let has_system = vm
         .registry()
         .map(|r| r.get("java/lang/System").is_some())
@@ -104,7 +104,7 @@ fn install_java_lang_access(vm: &mut Vm) -> Result<(), VmError> {
 /// "java/lang/reflect/AccessibleObject")` 触发其 `<clinit>`(AccessibleObject.java:78
 /// `SharedSecrets.setJavaLangReflectAccess(new ReflectAccess())`)。须早于 ReflectionFactory 单例
 /// 缓存(见 `initialize_system_class` 注释)。AccessibleObject 未预载 → 静默跳过。
-fn install_java_lang_reflect_access(vm: &mut Vm) -> Result<(), VmError> {
+fn install_java_lang_reflect_access(vm: &mut VmThread) -> Result<(), VmError> {
     let has_ao = vm
         .registry()
         .map(|r| r.get("java/lang/reflect/AccessibleObject").is_some())
@@ -129,7 +129,7 @@ fn install_java_lang_reflect_access(vm: &mut Vm) -> Result<(), VmError> {
 ///
 /// `java/util/Properties` 或 `java/lang/System` 未预载 → 静默跳过(保 `vm_system_bootstrap` 旧闸门:
 /// 仅预载 Integer/HashMap/String,无 Properties/System 时仍绿)。
-fn install_system_props(vm: &mut Vm) -> Result<(), VmError> {
+fn install_system_props(vm: &mut VmThread) -> Result<(), VmError> {
     use crate::metadata::descriptor::FieldType;
     use crate::runtime::Slot;
 
@@ -186,7 +186,7 @@ fn install_system_props(vm: &mut Vm) -> Result<(), VmError> {
 /// `initPhase1`,故在此直接 `Properties.put` 真字节码逐项写入(委派 `map.put` → HashMap.put)。
 /// 值从 OS 派生:`file.separator`=MAIN_SEPARATOR、`user.dir`=current_dir、… —— 解锁
 /// `WinNTFileSystem.<init>:95` 等读 `file.separator`/`path.separator`/`user.dir` 的代码。
-fn populate_launcher_props(vm: &mut Vm, props_ref: Reference) -> Result<(), VmError> {
+fn populate_launcher_props(vm: &mut VmThread, props_ref: Reference) -> Result<(), VmError> {
     let is_win = std::path::MAIN_SEPARATOR == '\\';
     let sep = std::path::MAIN_SEPARATOR.to_string();
     let path_sep = if is_win { ";" } else { ":" }.to_string();
@@ -243,7 +243,7 @@ fn populate_launcher_props(vm: &mut Vm, props_ref: Reference) -> Result<(), VmEr
 /// 委派 `map.put` → HashMap.put(单线程后盾)。&'a 引用(reg/lc/m/code/CP)不绑 &self(§6)→
 /// 出块后 `interpret_with(&mut vm)` 可独占。
 fn put_property(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     props_ref: Reference,
     key: &str,
     value: &str,
@@ -312,7 +312,7 @@ fn find_method_by_sig<'a>(
 ///
 /// **前置**:注册表须已闭包预载 `java/lang/ModuleLayer`、`java/lang/System`、
 /// `jdk/internal/misc/VM`。Phase 1(`initialize_system_class`)须已跑(`initLevel` 单调 1→2)。
-pub fn bootstrap_module_system(vm: &mut Vm) -> Result<(), VmError> {
+pub fn bootstrap_module_system(vm: &mut VmThread) -> Result<(), VmError> {
     use crate::metadata::descriptor::FieldType;
     use crate::runtime::Slot;
 
@@ -371,7 +371,7 @@ pub fn bootstrap_module_system(vm: &mut Vm) -> Result<(), VmError> {
 ///
 /// **前置**:Phase 1 + Phase 2 已跑;注册表已闭包预载 `java/lang/invoke/MethodHandleImpl`、
 /// `java/lang/invoke/MethodHandleNatives`、`jdk/internal/misc/VM`、`jdk/internal/access/SharedSecrets`。
-pub fn bootstrap_java_lang_invoke(vm: &mut Vm) -> Result<(), VmError> {
+pub fn bootstrap_java_lang_invoke(vm: &mut VmThread) -> Result<(), VmError> {
     // 1) MethodHandleNatives.<clinit> → VM.setJavaLangInvokeInited() 置 flag=true。
     crate::runtime::interpreter::clinit::ensure_class_initialized(
         vm,
@@ -403,7 +403,7 @@ pub fn bootstrap_java_lang_invoke(vm: &mut Vm) -> Result<(), VmError> {
 ///    (open/automatic 默认 false 即够——访问检查仅读这两布尔);置 Module 实例 `descriptor`+`exportedPackages`。
 ///
 /// 无注册表 / 无已登记模块 / Module 未加载 → 静默跳过(保旧测试兼容)。
-fn populate_module_exports(vm: &mut Vm) -> Result<(), VmError> {
+fn populate_module_exports(vm: &mut VmThread) -> Result<(), VmError> {
     use crate::metadata::descriptor::FieldType;
     use crate::runtime::Slot;
 
@@ -454,7 +454,7 @@ fn populate_module_exports(vm: &mut Vm) -> Result<(), VmError> {
 /// 填单个命名模块的 `descriptor` + `exportedPackages`(`populate_module_exports` 的逐模块步)。
 /// 模块镜像缺失 / 字段未见 → 静默跳过(保旧测试兼容)。
 fn populate_one_module(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     module_name: &str,
     desc: &crate::metadata::ModuleDescriptor,
     everyone_set: Reference,
@@ -495,7 +495,7 @@ fn populate_one_module(
 /// 限定 export 顺延)。经 `HashMap.put` 真字节码写入(对应 `initExports`,Module.java:1473)。
 /// HashMap 未加载 → 返 null(调用方跳过填 exportedPackages)。
 fn build_exported_packages(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     desc: &crate::metadata::ModuleDescriptor,
     everyone_set: Reference,
 ) -> Result<Reference, VmError> {
@@ -527,7 +527,7 @@ fn build_exported_packages(
 /// 经解释器跑 `HashMap.put(Object,Object)Object` 写一项(委派 HashMap.put 真字节码)。
 /// &'a 引用(reg/lc/CP)不绑 &self(§6)→ 出块后 interpret_with(&mut vm) 可独占。
 fn hash_map_put(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     map_ref: Reference,
     key_ref: Reference,
     val_ref: Reference,
@@ -563,7 +563,7 @@ fn hash_map_put(
 /// 分配 java `java/lang/module/ModuleDescriptor` Instance,置 `name` = intern(模块名)。
 /// open/automatic 默认 false(访问检查仅读这两布尔,不读 exports()/packages(),故最小填充即够)。
 /// ModuleDescriptor 未加载 → 返 null(调用方跳过填 descriptor)。
-fn alloc_module_descriptor(vm: &mut Vm, module_name: &str) -> Result<Reference, VmError> {
+fn alloc_module_descriptor(vm: &mut VmThread, module_name: &str) -> Result<Reference, VmError> {
     use crate::runtime::Slot;
     let desc_ref = {
         let reg = vm
@@ -594,7 +594,7 @@ fn alloc_module_descriptor(vm: &mut Vm, module_name: &str) -> Result<Reference, 
 ///
 /// **借用**(`Vm::registry` 返 `&'a ClassRegistry`,`'a` 不绑定本次 `&self`,CLAUDE.md §6):
 /// 故取出 `&'a LoadedClass`/`&'a ConstantPool`/`&'a [u8]` 后仍可再 `&mut vm` 跑 `interpret_with`。
-fn invoke_static_void<F>(vm: &mut Vm, class: &str, name: &str, setup: F) -> Result<(), VmError>
+fn invoke_static_void<F>(vm: &mut VmThread, class: &str, name: &str, setup: F) -> Result<(), VmError>
 where
     F: FnOnce(&mut Frame) -> Result<(), crate::runtime::FrameError>,
 {
@@ -662,7 +662,7 @@ mod tests {
     /// 经解释器在 `module_ref` 上跑 `Module.isExported(String)Z`(Module.java:697,1-arg →
     /// `implIsExportedOrOpen(pn, EVERYONE_MODULE, false)`)。返 owned `Value`(Z 作 Int)。
     fn invoke_is_exported(
-        vm: &mut Vm,
+        vm: &mut VmThread,
         module_ref: Reference,
         pn_ref: Reference,
     ) -> Result<Value, VmError> {
@@ -715,7 +715,7 @@ mod tests {
             load_closure(&mut registry, &cp, c).unwrap();
         }
 
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
         // bootstrap_module_system 末尾须调 populate_module_exports(本层实现)。
         bootstrap_module_system(&mut vm).expect("Phase 2 引导(含 populate)应成功");
@@ -773,7 +773,7 @@ mod tests {
             load_closure(&mut registry, &cp, c).unwrap();
         }
 
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         initialize_system_class(&mut vm).expect("Phase 1 应成功");
         bootstrap_module_system(&mut vm).expect("Phase 2 应成功");
         bootstrap_java_lang_invoke(&mut vm).expect("Phase 3 lite(java.lang.invoke)应成功");

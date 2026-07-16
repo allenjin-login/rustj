@@ -10,7 +10,7 @@ use rustj::classfile::parse;
 use rustj::constant_pool::ConstantPoolEntry;
 use rustj::metadata::{ClassFile, MethodInfo};
 use rustj::oops::ClassRegistry;
-use rustj::runtime::{DEFAULT_STACK_LIMIT, Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{DEFAULT_STACK_LIMIT, Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -85,7 +85,7 @@ fn run_with_limit(
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(std::sync::Arc::clone(registry)).with_stack_limit(stack_limit);
+    let mut vm = VmThread::new(std::sync::Arc::clone(registry)).with_stack_limit(stack_limit);
     interp.interpret_with(&mut frame, &mut vm)
 }
 
@@ -104,7 +104,7 @@ fn run_thrown_class_with_limit(
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(std::sync::Arc::clone(registry)).with_stack_limit(stack_limit);
+    let mut vm = VmThread::new(std::sync::Arc::clone(registry)).with_stack_limit(stack_limit);
     let err = interp
         .interpret_with(&mut frame, &mut vm)
         .expect_err("期望抛出异常");

@@ -18,7 +18,7 @@ use rustj::runtime::interpreter::clinit::ensure_class_initialized;
 use rustj::runtime::interpreter::launch::{
     bootstrap_java_lang_invoke, bootstrap_module_system, initialize_system_class,
 };
-use rustj::runtime::{Vm, VmError};
+use rustj::runtime::{VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -45,7 +45,7 @@ fn find_javabase_jmod() -> Option<PathBuf> {
 
 /// 载入 BMH 物种生成依赖:java.lang.invoke 核心 + Class-File API(java.lang.classfile)+
 /// 常量描述符(java.lang.constant / jdk.internal.constant)。
-fn setup_vm() -> Option<Vm> {
+fn setup_vm() -> Option<VmThread> {
     if !javac_available() {
         eprintln!("跳过:无 javac");
         return None;
@@ -81,7 +81,7 @@ fn setup_vm() -> Option<Vm> {
     ] {
         load_closure(&mut registry, &cp, c).unwrap();
     }
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     initialize_system_class(&mut vm).expect("Phase 1 应成功");
     bootstrap_module_system(&mut vm).expect("Phase 2 应成功");
     bootstrap_java_lang_invoke(&mut vm).expect("Phase 3 lite 应成功");

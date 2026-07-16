@@ -13,7 +13,7 @@ use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::parse_field_descriptor;
 use crate::metadata::ClassFile;
 use crate::oops::{InitState, LoadedClass, Oop};
-use crate::runtime::{Frame, Reference, Slot, Vm};
+use crate::runtime::{Frame, Reference, Slot, VmThread};
 
 use super::invoke::run_with_depth;
 use super::{set_throwable_field, throw_exception, Interpreter, VmError};
@@ -39,7 +39,7 @@ fn find_clinit(cf: &ClassFile) -> Option<&CodeAttribute> {
 /// 运行 `lc` 的 `<clinit>`(经既有 `interpret_with` + `run_with_depth`)。无 `<clinit>`
 /// 则仅默认初始化(加载期已完成)→ `Ok`。`<clinit>` 为 static void 无参,局部变量
 /// 全默认,无需传参。其内 `putstatic` 经既有 `static_storage` 机制写静态字段。
-fn run_clinit(lc: &LoadedClass, vm: &mut Vm) -> Result<(), VmError> {
+fn run_clinit(lc: &LoadedClass, vm: &mut VmThread) -> Result<(), VmError> {
     let Some(code) = find_clinit(&lc.cf) else {
         return Ok(());
     };
@@ -53,7 +53,7 @@ fn run_clinit(lc: &LoadedClass, vm: &mut Vm) -> Result<(), VmError> {
 
 /// 异常对象是否已是初始化失败类(`ExceptionInInitializerError` /
 /// `NoClassDefFoundError`)——超类初始化失败已上传此类异常时,本类不再重复包装。
-fn is_init_failure_class(vm: &Vm, exc: Reference) -> bool {
+fn is_init_failure_class(vm: &VmThread, exc: Reference) -> bool {
     let heap = vm.heap();
     let Some(Oop::Instance(i)) = heap.get(exc) else {
         return false;
@@ -71,7 +71,7 @@ fn is_init_failure_class(vm: &Vm, exc: Reference) -> bool {
 /// 对应 HotSpot 链接阶段 `InstanceKlass::transfer_static_fields` 对 ConstantValue 的处理
 /// (`javaClasses.cpp` 读 `fieldinfo` 的 initval 索引)。常量字段若另有 `<clinit>` putstatic
 /// 则后续覆盖;否则此常量即终值。无 `<clinit>` 的纯常量类(如 `Integer`)依赖此步生效。
-fn apply_constant_values(vm: &mut Vm, lc: &LoadedClass) {
+fn apply_constant_values(vm: &mut VmThread, lc: &LoadedClass) {
     let cp = &lc.cf.constant_pool;
     // 先收 (ord, Slot) 对,再统一写:String 常量需 `string::intern(vm, …)`(持 `&mut vm`),
     // 须在锁 `static_storage` 之外完成,避免持 guard 时 `&mut vm`(锁序隐患)。
@@ -123,7 +123,7 @@ fn apply_constant_values(vm: &mut Vm, lc: &LoadedClass) {
 
 /// ConstantValue 属性的常量池条目 → 槽。Integer/Long/Float/Double 直接转;String 经
 /// `string::intern`。非 primitive/String 条目 → `None`(跳过,交 `<clinit>` 兜底)。
-fn constant_value_slot(vm: &mut Vm, cp: &ConstantPool, cv_index: u16) -> Option<Slot> {
+fn constant_value_slot(vm: &mut VmThread, cp: &ConstantPool, cv_index: u16) -> Option<Slot> {
     let entry = cp.get(cv_index).ok()?;
     match entry {
         ConstantPoolEntry::Integer(v) => Some(Slot::Int(*v)),
@@ -155,7 +155,7 @@ fn constant_value_slot(vm: &mut Vm, cp: &ConstantPool, cv_index: u16) -> Option<
 /// 沿用 `'a` 借用技巧:[`Vm::registry`] 返 `&'a ClassRegistry`(寿命不绑 `&self`),故取
 /// `&'a LoadedClass` 后仍可 `&mut vm` 执行 `<clinit>`,并在重入/超类递归中反复再借。
 pub fn ensure_class_initialized(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class_name: &str,
 ) -> Result<(), VmError> {
     let Some(registry) = vm.registry() else {
@@ -248,7 +248,7 @@ pub fn ensure_class_initialized(
 
 /// [`ensure_class_initialized`] 阶段 B 的初始化体:超类先 → ConstantValue(准备)→ 本类 `<clinit>`。
 /// 抽离便于阶段 A/C 的锁逻辑与之解耦;返原始 `Result`(EIIE 包装由调用方阶段 D 做)。
-fn run_initialization_body(vm: &mut Vm, lc: &LoadedClass) -> Result<(), VmError> {
+fn run_initialization_body(vm: &mut VmThread, lc: &LoadedClass) -> Result<(), VmError> {
     // 先初始化超类:super_class_name() 在 super_class==0(Object)时为 None → 自然终止。
     if let Some(super_name) = lc.super_class_name() {
         ensure_class_initialized(vm, super_name)?;
@@ -293,7 +293,7 @@ mod tests {
     use crate::metadata::access_flags::{ACC_FINAL, ACC_STATIC};
     use crate::metadata::{AccessFlags, ClassFile, FieldInfo, MethodInfo};
     use crate::oops::ClassRegistry;
-    use crate::runtime::{Slot, Vm};
+    use crate::runtime::{Slot, VmThread};
 
     /// 常量池:[1]Utf8"Cls" [2]Utf8"java/lang/Object" [3]Utf8"v" [4]Utf8"I"
     ///        [5]Utf8"<clinit>" [6]Utf8"()V" [7]Class{1} [8]Class{2}
@@ -378,7 +378,7 @@ mod tests {
         let mut reg = ClassRegistry::new();
         reg.load(cls_with_clinit()).unwrap();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
         // <clinit> 执行前:静态字段为默认 0。
         assert_eq!(
             *reg.get("Cls").unwrap().static_storage.lock().unwrap(),
@@ -398,7 +398,7 @@ mod tests {
         let mut reg = ClassRegistry::new();
         reg.load(cls_with_clinit()).unwrap();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
         ensure_class_initialized(&mut vm, "Cls").unwrap();
         // 再次触发:Done → 直接返回,不重跑 <clinit>(静态值仍为 5,非 10)。
         ensure_class_initialized(&mut vm, "Cls").unwrap();
@@ -451,7 +451,7 @@ mod tests {
         // ClassRegistry::new() 预装 ArithmeticException / ExceptionInInitializerError 引导桩。
         let mut reg = ClassRegistry::new();
         reg.load(cls_with_throwing_clinit()).unwrap();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let err = ensure_class_initialized(&mut vm, "Cls").unwrap_err();
         let VmError::ThrownException(eiie) = err else {
             panic!("须包为 EIIE(ThrownException),得 {err:?}");
@@ -580,7 +580,7 @@ mod tests {
         let mut reg = ClassRegistry::new();
         reg.load(cls_with_constant_value()).unwrap();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
         let lc = reg.get("Cls").unwrap();
         // 初始化前:全默认。
         assert_eq!(
@@ -727,7 +727,7 @@ mod tests {
         let mut reg = ClassRegistry::new();
         reg.load(cls_with_blocking_clinit()).unwrap();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
         write_cls_static(&reg, "release", 1);
         ensure_class_initialized(&mut vm, "Cls").expect("clinit 应完成");
         assert_eq!(read_cls_static(&reg, "started"), 1);
@@ -750,7 +750,7 @@ mod tests {
         // 线程 A:首个初始化者。其 <clinit> 置 started=1 后自旋等 release。
         let reg_a = std::sync::Arc::clone(&reg);
         let a = std::thread::spawn(move || {
-            let mut vm = Vm::new(std::sync::Arc::clone(&reg_a));
+            let mut vm = VmThread::new(std::sync::Arc::clone(&reg_a));
             ensure_class_initialized(&mut vm, "Cls")
         });
 
@@ -762,7 +762,7 @@ mod tests {
         // 线程 B:此刻调用 ensure_class_initialized(Cls)——必须**阻塞**(等 A 完成),不可提前返回。
         let reg_b = std::sync::Arc::clone(&reg);
         let b = std::thread::spawn(move || {
-            let mut vm = Vm::new(std::sync::Arc::clone(&reg_b));
+            let mut vm = VmThread::new(std::sync::Arc::clone(&reg_b));
             ensure_class_initialized(&mut vm, "Cls")?;
             // 返回后类须已完全初始化:v==5。
             Ok::<_, crate::runtime::VmError>(read_cls_static_vm(&vm, "v"))
@@ -798,7 +798,7 @@ mod tests {
 
     /// `concurrent_init_blocks_waiter_until_done` 的 B 线程辅助:用 `vm` 的注册表读静态字段
     /// (B 持独立 Vm,经共享 `Arc<ClassRegistry>` 读到 A 写入的 `v`)。
-    fn read_cls_static_vm(vm: &Vm, name: &str) -> i32 {
+    fn read_cls_static_vm(vm: &VmThread, name: &str) -> i32 {
         let reg = vm
             .registry()
             .expect("B 的 Vm 须注册表");

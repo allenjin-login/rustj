@@ -12,7 +12,7 @@ use rustj::classfile::parse;
 use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -75,7 +75,7 @@ fn run_static(registry: &std::sync::Arc<ClassRegistry>, class: &str, name: &str,
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(std::sync::Arc::clone(registry));
+    let mut vm = VmThread::new(std::sync::Arc::clone(registry));
     interp.interpret_with(&mut frame, &mut vm)
 }
 

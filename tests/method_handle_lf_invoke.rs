@@ -20,7 +20,7 @@ use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::{
     bootstrap_java_lang_invoke, bootstrap_module_system, initialize_system_class,
 };
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -72,7 +72,7 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
 }
 
 /// 经解释器在 `Probe` 上跑静态法 `name()I`,返 owned Value。
-fn run_static_int(vm: &mut Vm, name: &str) -> Result<Value, VmError> {
+fn run_static_int(vm: &mut VmThread, name: &str) -> Result<Value, VmError> {
     use rustj::constant_pool::ConstantPoolEntry;
     let reg = vm.registry().expect("类注册表缺失");
     let lc = reg
@@ -114,7 +114,7 @@ public class Probe {
 }
 "#;
 
-fn setup_vm() -> Option<Vm> {
+fn setup_vm() -> Option<VmThread> {
     if !javac_available() {
         eprintln!("跳过:无 javac");
         return None;
@@ -148,7 +148,7 @@ fn setup_vm() -> Option<Vm> {
     ] {
         load_closure(&mut registry, &cp, c).unwrap();
     }
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     initialize_system_class(&mut vm).expect("Phase 1 应成功");
     bootstrap_module_system(&mut vm).expect("Phase 2 应成功");
     bootstrap_java_lang_invoke(&mut vm).expect("Phase 3 lite 应成功");

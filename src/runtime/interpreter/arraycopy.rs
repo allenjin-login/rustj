@@ -10,7 +10,7 @@
 use super::type_check::array_instanceof;
 use super::{throw_exception, throw_exception_with_message, Value, VmError};
 use crate::oops::Oop;
-use crate::runtime::{Reference, Slot, Vm};
+use crate::runtime::{Reference, Slot, VmThread};
 
 /// 引用异数组拷贝的逐元素 checkcast 上下文:目标组件 + 失败时的 ASE 消息。
 /// 消息镜像 HotSpot `throw_array_store_exception`(objArrayKlass.cpp:187-203):
@@ -26,7 +26,7 @@ struct Checkcast<'a> {
 /// 静态 native;实参已由 `native::invoke` 解构为正序 5 参传入。按 HotSpot 权威检查序
 /// (null→NPE、非数组/类型不符→ASE、负值/越界→AIOOBE)校验后拷贝;void 返回。
 pub(super) fn system_arraycopy(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     src: Reference,
     src_pos: i32,
     dst: Reference,
@@ -197,7 +197,7 @@ pub(super) fn system_arraycopy(
 /// `throw_array_store_exception` 消息,前缀已写)→ 可变借写。读/写分属不同借用时刻,故
 /// **同一数组**(src==dst)亦可安全自拷。`checkcast` 为 `Some` 时对每个非 null 引用元素查可赋性。
 fn copy_elements(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     src: Reference,
     src_pos: i32,
     dst: Reference,
@@ -234,7 +234,7 @@ fn copy_elements(
 }
 
 /// 取数组描述符(克隆)与长度;非数组 → `None`(供非数组判 ASE)。
-fn array_meta(vm: &Vm, r: Reference) -> Option<(String, usize)> {
+fn array_meta(vm: &VmThread, r: Reference) -> Option<(String, usize)> {
     match vm.heap().get(r) {
         Some(Oop::Array(a)) => Some((a.class_name().to_string(), a.length())),
         _ => None,
@@ -242,7 +242,7 @@ fn array_meta(vm: &Vm, r: Reference) -> Option<(String, usize)> {
 }
 
 /// 非数组 oop 的外部名(供 "source/destination type … is not an array" 消息):内部名 → 点分。
-fn oop_external_name(vm: &Vm, r: Reference) -> String {
+fn oop_external_name(vm: &VmThread, r: Reference) -> String {
     match vm.heap().get(r) {
         Some(Oop::Instance(i)) => i.class_name().replace('/', "."),
         Some(Oop::Array(a)) => a.class_name().replace('/', "."),
@@ -251,7 +251,7 @@ fn oop_external_name(vm: &Vm, r: Reference) -> String {
 }
 
 /// 读一个元素槽(调用方已做越界检查)。
-fn read_element(vm: &Vm, r: Reference, idx: usize) -> Result<Slot, VmError> {
+fn read_element(vm: &VmThread, r: Reference, idx: usize) -> Result<Slot, VmError> {
     match vm.heap().get(r) {
         Some(Oop::Array(a)) => Ok(a.element(idx)),
         _ => Err(VmError::BadConstant("arraycopy 源非数组")),
@@ -259,7 +259,7 @@ fn read_element(vm: &Vm, r: Reference, idx: usize) -> Result<Slot, VmError> {
 }
 
 /// 写一个元素槽。
-fn write_element(vm: &mut Vm, r: Reference, idx: usize, slot: Slot) -> Result<(), VmError> {
+fn write_element(vm: &mut VmThread, r: Reference, idx: usize, slot: Slot) -> Result<(), VmError> {
     match vm.heap_mut().get_mut(r) {
         Some(Oop::Array(a)) => {
             a.set_element(idx, slot);
@@ -272,7 +272,7 @@ fn write_element(vm: &mut Vm, r: Reference, idx: usize, slot: Slot) -> Result<()
 /// 元素运行时类型 → 组件描述符(供 [`component_assignable`] 比对 dst 组件)。
 /// 实例 `java/lang/String` → `Ljava/lang/String;`;数组 `[I` → `[I`;Class 镜像为
 /// `java/lang/Class` Instance → `Ljava/lang/Class;`(经 Instance 臂)。
-pub(super) fn element_component(vm: &Vm, r: Reference) -> Result<String, VmError> {
+pub(super) fn element_component(vm: &VmThread, r: Reference) -> Result<String, VmError> {
     Ok(match vm.heap().get(r) {
         Some(Oop::Instance(i)) => format!("L{};", i.class_name()),
         Some(Oop::Array(a)) => a.class_name().to_string(),
@@ -345,20 +345,20 @@ mod tests {
     use crate::runtime::Slot;
 
     /// 构 `int[]` 并入堆。
-    fn int_array(vm: &mut Vm, vals: &[i32]) -> Reference {
+    fn int_array(vm: &mut VmThread, vals: &[i32]) -> Reference {
         let els: Vec<Slot> = vals.iter().map(|&v| Slot::Int(v)).collect();
         vm.heap_mut()
             .alloc(Oop::Array(ArrayOop::new("[I".into(), els)))
     }
 
     /// 构指定描述符、给定 `Slot` 元素的数组并入堆。
-    fn array_of(vm: &mut Vm, desc: &str, els: Vec<Slot>) -> Reference {
+    fn array_of(vm: &mut VmThread, desc: &str, els: Vec<Slot>) -> Reference {
         vm.heap_mut()
             .alloc(Oop::Array(ArrayOop::new(desc.into(), els)))
     }
 
     /// 读 `int[]` 前 `n` 元为 `Vec<i32>`。
-    fn read_ints(vm: &Vm, r: Reference, n: usize) -> Vec<i32> {
+    fn read_ints(vm: &VmThread, r: Reference, n: usize) -> Vec<i32> {
         let heap = vm.heap();
         let Some(Oop::Array(a)) = heap.get(r) else {
             return vec![];
@@ -372,7 +372,7 @@ mod tests {
     }
 
     /// 取数组元素的 `Slot::Reference`(供引用拷贝断言)。
-    fn read_ref(vm: &Vm, r: Reference, idx: usize) -> Reference {
+    fn read_ref(vm: &VmThread, r: Reference, idx: usize) -> Reference {
         let heap = vm.heap();
         let Some(Oop::Array(a)) = heap.get(r) else {
             return Reference::null();
@@ -383,7 +383,7 @@ mod tests {
         }
     }
 
-    fn assert_exc_class(vm: &Vm, result: Result<Value, VmError>, expected: &str) {
+    fn assert_exc_class(vm: &VmThread, result: Result<Value, VmError>, expected: &str) {
         let Err(VmError::ThrownException(r)) = result else {
             panic!("期望 ThrownException,得 {result:?}");
         };
@@ -395,7 +395,7 @@ mod tests {
     }
 
     /// 取异常的 format_trace 文本(供 detailMessage 断言)。调用方须先求 result 再借 vm。
-    fn exc_trace(vm: &Vm, result: Result<Value, VmError>) -> String {
+    fn exc_trace(vm: &VmThread, result: Result<Value, VmError>) -> String {
         let Err(VmError::ThrownException(r)) = result else {
             panic!("期望 ThrownException,得 {result:?}");
         };
@@ -407,7 +407,7 @@ mod tests {
         // int[] → byte[]:ASE 消息 "type mismatch: can not copy int[] into byte[]"
         // (typeArrayKlass:126)。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[1, 2]);
         let dst = array_of(&mut vm, "[B", vec![Slot::Int(0); 2]);
         let result = system_arraycopy(&mut vm, src, 0, dst, 0, 2);
@@ -423,7 +423,7 @@ mod tests {
         // src_pos(1)+length(2)=3 > src_len(2) → AIOOBE "last source index 3 out of bounds for int[2]"
         // (typeArrayKlass:155)。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[1, 2]);
         let dst = int_array(&mut vm, &[0; 2]);
         let result = system_arraycopy(&mut vm, src, 1, dst, 0, 2);
@@ -438,7 +438,7 @@ mod tests {
     fn negative_srcpos_carries_source_index_message() {
         // src_pos=-1 → AIOOBE "source index -1 out of bounds for int[1]"(typeArrayKlass:138)。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[1]);
         let dst = int_array(&mut vm, &[0]);
         let result = system_arraycopy(&mut vm, src, -1, dst, 0, 1);
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn null_source_is_npe() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let dst = int_array(&mut vm, &[0; 1]);
         let result = system_arraycopy(&mut vm, Reference::null(), 0, dst, 0, 0);
         assert_exc_class(&vm, result, "java/lang/NullPointerException");
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn null_dest_is_npe() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[1]);
         let result = system_arraycopy(&mut vm, src, 0, Reference::null(), 0, 0);
         assert_exc_class(&vm, result, "java/lang/NullPointerException");
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn non_array_is_arraystore() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let obj = vm
             .heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("X".into(), vec![])));
@@ -483,7 +483,7 @@ mod tests {
     fn primitive_type_mismatch_is_arraystore() {
         // int[] → byte[]:基本但不同型 → ASE。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[1, 2]);
         let dst = array_of(&mut vm, "[B", vec![Slot::Int(0); 2]);
         let result = system_arraycopy(&mut vm, src, 0, dst, 0, 2);
@@ -494,7 +494,7 @@ mod tests {
     fn ref_to_primitive_is_arraystore() {
         // Object[] → int[]:引用 src、基本 dst → ASE。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = array_of(
             &mut vm,
             "[Ljava/lang/Object;",
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn negative_srcpos_is_aioobe() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[1]);
         let dst = int_array(&mut vm, &[0]);
         let result = system_arraycopy(&mut vm, src, -1, dst, 0, 1);
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn negative_length_is_aioobe() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[1]);
         let dst = int_array(&mut vm, &[0]);
         let result = system_arraycopy(&mut vm, src, 0, dst, 0, -1);
@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn out_of_bounds_is_aioobe() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[1, 2]);
         let dst = int_array(&mut vm, &[0; 2]);
         // srcPos+length(1+2=3) > srcLen(2) → AIOOBE。
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn length_zero_is_noop() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[1, 2]);
         let dst = int_array(&mut vm, &[9, 9]);
         // 边界点 srcPos==len、length==0:合法空拷(typeArrayKlass:293 注释)。
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn same_type_primitive_copy() {
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let src = int_array(&mut vm, &[10, 20, 30]);
         let dst = int_array(&mut vm, &[0; 3]);
         system_arraycopy(&mut vm, src, 0, dst, 0, 3).unwrap();
@@ -563,7 +563,7 @@ mod tests {
     fn overlap_forward_shift_left() {
         // 同数组、dst_pos<src_pos:前向。[1,2,3,4] 从 1 拷 3 到 0 → [1,2,3,4]的[0..3]=[2,3,4]。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let a = int_array(&mut vm, &[1, 2, 3, 4]);
         system_arraycopy(&mut vm, a, 1, a, 0, 3).unwrap();
         assert_eq!(read_ints(&vm, a, 4), vec![2, 3, 4, 4]);
@@ -573,7 +573,7 @@ mod tests {
     fn overlap_backward_shift_right() {
         // 同数组、dst_pos>src_pos:后向(memmove)。[1,2,3,4] 从 0 拷 3 到 1 → [1,1,2,3]。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let a = int_array(&mut vm, &[1, 2, 3, 4]);
         system_arraycopy(&mut vm, a, 0, a, 1, 3).unwrap();
         assert_eq!(read_ints(&vm, a, 4), vec![1, 1, 2, 3]);
@@ -583,7 +583,7 @@ mod tests {
     fn ref_bulk_subtype_copy() {
         // String[] → Object[]:src 组件子类型 dst(Object)→ 量体,无 checkcast。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let s0 = vm
             .heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("java/lang/String".into(), vec![])));
@@ -610,7 +610,7 @@ mod tests {
         // Object[]{String, Thread} → String[]:Object 非 String 子类型 → checkcast。
         // String 可赋(同型短路)→ 拷;Thread 不可赋 → ASE(dst[0] 已写、dst[1] 未变)。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let s = vm
             .heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("java/lang/String".into(), vec![])));
@@ -645,7 +645,7 @@ mod tests {
     fn same_ref_array_is_memmove_no_checkcast() {
         // 同一 Object[] 自拷(含非 String 元素):src==dst → 免 checkcast,正常 memmove。
         let reg = ClassRegistry::new();
-        let mut vm = Vm::new(reg);
+        let mut vm = VmThread::new(reg);
         let t = vm
             .heap_mut()
             .alloc(Oop::Instance(InstanceOop::new("java/lang/Thread".into(), vec![])));

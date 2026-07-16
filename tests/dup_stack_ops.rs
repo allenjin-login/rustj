@@ -16,7 +16,7 @@ use rustj::classfile::parse;
 use rustj::constant_pool::ConstantPoolEntry;
 use rustj::metadata::{ClassFile, MethodInfo};
 use rustj::oops::ClassRegistry;
-use rustj::runtime::{Frame, Interpreter, Value, Vm};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -79,7 +79,7 @@ fn run(registry: &std::sync::Arc<ClassRegistry>, name: &str, desc: &str) -> Valu
     let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = Vm::new(std::sync::Arc::clone(registry));
+    let mut vm = VmThread::new(std::sync::Arc::clone(registry));
     interp
         .interpret_with(&mut frame, &mut vm)
         .unwrap_or_else(|e| panic!("DupGate.{name}{desc} 执行失败:{e}"))

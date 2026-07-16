@@ -20,7 +20,7 @@ use rustj::metadata::{ClassFile, MethodInfo};
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -82,7 +82,7 @@ fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo 
 }
 
 /// 执行无参静态方法。`invokedynamic` 须方法身份 → `with_identity`。
-fn run(vm: &mut Vm, class: &str, name: &str, desc: &str) -> Value {
+fn run(vm: &mut VmThread, class: &str, name: &str, desc: &str) -> Value {
     let reg = vm.registry().unwrap_or_else(|| panic!("类注册表"));
     let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = find_method(&lc.cf, name, desc);
@@ -164,7 +164,7 @@ fn instance_method_reference_real_bytecode() {
     cp.add("java.base.jmod", &bytes).unwrap();
     load_closure(&mut registry, &cp, "java/util/Objects").unwrap();
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     assert_eq!(run(&mut vm, "MethodRefGate", "unbound", "()I"), Value::Int(42), "Box::get apply(new Box(42))");
     assert_eq!(run(&mut vm, "MethodRefGate", "unboundArg", "()I"), Value::Int(15), "Box::plus apply(new Box(10),5)");
     assert_eq!(run(&mut vm, "MethodRefGate", "bound", "()I"), Value::Int(7), "b::get(b=new Box(7))");

@@ -15,7 +15,7 @@ use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::initialize_system_class;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -48,7 +48,7 @@ public class LoadProbe {
 }
 "#;
 
-fn run_static_int(vm: &mut Vm, class: &str, name: &str) -> Result<i32, String> {
+fn run_static_int(vm: &mut VmThread, class: &str, name: &str) -> Result<i32, String> {
     let reg = vm.registry().unwrap_or_else(|| panic!("类注册表"));
     let lc = reg
         .get(class)
@@ -125,7 +125,7 @@ fn find_loaded_class0_supports_loadclass_already_loaded() {
     load_closure(&mut registry, &cp, "java/util/Properties").unwrap();
     load_closure(&mut registry, &cp, "java/util/HashMap").unwrap();
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     initialize_system_class(&mut vm).expect("Phase 1 引导应成功");
 
     assert_eq!(

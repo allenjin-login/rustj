@@ -5,13 +5,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::oops::{ArrayOop, Oop};
-use crate::runtime::{Reference, Slot, Value, Vm, VmError};
+use crate::runtime::{Reference, Slot, Value, VmThread, VmError};
 
 use super::super::{capture_backtrace, throw_exception};
 
 /// `java/lang/*` native 分派。未登记(类前缀命中但 (name,desc) 不匹配)→ `UnsatisfiedLinkError`。
 pub(super) fn dispatch(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -671,7 +671,7 @@ pub(super) fn dispatch(
 
 /// `Array.newArray(componentType, length)`:组件 Class 镜像 → 内部名 → 数组描述符 + 默认槽 → 造数组。
 /// 单次 mirror_internal_name 取 owned 名(返 String,无借用纠缠)后即 `&mut vm` 造数组。
-fn array_new_array(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn array_new_array(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     let component_ref = match args.first().copied() {
         Some(Value::Reference(r)) => r,
         _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
@@ -718,7 +718,7 @@ fn array_element_layout(component: &str) -> (String, Slot) {
 /// 实例方法)。移植 `JVM_FindLoadedClass`:按 binary name 查"本 loader 已加载"集 → Class 镜像或 null。
 /// rustj 单注册表:`registry.get(intern)` 命中 → `intern_class_mirror`,否则 `null`。**不触发加载/
 /// 初始化**(纯"已加载"查询);receiver(_this = ClassLoader)忽略——per-loader 隔离顺延。name null → NPE。
-fn find_loaded_class0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn find_loaded_class0(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     let Value::Reference(r) = args.first().copied().unwrap_or(Value::Void) else {
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
     };
@@ -740,7 +740,7 @@ fn find_loaded_class0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
 /// `classfile::parse`(jvm.cpp:978 `resolve_from_stream`)→ `ClassRegistry::define_class`(注册到运行时表)
 /// → `intern_class_mirror` → `initialize` 真? `ensure_class_initialized`(jvm.cpp:1020 `ik->initialize`):
 /// 否 → 返镜像(仅注册)。`loader`/`lookup`/`pd`/`flags`/`classData` 忽略(单 bootstrap loader/单注册表)。
-fn define_class0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn define_class0(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     // args[3]=byte[] b(args[0]loader/[1]lookup/[2]name/[4]off/[5]len/[6]pd/[7]initialize/[8]flags/[9]classData)。
     let bytes_ref = match args.get(3) {
         Some(Value::Reference(r)) => *r,
@@ -784,7 +784,7 @@ fn define_class0(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
 /// 读 `byte[]` 的 `b[off..off+len]` 子段为 owned `Vec<u8>`(`define_class0` 用)。非 `[B` 数组 →
 /// InternalError;off/len 越界 → ArrayIndexOutOfBoundsException(对应 JNI GetByteArrayRegion)。
 /// 持 heap guard 读 + 收集后释 guard(drop-before-recurse,§6)。
-fn read_byte_range(vm: &mut Vm, arr: Reference, off: usize, len: usize) -> Result<Vec<u8>, VmError> {
+fn read_byte_range(vm: &mut VmThread, arr: Reference, off: usize, len: usize) -> Result<Vec<u8>, VmError> {
     let outcome: Result<Vec<u8>, &str> = (|| {
         let heap = vm.heap();
         let a = match heap.get(arr) {
@@ -816,7 +816,7 @@ fn read_byte_range(vm: &mut Vm, arr: Reference, off: usize, len: usize) -> Resul
 /// `System.mapLibraryName(String)String`(System.c:296):返 `JNI_LIB_PREFIX + libname +
 /// JNI_LIB_SUFFIX`。Windows:""+".dll";Linux:"lib"+".so";macOS:"lib"+".dylib"。null→NPE;
 /// UTF-16 单元数 > 240→IllegalArgumentException(System.c:300,`GetStringLength` 计 UTF-16 单元)。
-fn map_library_name(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+fn map_library_name(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmError> {
     let Value::Reference(r) = args.first().copied().unwrap_or(Value::Void) else {
         return Err(throw_exception(vm, "java/lang/NullPointerException"));
     };
@@ -841,7 +841,7 @@ fn map_library_name(vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
 /// `StackTraceElement.initStackTraceElements(ste[], backtrace, depth)` 的实现(见分派臂注释)。
 /// 据 backtrace(= Throwable 自指句柄)取 exception_meta 捕获帧,**逆序**回填 ste[i] 五字段。
 fn init_stack_trace_elements(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     elements: Reference,
     backtrace: Reference,
     depth: i32,
@@ -940,7 +940,7 @@ fn init_stack_trace_elements(
 /// 1. 借注册表(§6:'a 不绑 &self)收字段元数据 + 解析 Field 类字段序号,出块为 owned;
 /// 2. 独占 `&mut vm` 分配 Field[] + 逐字段 Instance 并填,无残余借用。
 fn get_declared_fields0(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     this: Option<Reference>,
     args: &[Value],
 ) -> Result<Value, VmError> {
@@ -1090,7 +1090,7 @@ fn field_type_to_class_name(ft: &crate::metadata::descriptor::FieldType) -> Stri
 
 /// 构造 `[Ljava/lang/Class;` 数组,元素为各 `FieldType` 的 Class 镜像(供 parameterTypes/
 /// exceptionTypes)。空切片 → 长度 0 的 Class[](getParameterCount 返 0)。
-fn class_array_of(vm: &mut Vm, types: &[crate::metadata::descriptor::FieldType]) -> Reference {
+fn class_array_of(vm: &mut VmThread, types: &[crate::metadata::descriptor::FieldType]) -> Reference {
     use crate::oops::ArrayOop;
     let elements: Vec<Slot> = types
         .iter()
@@ -1102,7 +1102,7 @@ fn class_array_of(vm: &mut Vm, types: &[crate::metadata::descriptor::FieldType])
 
 /// 解析方法描述符的**返回类型**为 Class 镜像(V→void 镜像;否则字段类型→镜像)。供 Method.returnType。
 fn return_type_mirror(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     ret: &crate::metadata::descriptor::ReturnDescriptor,
 ) -> Reference {
     use crate::metadata::descriptor::ReturnDescriptor;
@@ -1116,7 +1116,7 @@ fn return_type_mirror(
 
 /// `Class.getDeclaredMethods0(Z)[Ljava/lang/reflect/Method;` 实现(见分派臂注释)。
 fn get_declared_methods0(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     this: Option<Reference>,
     args: &[Value],
 ) -> Result<Value, VmError> {
@@ -1223,7 +1223,7 @@ fn get_declared_methods0(
 
 /// `Class.getDeclaredConstructors0(Z)[Ljava/lang/reflect/Constructor;` 实现(见分派臂注释)。
 fn get_declared_constructors0(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     this: Option<Reference>,
     args: &[Value],
 ) -> Result<Value, VmError> {
@@ -1344,7 +1344,7 @@ mod tests {
     use crate::oops::ClassRegistry;
     use crate::runtime::class_loader::class_path::ClassPath;
     use crate::runtime::class_loader::loader::load_closure;
-    use crate::runtime::{Reference, Slot, Value, Vm, VmError};
+    use crate::runtime::{Reference, Slot, Value, VmThread, VmError};
 
     use std::path::{Path, PathBuf};
 
@@ -1399,7 +1399,7 @@ mod tests {
     }
 
     /// 读 `class.name` 静态 int 字段(经 `static_storage`,跨线程经其 Mutex 可见)。
-    fn read_static_int(vm: &Vm, class: &str, name: &str) -> i32 {
+    fn read_static_int(vm: &VmThread, class: &str, name: &str) -> i32 {
         use crate::metadata::descriptor::FieldType;
         let reg = vm.registry().expect("须注册表");
         let (lc, ord) = reg
@@ -1450,7 +1450,7 @@ public class Worker extends Thread {
         let mut cp = ClassPath::new();
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
 
         // 3) 分配 Worker 实例(不跑 <init> — override run() 不读实例字段)。
         let w = {
@@ -1476,7 +1476,7 @@ public class Worker extends Thread {
     }
 
     /// 取实例 `referent` 字段序号(声明于 Reference;子类扁平布局同序)。
-    fn referent_ord(vm: &Vm, r: Reference) -> Option<usize> {
+    fn referent_ord(vm: &VmThread, r: Reference) -> Option<usize> {
         let cn = match vm.heap().get(r)? {
             crate::oops::Oop::Instance(i) => i.class_name().to_string(),
             _ => return None,
@@ -1506,10 +1506,10 @@ public class Worker extends Thread {
         load_closure(&mut registry, &cp, "java/lang/ref/Reference").unwrap();
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         // 两个不同 Object 实例 A、B(身份不同)。§6:'a 不绑 &self → inst 先算出(owned),
         // 再 heap_mut().alloc,免 &mut vm 与 &vm 并发。
-        let new_obj = |vm: &mut Vm| -> Reference {
+        let new_obj = |vm: &mut VmThread| -> Reference {
             let reg = vm.registry().expect("须有注册表");
             let lc = reg.get("java/lang/Object").expect("Object 须已加载");
             let inst = reg.new_instance(&lc);
@@ -1573,8 +1573,8 @@ public class Worker extends Thread {
         load_closure(&mut registry, &cp, "java/lang/System").unwrap();
         load_closure(&mut registry, &cp, "java/lang/Object").unwrap();
 
-        let mut vm = Vm::new(registry);
-        let new_obj = |vm: &mut Vm| -> Reference {
+        let mut vm = VmThread::new(registry);
+        let new_obj = |vm: &mut VmThread| -> Reference {
             let reg = vm.registry().expect("须有注册表");
             let lc = reg.get("java/lang/Object").expect("Object 须已加载");
             let inst = reg.new_instance(&lc);
@@ -1650,7 +1650,7 @@ public class Worker extends Thread {
         let mut cp = ClassPath::new();
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/String").unwrap();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         let name =
             crate::runtime::interpreter::string::intern(&mut vm, "net").expect("intern \"net\"");
 
@@ -1711,7 +1711,7 @@ public class Worker extends Thread {
         let mut cp = ClassPath::new();
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/String").unwrap();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         let long_name = "x".repeat(241);
         let name = crate::runtime::interpreter::string::intern(&mut vm, &long_name).expect("intern");
         let err = super::super::invoke(
@@ -1751,7 +1751,7 @@ public class Worker extends Thread {
         let mut cp = ClassPath::new();
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
 
         let r1 = super::super::invoke(
             &mut vm,
@@ -1804,10 +1804,10 @@ public class Worker extends Thread {
         let mut cp = ClassPath::new();
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
 
         // 分配两个锁对象(裸 Instance;holdsLock 只认句柄,与类无关)。
-        let lock = |vm: &mut Vm| {
+        let lock = |vm: &mut VmThread| {
             vm.heap_mut().alloc(crate::oops::Oop::Instance(
                 crate::oops::InstanceOop::new("Lock".into(), vec![]),
             ))
@@ -1874,7 +1874,7 @@ public class Worker extends Thread {
         let mut cp = ClassPath::new();
         cp.add("java.base.jmod", &bytes).unwrap();
         load_closure(&mut registry, &cp, "java/lang/Thread").unwrap();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
 
         // yield0()V —— 空操作(yield_now),返 Void。
         assert_eq!(
@@ -1924,7 +1924,7 @@ public class Worker extends Thread {
     #[test]
     fn unbound_reference_native_throws_ule() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         let err = super::super::invoke(
             &mut vm,
             "java/lang/ref/Reference",

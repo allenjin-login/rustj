@@ -18,7 +18,7 @@ use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::{ClassRegistry, Oop};
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Reference, Value, Vm};
+use rustj::runtime::{Frame, Interpreter, Reference, Value, VmThread};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -81,7 +81,7 @@ fn find_method<'a>(
 /// 解释执行一个静态方法,locals 从 `args` 顺序填入(引用/long/int)。返回值或 `VmError`。
 fn run_static(
     registry: &std::sync::Arc<ClassRegistry>,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -164,7 +164,7 @@ fn thread_constructor_end_to_end() {
         load_closure(&mut registry, &cp, cls).unwrap();
     }
     let registry = std::sync::Arc::new(registry);
-    let mut vm = Vm::new(std::sync::Arc::clone(&registry));
+    let mut vm = VmThread::new(std::sync::Arc::clone(&registry));
 
     // 3) 分配 Probe 实例(makeThread 的入参;fieldless,不跑 <init> 无碍)。
     let probe = {

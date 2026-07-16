@@ -15,7 +15,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -66,7 +66,7 @@ fn compile_dir(source: &str, public_name: &str, extra: &[&str]) -> PathBuf {
     dir
 }
 
-fn run_static_in(vm: &mut Vm, class: &str, name: &str, desc: &str) -> Result<Value, String> {
+fn run_static_in(vm: &mut VmThread, class: &str, name: &str, desc: &str) -> Result<Value, String> {
     let reg = vm.registry().unwrap_or_else(|| panic!("类注册表"));
     let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
     let method = lc
@@ -170,7 +170,7 @@ fn real_hashmap_end_to_end() {
         load_closure(&mut registry, &cp, cls).unwrap();
     }
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     run_static_in(&mut vm, "RustjBootstrap", "init", "()V").expect("引导不应抛异常");
 
     assert_eq!(

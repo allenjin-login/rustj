@@ -6,7 +6,7 @@
 //! 持 `HashMap<Reference, ExceptionMeta>` 须命名类型。
 
 use crate::oops::Oop;
-use crate::runtime::{Reference, Vm};
+use crate::runtime::{Reference, VmThread};
 
 use super::CallFrame;
 
@@ -25,13 +25,13 @@ pub(super) struct ExceptionMeta {
     pub(super) message: Option<String>,
 }
 
-impl Vm {
+impl VmThread {
     /// 在抛出点快照当前调用链,绑定到异常句柄(此刻 `call_stack` 满)。
     /// 等价 HotSpot `Throwable.fillInStackTrace` 捕获语义——stub 异常不经真 `<init>`,
     /// 故 `throw_exception` 直接调之;`fillInStackTrace` native 亦调之(为真 Throwable 预留)。
     pub(crate) fn record_trace(&mut self, exc: Reference) {
         let frames = self.thread.call_stack.clone();
-        let mut meta = self.shared.exception_meta.lock().unwrap();
+        let mut meta = self.vm.exception_meta.lock().unwrap();
         meta.entry(exc).or_default().frames = frames;
     }
 
@@ -39,7 +39,7 @@ impl Vm {
     /// `format_trace` 据此追链渲染 "Caused by:"——被包异常**自身**的轨迹携带真正抛出点
     /// (如 clinit 内部位置),从而顶层不再丢失根因。
     pub(crate) fn record_cause(&mut self, wrapper: Reference, cause: Reference) {
-        let mut meta = self.shared.exception_meta.lock().unwrap();
+        let mut meta = self.vm.exception_meta.lock().unwrap();
         meta.entry(wrapper).or_default().cause = Some(cause);
     }
 
@@ -47,7 +47,7 @@ impl Vm {
     /// `format_trace` 据此在头类后渲染 ": <message>"。供 JVM 自动抛出点带上诊断消息。
     pub(crate) fn record_message(&mut self, exc: Reference, message: impl Into<String>) {
         let msg = message.into();
-        let mut meta = self.shared.exception_meta.lock().unwrap();
+        let mut meta = self.vm.exception_meta.lock().unwrap();
         meta.entry(exc).or_default().message = Some(msg);
     }
 
@@ -107,7 +107,7 @@ impl Vm {
     /// 供 `Throwable.getStackTrace` native 构造 `StackTraceElement[]`。键 = 异常句柄。
     /// 返 owned `Vec`(exception_meta 已 Mutex 化;无法返借用切片——B.2.3b)。
     pub(crate) fn exception_frames(&self, exc: Reference) -> Option<Vec<CallFrame>> {
-        let meta = self.shared.exception_meta.lock().unwrap();
+        let meta = self.vm.exception_meta.lock().unwrap();
         meta.get(&exc).map(|m| m.frames.clone())
     }
 
@@ -129,7 +129,7 @@ impl Vm {
                 break;
             }
             depth += 1;
-            let class = match self.shared.heap.lock().unwrap().get(e) {
+            let class = match self.vm.heap.lock().unwrap().get(e) {
                 Some(Oop::Instance(i)) => i.class_name().to_string(),
                 _ => "<unknown>".to_string(),
             };
@@ -142,7 +142,7 @@ impl Vm {
             }
             // 每跳单次锁 exception_meta 取 owned(frames/message/cause),释 guard 再渲染。
             let (frames, message, cause) = {
-                let meta = self.shared.exception_meta.lock().unwrap();
+                let meta = self.vm.exception_meta.lock().unwrap();
                 match meta.get(&e) {
                     Some(m) => (m.frames.clone(), m.message.clone(), m.cause),
                     None => (Vec::new(), None, None),
@@ -179,7 +179,7 @@ impl Vm {
         let reg = self.registry()?;
         let lc = reg.get("java/lang/Throwable")?;
         let ord = reg.instance_field(&lc, "cause", &FieldType::Class("java/lang/Throwable".into()))?;
-        let heap = self.shared.heap.lock().unwrap();
+        let heap = self.vm.heap.lock().unwrap();
         let inst = match heap.get(exc) {
             Some(Oop::Instance(i)) => i,
             _ => return None,

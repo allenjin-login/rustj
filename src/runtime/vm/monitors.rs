@@ -10,11 +10,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::runtime::{Reference, Vm, VmError};
+use crate::runtime::{Reference, VmThread, VmError};
 
 use super::{JavaMonitor, MonitorInner};
 
-impl Vm {
+impl VmThread {
     /// `monitorenter`(JVMS §6.5):进入 `obj` 管程。null → NPE;owner = 当前线程(`main_thread`)。
     /// 取/建该对象的 [`JavaMonitor`](锁表→取 `Arc` clone→**释表**),再锁 `inner`:owner==本线程→重入
     /// `count+1`;owner==None→占位 `owner+count=1`;owner==他人→`entry.wait` 循环至 owner 空闲/本线程。
@@ -29,7 +29,7 @@ impl Vm {
         let owner = self.main_thread();
         // 锁表取/建 JavaMonitor,克隆 Arc 后即释表 guard(drop-before-recurse;B.2.3b)。
         let mon = {
-            let mut table = self.shared.monitors.lock().unwrap();
+            let mut table = self.vm.monitors.lock().unwrap();
             Arc::clone(
                 table
                     .entry(obj)
@@ -57,7 +57,7 @@ impl Vm {
         let owner = self.main_thread();
         // 锁表取 Arc clone(无该对象 → 未持有 → IMSE)。先提取 owned Option<Arc>、释表 guard,
         // 再 IMSE(throw_exception 须 &mut self,不能持表 guard)。
-        let mon = self.shared.monitors.lock().unwrap().get(&obj).cloned();
+        let mon = self.vm.monitors.lock().unwrap().get(&obj).cloned();
         let Some(mon) = mon else {
             return Err(crate::runtime::interpreter::throw_exception(
                 self,
@@ -93,7 +93,7 @@ impl Vm {
         let owner = self.main_thread();
         // 锁表取 Arc(无 → false),释表后锁 inner 读 owner==本线程 && count>0。
         let mon = {
-            let table = self.shared.monitors.lock().unwrap();
+            let table = self.vm.monitors.lock().unwrap();
             table.get(&obj).cloned()
         };
         let Some(mon) = mon else { return Ok(false) };
@@ -135,7 +135,7 @@ impl Vm {
         }
         // 锁表取 Arc clone(无该对象 → 未持有 → IMSE)。先提取 owned Option<Arc>、释表 guard,
         // 再 IMSE(throw_exception 须 &mut self,不能持表 guard)。
-        let mon = self.shared.monitors.lock().unwrap().get(&obj).cloned();
+        let mon = self.vm.monitors.lock().unwrap().get(&obj).cloned();
         let Some(mon) = mon else {
             return Err(crate::runtime::interpreter::throw_exception(
                 self,
@@ -160,7 +160,7 @@ impl Vm {
         // 持 inner guard 调 entry.notify_one(std 允许;waiter 须重获 inner,blocked 至 wait_cvar.wait 释)。
         mon.entry.notify_one();
         // B.4c:登记 wait_targets[owner]=obj(供 interrupt0 找本线程阻塞的 monitor → wait_cvar.notify_all)。
-        self.shared
+        self.vm
             .threads
             .wait_targets
             .lock()
@@ -185,7 +185,7 @@ impl Vm {
                 .0
         };
         // B.4c:注销 wait_targets(已唤醒,不再阻塞于 wait)。
-        self.shared.threads.wait_targets.lock().unwrap().remove(&owner);
+        self.vm.threads.wait_targets.lock().unwrap().remove(&owner);
         // 唤醒后:waiters-1、重获管程(可能被他人抢占 → entry 等待循环)、恢复重入计数。
         guard.waiters -= 1;
         let notified = guard.wake_seq != my_seq;
@@ -230,7 +230,7 @@ impl Vm {
             ));
         }
         let owner = self.main_thread();
-        let mon = self.shared.monitors.lock().unwrap().get(&obj).cloned();
+        let mon = self.vm.monitors.lock().unwrap().get(&obj).cloned();
         let Some(mon) = mon else {
             return Err(crate::runtime::interpreter::throw_exception(
                 self,

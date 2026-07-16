@@ -9,7 +9,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -70,7 +70,7 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
     dir
 }
 
-fn run_int(vm: &mut Vm, name: &str) -> Result<i32, VmError> {
+fn run_int(vm: &mut VmThread, name: &str) -> Result<i32, VmError> {
     use rustj::constant_pool::ConstantPoolEntry;
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("SbOps").expect("SbOps 须已加载");
@@ -118,7 +118,7 @@ fn real_string_builder() {
     cp.add("java.base.jmod", &bytes).unwrap();
     load_closure(&mut registry, &cp, "java/lang/StringBuilder").unwrap();
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     let len = run_int(&mut vm, "appendLen").unwrap_or_else(|e| panic!("appendLen 失败:{e:?}"));
     assert_eq!(len, 6, "append(\"foo\")+append(\"bar\") → length 6");
     let ilen = run_int(&mut vm, "appendIntLen").unwrap_or_else(|e| panic!("appendIntLen 失败:{e:?}"));

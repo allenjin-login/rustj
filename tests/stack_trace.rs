@@ -11,7 +11,7 @@ use rustj::classfile::parse;
 use rustj::constant_pool::ConstantPoolEntry;
 use rustj::metadata::{ClassFile, MethodInfo};
 use rustj::oops::ClassRegistry;
-use rustj::runtime::{Frame, Interpreter, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -88,7 +88,7 @@ fn thrown_exception_carries_call_chain() {
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
         .with_exception_table(&code.exception_table)
         .with_identity(lc.name(), "top");
-    let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+    let mut vm = VmThread::new(std::sync::Arc::clone(&reg));
 
     let err = interp
         .interpret_with(&mut frame, &mut vm)

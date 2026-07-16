@@ -6,12 +6,12 @@
 use super::field::resolve_class_name;
 use super::{throw_exception, Interpreter, VmError};
 use crate::oops::Oop;
-use crate::runtime::{Frame, Reference, Vm};
+use crate::runtime::{Frame, Reference, VmThread};
 
 /// 取 objectref(非 null)的(是否数组, 运行时类名)。own 字符串避免借用纠缠。
 /// 数组取其类型描述符(`[B` / `[Ljava/lang/String;`),实例取类内部名。
-fn object_type(vm: &Vm, objref: Reference) -> Result<(bool, Option<String>), VmError> {
-    let heap = vm.heap();
+fn object_type(jt: &VmThread, objref: Reference) -> Result<(bool, Option<String>), VmError> {
+    let heap = jt.heap();
     let obj = heap
         .get(objref)
         .ok_or(VmError::BadConstant("checkcast/instanceof 引用悬空"))?;
@@ -79,13 +79,13 @@ pub(super) fn array_instanceof(sub: &str, target: &str, reg: &crate::oops::Class
 /// 类注册表的 `is_instance`(超类链 ∪ 接口闭包)。
 fn matches(
     interp: &Interpreter<'_>,
-    vm: &Vm,
+    jt: &VmThread,
     objref: Reference,
     index: u16,
 ) -> Result<bool, VmError> {
     let target = resolve_class_name(interp.cp(), index)?;
-    let (is_array, class_name) = object_type(vm, objref)?;
-    let reg = vm
+    let (is_array, class_name) = object_type(jt, objref)?;
+    let reg = jt
         .registry()
         .ok_or(VmError::BadConstant("checkcast/instanceof 需类注册表"))?;
     Ok(if is_array {
@@ -99,20 +99,20 @@ fn matches(
 pub(super) fn check_cast(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    jt: &mut VmThread,
     index: u16,
 ) -> Result<(), VmError> {
     let objref = frame.operands.pop_reference()?;
     let ok = if objref.is_null() {
         true
     } else {
-        matches(interp, vm, objref, index)?
+        matches(interp, jt, objref, index)?
     };
     frame.operands.push_reference(objref)?;
     if ok {
         Ok(())
     } else {
-        Err(throw_exception(vm, "java/lang/ClassCastException"))
+        Err(throw_exception(jt, "java/lang/ClassCastException"))
     }
 }
 
@@ -120,14 +120,14 @@ pub(super) fn check_cast(
 pub(super) fn instance_of(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    jt: &mut VmThread,
     index: u16,
 ) -> Result<(), VmError> {
     let objref = frame.operands.pop_reference()?;
     let result = if objref.is_null() {
         0
     } else {
-        i32::from(matches(interp, vm, objref, index)?)
+        i32::from(matches(interp, jt, objref, index)?)
     };
     frame.operands.push_int(result)?;
     Ok(())
@@ -140,7 +140,7 @@ mod tests {
     use crate::constant_pool::ConstantPool;
     use crate::metadata::{AccessFlags, ClassFile};
     use crate::oops::{ClassRegistry, Oop};
-    use crate::runtime::{Frame, Interpreter, Value, Vm};
+    use crate::runtime::{Frame, Interpreter, Value, VmThread};
 
     /// utf8: 1=Object 2=Shape 3=Square ; class: 4=Object 5=Shape 6=Square。
     fn cp_bytes() -> Vec<u8> {
@@ -182,9 +182,9 @@ mod tests {
     fn instanceof_shape_on_square_returns_one() {
         let (reg, cp) = build();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut jt = VmThread::new(std::sync::Arc::clone(&reg));
         let square_lc = reg.get("Square").unwrap();
-        let inst = vm
+        let inst = jt
             .heap_mut()
             .alloc(Oop::Instance(reg.new_instance(&square_lc)));
         let code = [
@@ -198,7 +198,7 @@ mod tests {
         frame.locals.set_reference(0, inst).unwrap();
         let interp = Interpreter::new(&code, &cp);
         assert_eq!(
-            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            interp.interpret_with(&mut frame, &mut jt).unwrap(),
             Value::Int(1)
         );
     }
@@ -207,7 +207,7 @@ mod tests {
     fn instanceof_null_returns_zero() {
         let (reg, cp) = build();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut jt = VmThread::new(std::sync::Arc::clone(&reg));
         let code = [
             Opcode::AconstNull as u8,
             Opcode::Instanceof as u8,
@@ -218,7 +218,7 @@ mod tests {
         let mut frame = Frame::new(0, 2);
         let interp = Interpreter::new(&code, &cp);
         assert_eq!(
-            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            interp.interpret_with(&mut frame, &mut jt).unwrap(),
             Value::Int(0)
         );
     }
@@ -227,9 +227,9 @@ mod tests {
     fn checkcast_shape_on_square_passes() {
         let (reg, cp) = build();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut jt = VmThread::new(std::sync::Arc::clone(&reg));
         let square_lc = reg.get("Square").unwrap();
-        let inst = vm
+        let inst = jt
             .heap_mut()
             .alloc(Oop::Instance(reg.new_instance(&square_lc)));
         let code = [
@@ -244,7 +244,7 @@ mod tests {
         frame.locals.set_reference(0, inst).unwrap();
         let interp = Interpreter::new(&code, &cp);
         assert_eq!(
-            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            interp.interpret_with(&mut frame, &mut jt).unwrap(),
             Value::Int(1)
         );
     }
@@ -253,9 +253,9 @@ mod tests {
     fn checkcast_own_class_passes() {
         let (reg, cp) = build();
         let reg = std::sync::Arc::new(reg);
-        let mut vm = Vm::new(std::sync::Arc::clone(&reg));
+        let mut jt = VmThread::new(std::sync::Arc::clone(&reg));
         let square_lc = reg.get("Square").unwrap();
-        let inst = vm
+        let inst = jt
             .heap_mut()
             .alloc(Oop::Instance(reg.new_instance(&square_lc)));
         // checkcast 自身类通过(objectref 保留、不抛);失败用例留给集成闸门(同级类 Rect)。
@@ -271,7 +271,7 @@ mod tests {
         frame.locals.set_reference(0, inst).unwrap();
         let interp = Interpreter::new(&code, &cp);
         assert_eq!(
-            interp.interpret_with(&mut frame, &mut vm).unwrap(),
+            interp.interpret_with(&mut frame, &mut jt).unwrap(),
             Value::Int(1)
         );
     }

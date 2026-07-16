@@ -14,7 +14,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -78,7 +78,7 @@ fn compile_dir(source: &str, public_name: &str) -> PathBuf {
     dir
 }
 
-fn run_int(vm: &mut Vm, name: &str) -> i32 {
+fn run_int(vm: &mut VmThread, name: &str) -> i32 {
     use rustj::constant_pool::ConstantPoolEntry;
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("AstoreAse").expect("AstoreAse 须已加载");
@@ -133,7 +133,7 @@ fn aastore_array_store_exception() {
     cp.add("java.base.jmod", &bytes).unwrap();
     load_closure(&mut registry, &cp, "java/lang/String").unwrap();
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
     assert_eq!(run_int(&mut vm, "okMatch"), 1, "String 入 String[] 须合法");
     assert_eq!(
         run_int(&mut vm, "mismatch"),

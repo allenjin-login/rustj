@@ -23,7 +23,7 @@ use crate::oops::lambda::{
     REF_NEW_INVOKE_SPECIAL,
 };
 use crate::oops::{ClassRegistry, LoadedClass, ArrayOop, LambdaOop, Oop};
-use crate::runtime::{Frame, LocalVars, Reference, Slot, Vm};
+use crate::runtime::{Frame, LocalVars, Reference, Slot, VmThread};
 
 use super::{clinit, exception, native, string, throw_exception, Interpreter, Value, VmError};
 
@@ -53,7 +53,7 @@ pub(super) enum InvokeFlow {
 fn finish_invoke(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     caller_pc: usize,
     result: Result<Value, VmError>,
     return_type: ReturnDescriptor,
@@ -95,7 +95,7 @@ fn finish_invoke(
 /// 此处短路为等价语义(同 `java/lang/Object` 各 native)。解锁 `LambdaForm$BasicType[].getClass()`
 /// 等(DMH.makePreparedFieldLambdaForm LF 准备触发)。toString 等余法顺延。
 fn dispatch_array_object_method(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     objref: Reference,
     arr: &ArrayOop,
     method_name: &str,
@@ -122,7 +122,7 @@ fn dispatch_array_object_method(
 
 /// `runtime_class` 是否为 `java/lang/invoke/DirectMethodHandle` 的(子)类(B.5.2 MH 调用钩子前置)。
 /// 沿超类链上行比对(owned 类名,避开 `&lc` 借 `reg` 的链式借用);无注册表/链顶 → false。
-fn is_direct_method_handle(vm: &Vm, runtime_class: &str) -> bool {
+fn is_direct_method_handle(vm: &VmThread, runtime_class: &str) -> bool {
     let Some(reg) = vm.registry() else {
         return false;
     };
@@ -144,7 +144,7 @@ fn is_direct_method_handle(vm: &Vm, runtime_class: &str) -> bool {
 /// `runtime_class` 是否为 `java/lang/invoke/MethodHandle` 的(子)类(G.2 LF 解释前置)。
 /// 同 [`is_direct_method_handle`] 沿超类链上行比对;到链顶仍未命中 → false。覆盖 DMH/BMH/
 /// 转换 adapter(AsTypeInstance 等)等所有 MH 子类——皆须拦截 invoke 族走 LF 解释或字段 shortcut。
-fn is_method_handle(vm: &Vm, runtime_class: &str) -> bool {
+fn is_method_handle(vm: &VmThread, runtime_class: &str) -> bool {
     let Some(reg) = vm.registry() else {
         return false;
     };
@@ -172,7 +172,7 @@ fn is_method_handle(vm: &Vm, runtime_class: &str) -> bool {
 /// `Ok(Some(value))` = 已处理(调用方 `finish_invoke` 回填);`Ok(None)` = 非 MH 或方法名非
 /// invoke 族 → 调用方走正常虚分派。
 fn try_method_handle_invoke_hook(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     method_name: &str,
     runtime_class: &str,
     mh_ref: Reference,
@@ -205,7 +205,7 @@ fn try_method_handle_invoke_hook(
 /// 入口参数 1:1 绑定(LF 每个 Name 占一位,与 JVM 栈 category-2 翻倍无关);`args` 不含
 /// receiver(MH 经 `mh_ref` 单独传),故 param i ∈ 1..arity 对应 args[i-1]。
 fn interpret_lambda_form(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     mh_ref: Reference,
     args: &[Arg],
 ) -> Result<Value, VmError> {
@@ -276,7 +276,7 @@ fn interpret_lambda_form(
 /// - `MethodHandle.linkTo*` / `invokeBasic` → MH 链接器:末参为 MemberName,以其派发前置实参;
 /// - 其余方法/字段成员 → 按 refKind 调用/访问(复用 DMH 字段访问逻辑)。
 fn eval_compute_node(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     name_ref: Reference,
     values: &[Slot],
 ) -> Result<Slot, VmError> {
@@ -345,7 +345,7 @@ fn eval_compute_node(
 }
 
 /// 读 MemberName 的字符串型字段(`name` / `type` 等)→ 解码 String 池文本。
-fn read_member_name_string(vm: &mut Vm, member: Reference, field: &str) -> String {
+fn read_member_name_string(vm: &mut VmThread, member: Reference, field: &str) -> String {
     vm.instance_reference_field(member, "java/lang/invoke/MemberName", field)
         .and_then(|r| string::read_text(vm, r).ok().flatten())
         .unwrap_or_default()
@@ -354,7 +354,7 @@ fn read_member_name_string(vm: &mut Vm, member: Reference, field: &str) -> Strin
 /// 解析 LF 计算节点实参 `Name.arguments`(Object[])→ 槽位向量。元素为 `Name`(引用先前节点 →
 /// values[index])或字面量(装箱对象 → 拆箱)。Name.index(short)定位 values。
 fn resolve_name_arguments(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     name_ref: Reference,
     values: &[Slot],
 ) -> Result<Vec<Slot>, VmError> {
@@ -402,7 +402,7 @@ fn resolve_name_arguments(
 }
 
 /// 拆箱字面量实参(Integer/Long/Float/Double/Short/Byte/Boolean/Character → value 槽位)。
-fn unbox_literal(vm: &mut Vm, r: Reference) -> Result<Slot, VmError> {
+fn unbox_literal(vm: &mut VmThread, r: Reference) -> Result<Slot, VmError> {
     let (class_name, value_ord) = {
         let reg = vm
             .registry()
@@ -438,7 +438,7 @@ fn unbox_literal(vm: &mut Vm, r: Reference) -> Result<Slot, VmError> {
 /// `MethodHandle.linkTo*` / `invokeBasic` 链接器(G.2.2):末参为 MemberName,据其 refKind 派发
 /// 前置实参(字段读/写、方法调用)。对应 HotSpot `MethodHandles::linkTo*` 内联:跳转到 MemberName
 /// 的 vmtarget/vmindex。rustj 直读 MemberName.{clazz,name,flags,type} 派发(同 DMH 字段 shortcut)。
-fn link_to_member(vm: &mut Vm, arg_slots: &[Slot]) -> Result<Slot, VmError> {
+fn link_to_member(vm: &mut VmThread, arg_slots: &[Slot]) -> Result<Slot, VmError> {
     let mname_ref = match arg_slots.last() {
         Some(Slot::Reference(r)) if !r.is_null() => *r,
         _ => return Err(VmError::BadConstant("linkTo:末参非 MemberName")),
@@ -460,7 +460,7 @@ fn link_to_member(vm: &mut Vm, arg_slots: &[Slot]) -> Result<Slot, VmError> {
 /// 后 `interpret_with` 跑真字节码(invokeStatic=物种工厂 make / invokeVirtual=虚分派 / newInvokeSpecial
 /// =构造器先分配再跑 `<init>`)。
 fn invoke_member_name(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     mname: Reference,
     ref_kind: u8,
     args: &[Arg],
@@ -495,7 +495,7 @@ fn invoke_member_name(
 /// `interpret_with`。invokeStatic 在声明类解析;invokeVirtual/Interface 按接收者运行时类虚分派;
 /// invokeSpecial 在声明类非虚解析;newInvokeSpecial 先分配新实例(构造器 `<init>`)。
 fn invoke_method_ref(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     mname: Reference,
     ref_kind: u8,
     args: &[Arg],
@@ -611,7 +611,7 @@ fn invoke_method_ref(
 
 /// 读 MemberName.type → 方法描述符 `(...)R`。type 为 String(直接描述符)或 MethodType
 /// (rtype:Class + ptypes:Class[] → 拼描述符)。字段 MemberName 不调此(其 type 为 Class)。
-fn member_name_method_descriptor(vm: &mut Vm, mname: Reference) -> Result<String, VmError> {
+fn member_name_method_descriptor(vm: &mut VmThread, mname: Reference) -> Result<String, VmError> {
     let type_ref = vm
         .instance_reference_field(mname, "java/lang/invoke/MemberName", "type")
         .filter(|r| !r.is_null())
@@ -658,7 +658,7 @@ fn member_name_method_descriptor(vm: &mut Vm, mname: Reference) -> Result<String
 
 /// Class 镜像 → 字段/方法描述符中的类型编码。原语("int"→"I" 等)、数组(内部名即描述符)、
 /// 其余 → `Lname;`。原语镜像经 `mirror_internal_name` 返 "int"/"long"/...;数组返 "[..."。
-fn class_mirror_descriptor(vm: &Vm, mirror: Reference) -> Result<String, VmError> {
+fn class_mirror_descriptor(vm: &VmThread, mirror: Reference) -> Result<String, VmError> {
     let internal = vm
         .mirror_internal_name(mirror)
         .ok_or(VmError::BadConstant("Class 镜像:无内部名"))?;
@@ -708,7 +708,7 @@ fn value_to_slot(v: Value) -> Slot {
 /// (B.5.1 init_from_field 置 clazz+flags;Java 侧构造器再置 name+type;makeSetter 经 changeReferenceKind
 /// 把 getter refKind 转 putter)。
 fn dispatch_method_handle_field(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     mh_ref: Reference,
     args: &[Arg],
 ) -> Result<Option<Value>, VmError> {
@@ -757,7 +757,7 @@ fn dispatch_method_handle_field(
 /// 字段序号在**声明类**扁平布局中定位——其布局是运行时子类布局的前缀(超类链置前),故同一序号
 /// 对子类实例同样有效(同 getfield/putfield 语义)。
 fn access_instance_field(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     declaring: &str,
     field_name: &str,
     ref_kind: u8,
@@ -806,7 +806,7 @@ fn access_instance_field(
 /// 沿超类链按名定位(声明类即 member.clazz,保守沿链兼容继承静态字段);首次访问触发 `<clinit>`
 /// (同 getstatic/putstatic)。
 fn access_static_field(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     declaring: &str,
     field_name: &str,
     ref_kind: u8,
@@ -947,8 +947,8 @@ fn arg_to_slot(arg: Option<&Arg>) -> Result<Slot, VmError> {
 /// `frame_depth >= stack_limit` 时直接抛 `java/lang/StackOverflowError`
 /// ([`VmError::ThrownException`]),不进入 `f`。
 pub(crate) fn run_with_depth<R>(
-    vm: &mut Vm,
-    f: impl FnOnce(&mut Vm) -> Result<R, VmError>,
+    vm: &mut VmThread,
+    f: impl FnOnce(&mut VmThread) -> Result<R, VmError>,
 ) -> Result<R, VmError> {
     if vm.thread.frame_depth >= vm.thread.stack_limit {
         return Err(throw_exception(vm, "java/lang/StackOverflowError"));
@@ -1153,7 +1153,7 @@ fn pop_args(frame: &mut Frame, params: &[FieldType]) -> Result<Vec<Arg>, VmError
 fn dispatch_native(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     caller_pc: usize,
     class: &str,
     name: &str,
@@ -1177,7 +1177,7 @@ fn dispatch_native(
 /// 跑被调用者解释帧至返回,得原始 `Value`(**不** `finish_invoke`)。供 [`run_callee`] 与
 /// [`dispatch_lambda`] 共用——后者须在返回前做 lambda 装箱/拆箱适配(G.4.1),故拆出原始值。
 fn run_callee_to_value(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     target_lc: &LoadedClass,
     target_method: &MethodInfo,
     code: &CodeAttribute,
@@ -1214,7 +1214,7 @@ fn run_callee_to_value(
 fn run_callee(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     caller_pc: usize,
     target_lc: &LoadedClass,
     target_method: &MethodInfo,
@@ -1242,7 +1242,7 @@ fn run_callee(
 fn dispatch_lambda(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     caller_pc: usize,
     lambda: LambdaOop,
     args: Vec<Arg>,
@@ -1375,7 +1375,7 @@ fn dispatch_lambda(
 /// 读包装类 `value` 字段拆箱(I/Z/B/C/S→Int、J→Long、F→Float、D→Double,null→NPE);类型已匹配
 /// → 直传。对应 LambdaForm 的 unbox 节点(`LambdaForm$NamedFunction` 适配)。
 fn adapt_lambda_args(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     args: Vec<Arg>,
     impl_params: &[FieldType],
 ) -> Result<Vec<Arg>, VmError> {
@@ -1396,7 +1396,7 @@ fn adapt_lambda_args(
 /// `List::add`(boolean)作 `BiConsumer.accept` void);类型已匹配(引用→引用 / 原语→原语 /
 /// void→void)→ 直传。对应 LambdaForm 的 box / void 节点。
 fn adapt_lambda_return(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     raw: Value,
     impl_ret: &ReturnDescriptor,
     sam_ret: &ReturnDescriptor,
@@ -1440,7 +1440,7 @@ fn arg_from_value(v: Value) -> Result<Arg, VmError> {
 pub(super) fn invoke_dynamic(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -1563,7 +1563,7 @@ fn resolve_recipe(cp: &ConstantPool, bsm_args: &[u16]) -> Result<String, VmError
 /// `` 占位取下一个实参按其类型字符串化;其它字符字面量拼入;``(常量占位)
 /// 少见于简单拼接,本层 best-effort 跳过(记债)。结果经 `string::intern` 规范化。
 fn concat_with_recipe(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     recipe: &str,
     args: &[Arg],
     param_types: &[FieldType],
@@ -1592,7 +1592,7 @@ fn concat_with_recipe(
 
 /// 把单个动态实参按其字段类型字符串化,追加到 `out`(对应 Java `String.valueOf` 语义)。
 /// float/double 用 Rust `{:?}` 格式(**非 Java 精确**:NaN/无穷/定点规则,独立债,后续)。
-fn stringify_arg(vm: &Vm, arg: &Arg, ft: &FieldType, out: &mut String) {
+fn stringify_arg(vm: &VmThread, arg: &Arg, ft: &FieldType, out: &mut String) {
     use std::fmt::Write;
     match (ft, arg) {
         // 引用:null → "null"(Java 语义);非 null String → 读文本(非 String 罕见,best-effort 跳过)。
@@ -1630,7 +1630,7 @@ fn stringify_arg(vm: &Vm, arg: &Arg, ft: &FieldType, out: &mut String) {
 /// 取实现身份。捕获 = 已按 factoryType 形参弹出的动态实参(`pop_args` 结果)。
 /// 结果为新分配的 `Oop::Lambda` 引用,按调用点返回类型(函数式接口)回填。
 fn build_lambda(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     cp: &ConstantPool,
     bsm_args: &[u16],
     factory_return: &ReturnDescriptor,
@@ -1652,7 +1652,7 @@ fn build_lambda(
 pub(super) fn invoke_static(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     methodref_index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -1717,7 +1717,7 @@ pub(super) fn invoke_static(
 pub(super) fn invoke_special(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     methodref_index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -1802,7 +1802,7 @@ pub(super) fn invoke_special(
 pub(super) fn invoke_virtual(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     methodref_index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -1894,7 +1894,7 @@ pub(super) fn invoke_virtual(
 pub(super) fn invoke_interface(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     methodref_index: u16,
     caller_pc: usize,
 ) -> Result<InvokeFlow, VmError> {
@@ -2009,7 +2009,7 @@ mod tests {
     #[test]
     fn run_with_depth_counts_symmetrically() {
         // Ok 路径:进入 +1、退出 −1(嵌套两层验证递增)。
-        let mut vm = crate::runtime::Vm::default();
+        let mut vm = crate::runtime::VmThread::default();
         let r = super::run_with_depth(&mut vm, |vm| {
             let d1 = vm.thread.frame_depth;
             let inner = super::run_with_depth(vm, |vm| Ok(vm.thread.frame_depth));
@@ -2026,7 +2026,7 @@ mod tests {
         // limit=2:外层→depth1,中层→depth2,内层 depth>=limit → 抛 StackOverflowError;
         // 异常路径仍对称归零。
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(reg).with_stack_limit(2);
+        let mut vm = crate::runtime::VmThread::new(reg).with_stack_limit(2);
         let r = super::run_with_depth(&mut vm, |vm| {
             super::run_with_depth(vm, |vm| super::run_with_depth(vm, |_| Ok(())))
         });

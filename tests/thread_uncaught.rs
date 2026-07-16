@@ -18,7 +18,7 @@ use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -77,7 +77,7 @@ fn find_method<'a>(
 
 fn run_static(
     registry: &std::sync::Arc<ClassRegistry>,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -150,7 +150,7 @@ fn uncaught_exception_dispatched() {
         load_closure(&mut registry, &cp, cls).unwrap();
     }
     let registry = std::sync::Arc::new(registry);
-    let mut vm = Vm::new(std::sync::Arc::clone(&registry));
+    let mut vm = VmThread::new(std::sync::Arc::clone(&registry));
 
     let result = match run_static(&registry, &mut vm, "Probe", "uncaughtDispatched", "()I")
         .expect("uncaughtDispatched 应非抛")

@@ -19,7 +19,7 @@
 //!   rustj 以句柄 id(堆槽号)为对象唯一标识。
 //! - `System.currentTimeMillis/nanoTime` = `jvm.cpp` `JVM_CurrentTimeMillis` / `JVM_NanoTime`。
 
-use crate::runtime::{Reference, Vm};
+use crate::runtime::{Reference, VmThread};
 
 use super::{throw_exception, Value, VmError};
 
@@ -47,7 +47,7 @@ pub(crate) use jdk_internal_reflect::{alloc_wrapper, primitive_wrapper, unbox_ar
 /// native"),按声明类路由到包子模块 `dispatch`,出口**配对 pop**(覆盖所有 Ok/Err 路径)。
 /// 返回值须匹配 `desc` 返回类型(void → [`Value::Void`])。
 pub(super) fn invoke(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -64,7 +64,7 @@ pub(super) fn invoke(
 /// 已注册);`java/lang/*` → [`java_lang`];`jdk/internal/misc/*` → [`jdk_internal`];
 /// 其余 → `UnsatisfiedLinkError`(`nativeLookup.cpp` 解析失败的对应物)。
 fn dispatch(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -111,7 +111,7 @@ fn is_primitive_name(name: &str) -> bool {
 /// 取第 0 参(Class 镜像)的内部名(如 `[B`);非 Class 镜像 / 悬空 → `None`。
 /// 供 `Unsafe.arrayIndexScale(Class)` 按数组组件类型定刻度。镜像现为 `java/lang/Class`
 /// Instance,所表示的类型经 `Vm::mirror_internal_name` 反查(4.12)。
-fn class_arg_name(vm: &Vm, args: &[Value]) -> Option<String> {
+fn class_arg_name(vm: &VmThread, args: &[Value]) -> Option<String> {
     let Value::Reference(r) = args.first().copied()? else {
         return None;
     };
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn register_natives_is_noop_for_any_class() {
-        let mut vm = crate::runtime::Vm::default();
+        let mut vm = crate::runtime::VmThread::default();
         // System / Object / Thread 等皆有 registerNatives()V —— 一律空操作。
         assert_eq!(
             invoke(&mut vm, "java/lang/System", "registerNatives", "()V", None, &[]).unwrap(),
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn object_hashcode_is_handle_id_mode4() {
-        let mut vm = crate::runtime::Vm::default();
+        let mut vm = crate::runtime::VmThread::default();
         // 句柄 id=7 → hashCode = 7(对象标识,mode 4)。同一对象返回同一值。
         let this = Reference::from_id(7);
         assert_eq!(
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn system_current_time_millis_returns_wall_clock_long() {
-        let mut vm = crate::runtime::Vm::default();
+        let mut vm = crate::runtime::VmThread::default();
         match invoke(&mut vm, "java/lang/System", "currentTimeMillis", "()J", None, &[]).unwrap() {
             Value::Long(millis) => {
                 // 墙钟毫秒:2023-11 之后(> 1.7e12),且随调用单调不退。
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn system_nano_time_returns_long() {
-        let mut vm = crate::runtime::Vm::default();
+        let mut vm = crate::runtime::VmThread::default();
         assert!(matches!(
             invoke(&mut vm, "java/lang/System", "nanoTime", "()J", None, &[]).unwrap(),
             Value::Long(_)
@@ -176,7 +176,7 @@ mod tests {
     fn runtime_available_processors_returns_positive() {
         // 须注册表:未登记臂走 throw_exception 须有引导桩(RED 阶段);GREEN 后本臂不触之。
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(reg);
+        let mut vm = crate::runtime::VmThread::new(reg);
         match invoke(&mut vm, "java/lang/Runtime", "availableProcessors", "()I", None, &[]).unwrap() {
             Value::Int(n) => assert!(n >= 1, "availableProcessors 须 ≥1,得 {n}"),
             other => panic!("期望 Int,得 {other:?}"),
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn get_primitive_class_missing_arg_throws_npe() {
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(reg);
+        let mut vm = crate::runtime::VmThread::new(reg);
         let err = invoke(
             &mut vm,
             "java/lang/Class",
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn float_to_raw_int_bits_is_ieee754_reinterpret() {
-        let mut vm = crate::runtime::Vm::default();
+        let mut vm = crate::runtime::VmThread::default();
         // 1.0f 的 IEEE-754 位 = 0x3f800000。
         assert_eq!(
             invoke(&mut vm, "java/lang/Float", "floatToRawIntBits", "(F)I", None, &[Value::Float(1.0)])
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn float_to_raw_int_bits_preserves_nan_bits() {
         // raw 变体**不**折叠 NaN:特定 NaN 位模式原样保留(与 floatToIntBits 折叠到 0x7fc00000 区分)。
-        let mut vm = crate::runtime::Vm::default();
+        let mut vm = crate::runtime::VmThread::default();
         let nan = f32::from_bits(0x7fc0_0042); // 一个带尾数的 NaN
         assert_eq!(
             invoke(&mut vm, "java/lang/Float", "floatToRawIntBits", "(F)I", None, &[Value::Float(nan)])
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn int_bits_to_float_is_inverse_of_raw() {
-        let mut vm = crate::runtime::Vm::default();
+        let mut vm = crate::runtime::VmThread::default();
         // 0x3f800000 → 1.0f;0x80000000 → -0.0f。
         assert_eq!(
             invoke(&mut vm, "java/lang/Float", "intBitsToFloat", "(I)F", None, &[Value::Int(0x3f800000)])
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn double_to_raw_long_bits_and_inverse() {
-        let mut vm = crate::runtime::Vm::default();
+        let mut vm = crate::runtime::VmThread::default();
         // 1.0d 的 IEEE-754 位 = 0x3ff0000000000000(Math.<clinit> 经此路径取 negativeZeroDoubleBits)。
         assert_eq!(
             invoke(&mut vm, "java/lang/Double", "doubleToRawLongBits", "(D)J", None, &[Value::Double(1.0)])
@@ -311,7 +311,7 @@ mod tests {
     fn unbound_native_throws_unsatisfied_link_error() {
         // 未登记的 native → UnsatisfiedLinkError(须有注册表:throw_exception 取引导桩)。
         let reg = crate::oops::ClassRegistry::new();
-        let mut vm = crate::runtime::Vm::new(reg);
+        let mut vm = crate::runtime::VmThread::new(reg);
         let err = invoke(&mut vm, "java/lang/Foo", "bar", "()V", None, &[]).unwrap_err();
         let crate::runtime::VmError::ThrownException(exc) = err else {
             panic!("未登记 native 应抛 ThrownException,得 {err:?}");

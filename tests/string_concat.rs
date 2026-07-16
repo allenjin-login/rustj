@@ -14,7 +14,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -113,7 +113,7 @@ fn string_concat_end_to_end() {
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp =
         Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = Vm::new(std::sync::Arc::clone(&registry));
+    let mut vm = VmThread::new(std::sync::Arc::clone(&registry));
 
     match interp.interpret_with(&mut frame, &mut vm) {
         Ok(rustj::runtime::Value::Int(n)) => {

@@ -18,7 +18,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Reference, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Reference, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -100,7 +100,7 @@ public class St {
 "#;
 
 /// 跑 `St.top` → 期望 `ThrownException`(ArithmeticException),回异常引用。
-fn run_top(vm: &mut Vm) -> Reference {
+fn run_top(vm: &mut VmThread) -> Reference {
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("St").expect("St 须已加载");
     let m = find_method(&lc, "top", "()I");
@@ -116,7 +116,7 @@ fn run_top(vm: &mut Vm) -> Reference {
 }
 
 /// 跑 `St.check(Throwable)`(local[0]=exc)→ 返回诊断 int(3=成功)。
-fn run_check(vm: &mut Vm, exc: Reference) -> Value {
+fn run_check(vm: &mut VmThread, exc: Reference) -> Value {
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("St").expect("St 须已加载");
     let m = find_method(&lc, "check", "(Ljava/lang/Throwable;)I");
@@ -173,7 +173,7 @@ fn get_stack_trace_returns_real_elements() {
     let gl = find_method(&ste, "getLineNumber", "()I");
     assert!(!gl.access_flags.is_native(), "STE.getLineNumber 须为真字节码");
 
-    let mut vm = Vm::new(registry);
+    let mut vm = VmThread::new(registry);
 
     // 4) St.top 抛 ArithmeticException → Rust 捕获引用(调用链已 record_trace 快照)。
     let exc = run_top(&mut vm);

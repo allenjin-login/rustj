@@ -17,13 +17,13 @@
 //! 4.35)。解锁 `WindowsNativeDispatcher.<clinit>` 完整跑通(本版本 `<clinit>` 仅 `initIDs()`,
 //! 无 `capabilities = init()` 赋值)。
 
-use crate::runtime::{Reference, Value, Vm, VmError};
+use crate::runtime::{Reference, Value, VmThread, VmError};
 
 use super::super::throw_exception;
 
 /// `sun/nio/fs/*` native 分派。未登记 → `UnsatisfiedLinkError`。
 pub(super) fn dispatch(
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
@@ -47,7 +47,7 @@ pub(super) fn dispatch(
 #[cfg(test)]
 mod tests {
     use crate::oops::ClassRegistry;
-    use crate::runtime::{Value, Vm};
+    use crate::runtime::{Value, VmThread};
 
     /// **RED→GREEN**(Layer 4.39):`WindowsNativeDispatcher.initIDs()V` native 空操作返 void。
     /// 本机 jmod `<clinit>:1100` 调用(经 `BootLoader.loadLibrary("net"/"nio")` 后);HotSpot
@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn windows_native_dispatcher_init_ids_returns_void() {
         let registry = ClassRegistry::new();
-        let mut vm = Vm::new(registry);
+        let mut vm = VmThread::new(registry);
         let r = super::super::invoke(
             &mut vm,
             "sun/nio/fs/WindowsNativeDispatcher",

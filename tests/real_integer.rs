@@ -24,7 +24,7 @@ use std::process::Command;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, Vm, VmError};
+use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
 
 fn javac_available() -> bool {
     Command::new("javac")
@@ -85,7 +85,7 @@ fn compile_dir(source: &str, public_name: &str, extra: &[&str]) -> PathBuf {
 /// **Vm 堆句柄**——堆随 Vm 析构而失效。故引导(写 `VM.savedProps`)与用户代码(读
 /// `VM.savedProps`)必须同一 Vm,否则旧句柄在新堆里指向错对象。这对应真实 JVM 单一全局堆的
 /// 约定:一个 JVM 实例一个堆,贯穿整个程序。
-fn run_static_in(vm: &mut Vm, class: &str, name: &str, desc: &str) -> Result<Value, String> {
+fn run_static_in(vm: &mut VmThread, class: &str, name: &str, desc: &str) -> Result<Value, String> {
     let reg = vm.registry().unwrap_or_else(|| panic!("类注册表缺失"));
     let lc = reg
         .get(class)
@@ -201,7 +201,7 @@ fn real_integer_valueof_intvalue_runs() {
     // 4) 系统属性引导 + 5) IntegerGate.run() 须共用同一 Vm:静态字段(VM.savedProps)存于
     //    注册表,但其值是 Vm 堆句柄——堆随 Vm 析构失效,故引导与运行同 Vm(对应真实 JVM 单一
     //    全局堆贯穿整个程序的约定)。
-    let mut vm = Vm::new(std::sync::Arc::clone(&registry));
+    let mut vm = VmThread::new(std::sync::Arc::clone(&registry));
     // 系统属性引导:跑 RustjBootstrap.init()(= VM.saveProperties(new HashMap<>()),等价 launcher
     // 的 System.initializeSystemClass 片段)。savedProps 一旦非 null,后续 IntegerCache.<clinit>
     // 的 VM.getSavedProperty 即不再抛 IllegalStateException。抛异常即明确暴露下一缺口(类名)。

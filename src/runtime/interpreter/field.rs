@@ -14,7 +14,7 @@
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::metadata::descriptor::{parse_field_descriptor, FieldType};
 use crate::oops::Oop;
-use crate::runtime::{Frame, Slot, Vm};
+use crate::runtime::{Frame, Slot, VmThread};
 
 use super::{clinit, throw_exception, Interpreter, VmError};
 
@@ -133,7 +133,7 @@ fn push_field_value(frame: &mut Frame, ft: &FieldType, slot: Slot) -> Result<(),
 pub(super) fn new_instance(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     class_index: u16,
 ) -> Result<(), VmError> {
     let class_name = resolve_class_name(interp.cp(), class_index)?;
@@ -155,7 +155,7 @@ pub(super) fn new_instance(
 pub(super) fn get_field(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     fieldref_index: u16,
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
@@ -194,7 +194,7 @@ pub(super) fn get_field(
 pub(super) fn put_field(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     fieldref_index: u16,
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
@@ -231,7 +231,7 @@ pub(super) fn put_field(
 pub(super) fn get_static(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     fieldref_index: u16,
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;
@@ -259,7 +259,7 @@ pub(super) fn get_static(
 pub(super) fn put_static(
     interp: &Interpreter<'_>,
     frame: &mut Frame,
-    vm: &mut Vm,
+    vm: &mut VmThread,
     fieldref_index: u16,
 ) -> Result<(), VmError> {
     let (class_name, field_name, desc) = resolve_fieldref(interp.cp(), fieldref_index)?;

@@ -20,4 +20,4 @@ pub use local_vars::LocalVars;
 pub use operand_stack::OperandStack;
 pub use slot::{Reference, Slot};
 pub use string_pool::StringPool;
-pub use vm::{DEFAULT_STACK_LIMIT, Vm};
+pub use vm::{DEFAULT_STACK_LIMIT, VmThread};

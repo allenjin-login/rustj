@@ -1,6 +1,7 @@
 //! `java/io/*` 的 native 桥。语义移植自 `src/java.base/{windows,unix}/native/libjava/` 的
-//! `Java_java_io_*` 桥 + `prims/jvm.cpp` 的 `JVM_*`。由 [`super::dispatch`] 按声明类路由至此
-//! (`java/io/` 前缀;4.25 起新增,此前 `native/mod.rs::dispatch` 仅路由 `java/lang/`)。
+//! `Java_java_io_*` 桥 + `prims/jvm.cpp` 的 `JVM_*`。由 [`super`] 的 `NativeRegistry` 按
+//! (class,name,desc) 命中——`register_all` 时调本模块 `register`([`natives!`] 生成)登记各条;
+//! `invoke_inner` 查表得 fn 指针即调(4.25 起 java/io 上表)。
 //!
 //! **`WinNTFileSystem.initIDs()V`**(WinNTFileSystem.java:632 `private static native`,
 //! `<clinit>:634` 首调):HotSpot `Java_java_io_WinNTFileSystem_initIDs`(`WinNTFileSystem_md.c`)
@@ -18,50 +19,45 @@ use crate::runtime::{Reference, Value, VmThread, VmError};
 
 use super::super::throw_exception;
 
-/// `java/io/*` native 分派。未登记 → `UnsatisfiedLinkError`。
-pub(super) fn dispatch(
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-    _this: Option<Reference>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    match (class, name, desc) {
-        // WinNTFileSystem.initIDs()V —— <clinit> 缓存字段 ID;无 FS 访问 → 空操作返 void。
-        ("java/io/WinNTFileSystem", "initIDs", "()V") => Ok(Value::Void),
-        // FileDescriptor.initIDs()V —— FileDescriptor.java:65 <clinit> 首调。HotSpot
-        // Java_java_io_FileDescriptor_initIDs 仅缓存字段 ID(IO_fd/handle/append),无 FS 访问 → 空操作。
-        ("java/io/FileDescriptor", "initIDs", "()V") => Ok(Value::Void),
-        // FileDescriptor.getHandle(I)J —— FileDescriptor.java:227 private static native。私有
-        // FileDescriptor(int fd)<init>:129 调用(std 流 in=0/out=1/err=2)。HotSpot Windows 用
-        // GetStdHandle 取 OS HANDLE;rustj 不接 OS stdio handle → 返 fd 作 placeholder(0/1/2,
-        // 非 -1 即非 invalid handle,使 <clinit>:151 的 in/out/err 构造完成)。
-        ("java/io/FileDescriptor", "getHandle", "(I)J") => {
-            let fd = match args.first().copied() {
-                Some(Value::Int(n)) => n as i64,
-                _ => -1,
-            };
-            Ok(Value::Long(fd))
-        }
-        // FileDescriptor.getAppend(I)Z —— FileDescriptor.java:232 private static native。std 流
-        // 非 append → 返 false。HotSpot 读 fd 的 O_APPEND 标志;rustj std 流恒非 append。
-        ("java/io/FileDescriptor", "getAppend", "(I)Z") => Ok(Value::Int(0)),
-        // WinNTFileSystem.canonicalize0(Ljava/lang/String;)Ljava/lang/String; —— 路径规范化(std::fs::canonicalize)。
-        ("java/io/WinNTFileSystem", "canonicalize0", "(Ljava/lang/String;)Ljava/lang/String;") => {
-            canonicalize0(vm, args)
-        }
-        // WinNTFileSystem.getFinalPath0(Ljava/lang/String;)Ljava/lang/String; —— canonicalize 已全解析
-        // (std::fs::canonicalize 含符号链接→最终目标),此处的 reparse 再解析冗余 → 恒等返原输入。
-        ("java/io/WinNTFileSystem", "getFinalPath0", "(Ljava/lang/String;)Ljava/lang/String;") => {
-            get_final_path_0(vm, args)
-        }
-        // WinNTFileSystem.getBooleanAttributes0(Ljava/io/File;)I —— 文件属性位掩码(std::fs::metadata)。
-        ("java/io/WinNTFileSystem", "getBooleanAttributes0", "(Ljava/io/File;)I") => {
-            get_boolean_attributes_0(vm, args)
-        }
-        _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
-    }
+natives! {
+    // WinNTFileSystem.initIDs()V —— <clinit> 缓存字段 ID;无 FS 访问 → 空操作返 void。
+    ("java/io/WinNTFileSystem", "initIDs", "()V") => |_vm, _this, _args| Ok(Value::Void);
+    // FileDescriptor.initIDs()V —— FileDescriptor.java:65 <clinit> 首调。HotSpot
+    // Java_java_io_FileDescriptor_initIDs 仅缓存字段 ID(IO_fd/handle/append),无 FS 访问 → 空操作。
+    ("java/io/FileDescriptor", "initIDs", "()V") => |_vm, _this, _args| Ok(Value::Void);
+    // FileDescriptor.getHandle(I)J —— FileDescriptor.java:227 private static native。私有
+    // FileDescriptor(int fd)<init>:129 调用(std 流 in=0/out=1/err=2)。HotSpot Windows 用
+    // GetStdHandle 取 OS HANDLE;rustj 不接 OS stdio handle → 返 fd 作 placeholder(0/1/2,
+    // 非 -1 即非 invalid handle,使 <clinit>:151 的 in/out/err 构造完成)。
+    ("java/io/FileDescriptor", "getHandle", "(I)J") => |_vm, _this, args| {
+        let fd = match args.first().copied() {
+            Some(Value::Int(n)) => n as i64,
+            _ => -1,
+        };
+        Ok(Value::Long(fd))
+    };
+    // FileDescriptor.getAppend(I)Z —— FileDescriptor.java:232 private static native。std 流
+    // 非 append → 返 false。HotSpot 读 fd 的 O_APPEND 标志;rustj std 流恒非 append。
+    ("java/io/FileDescriptor", "getAppend", "(I)Z") => |_vm, _this, _args| Ok(Value::Int(0));
+    // WinNTFileSystem.canonicalize0(Ljava/lang/String;)Ljava/lang/String; —— 路径规范化(std::fs::canonicalize)。
+    (
+        "java/io/WinNTFileSystem",
+        "canonicalize0",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ) => |vm, _this, args| canonicalize0(vm, args);
+    // WinNTFileSystem.getFinalPath0(Ljava/lang/String;)Ljava/lang/String; —— canonicalize 已全解析
+    // (std::fs::canonicalize 含符号链接→最终目标),此处的 reparse 再解析冗余 → 恒等返原输入。
+    (
+        "java/io/WinNTFileSystem",
+        "getFinalPath0",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ) => |vm, _this, args| get_final_path_0(vm, args);
+    // WinNTFileSystem.getBooleanAttributes0(Ljava/io/File;)I —— 文件属性位掩码(std::fs::metadata)。
+    (
+        "java/io/WinNTFileSystem",
+        "getBooleanAttributes0",
+        "(Ljava/io/File;)I",
+    ) => |vm, _this, args| get_boolean_attributes_0(vm, args);
 }
 
 /// `WinNTFileSystem.canonicalize0(String path)String`(throws IOException):把路径解析为规范绝对

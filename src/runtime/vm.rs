@@ -13,13 +13,14 @@
 //! 构造、堆/池/注册表 accessor、栈帧法(T8 下沉 [`ThreadContext`])。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 
 use crate::oops::ClassRegistry;
 use crate::runtime::heap::Heap;
 use crate::runtime::string_pool::StringPool;
 use crate::runtime::Reference;
 use crate::runtime::interpreter::{launch, VmError};
+use crate::runtime::interpreter::native::NativeRegistry;
 
 /// VM 生命周期阶段(Phase V)。粗粒度跟踪 Rust 侧生命周期——Java 侧 `initLevel` 0..3 仍由
 /// `launch.rs` 经字节码置(Java 层事实源,不复刻到 Rust 避免双源真相)。`VmThread::bootstrap`
@@ -229,12 +230,18 @@ pub(crate) struct Vm {
     /// 派生 VmThread 共享(去重,避免每 VmThread 各自重派)。对应 HotSpot 主线程单例
     ///(`Threads::create_vm` 一次性建)。区别 `VmThread::current_thread`(每线程身份)。
     main_thread: Mutex<Option<Reference>>,
+    /// Native 方法 fn 指针注册表(Layer 4.17):替代 4.10c 编译期 match。读多写稀(写仅 `Vm::new`
+    /// 与将来 4.16 RegisterNatives)→ `RwLock`。`Vm::new` 时 `register_all` 一次性填满。
+    /// 对应 HotSpot 每 `Method` 的 `native_function`,rustj 集中成单表(per-Method 缓存顺延)。
+    native_registry: RwLock<NativeRegistry>,
 }
 
 impl Vm {
     /// 构造共享态(空堆、空池、空表;tid 起始 1)。`registry` = `Some` 经 [`Vm::new`],
     /// `None` 经 [`Vm::default`](无注册表纯数值测试)。B.3.0:`registry` 为 owned `Arc`(非借用)。
     fn new(registry: Option<Arc<ClassRegistry>>) -> Self {
+        let mut native_registry = NativeRegistry::new();
+        crate::runtime::interpreter::native::register_all(&mut native_registry);
         Self {
             heap: Mutex::new(Heap::new()),
             registry,
@@ -247,6 +254,7 @@ impl Vm {
             unnamed_module: Mutex::new(None),
             phase: Mutex::new(VmPhase::Created),
             main_thread: Mutex::new(None),
+            native_registry: RwLock::new(native_registry),
         }
     }
 
@@ -320,6 +328,22 @@ impl VmThread {
             runtime,
             thread: ThreadContext::new_main(),
         }
+    }
+
+    /// 按 (class,name,desc) 取 native 实现:读锁 → `NativeRegistry::resolve` → 拷出 owned
+    /// `Option<NativeFn>` → 释锁。**不在持锁态调 native 体**(避免串行化所有 native 调用)。
+    /// 命中 → 调用方 `f(vm, this, args)`;未命中 → 调用方抛 `UnsatisfiedLinkError`。
+    pub(crate) fn native_resolve(
+        &self,
+        class: &str,
+        name: &str,
+        desc: &str,
+    ) -> Option<crate::runtime::interpreter::native::NativeFn> {
+        self.runtime
+            .native_registry
+            .read()
+            .unwrap()
+            .resolve(class, name, desc)
     }
 
     /// 取共享态的 `Arc::clone`(供 [`Vm::from_shared`] 派生线程 Vm;`shared` 字段私有)。
@@ -553,6 +577,23 @@ mod sync_assertions {
         // Vm 无生命周期参数(registry 为 owned Arc<ClassRegistry>)。
         assert_send::<std::sync::Arc<super::Vm>>();
         assert_sync::<std::sync::Arc<super::Vm>>();
+    }
+
+    /// Layer 4.17:`VmThread::native_resolve` 经 `Vm.native_registry`(RwLock 读锁,拷 fn 指针,
+    /// 释锁)返 `Option<NativeFn>`。未登记(表空或无此 native)→ `None`。
+    #[test]
+    fn native_resolve_returns_none_for_unregistered() {
+        let reg = ClassRegistry::new();
+        let vm = VmThread::new(reg);
+        // Task 3 时 register_all 仍空 → Object.hashCode 未登记 → None。
+        assert!(vm.native_resolve("java/lang/Object", "hashCode", "()I").is_none());
+    }
+
+    /// Layer 4.17:`NativeRegistry: Send + Sync`(RwLock<NativeRegistry> 为 Vm 字段,Vm: Send+Sync 的前置)。
+    #[test]
+    fn native_registry_is_send_sync() {
+        assert_send::<crate::runtime::interpreter::native::NativeRegistry>();
+        assert_sync::<crate::runtime::interpreter::native::NativeRegistry>();
     }
 
     /// `from_vm(vt.vm_arc())` 派生的 VmThread 与原 VmThread **共享同一 `Arc<Vm>`**(堆/池/

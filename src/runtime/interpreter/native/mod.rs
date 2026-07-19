@@ -11,8 +11,10 @@
 //! `UnsatisfiedLinkError`(`ThrownException`)。
 //!
 //! **结构**(解决"一堵大 match"的可维护性,CLAUDE.md §6):[`invoke`] 仅做栈帧 push/pop +
-//! 按声明类**前缀**路由到各包子模块的 `dispatch`;`java/lang/*` → [`java_lang`],
-//! `jdk/internal/misc/*` → [`jdk_internal`]。新增 native 只动对应子模块,不再扫全表。
+//! 委托 [`invoke_inner`],后者**先查 [`NativeRegistry`]**(fn 指针表,各子模块经 [`natives!`]
+//! 宏声明式登记)→ 命中即调 fn 指针;miss 走 [`dispatch`] 前缀路由 fallback(渐进迁移期,
+//! Task 4–10 逐模块退役;Task 11 全删)。新增 native 只在对应子模块的 `natives! { ... }` 加一行
+//!(并 [`register_all`] 登记),不再扫全表。
 //!
 //! **Step 0 源码依据**:
 //! - `Object.hashCode` 的地址模式 = `synchronizer.cpp` `get_next_hash` mode 4(对象地址/标识);
@@ -21,7 +23,7 @@
 
 use crate::runtime::{Reference, VmThread};
 
-use super::{throw_exception, Value, VmError};
+use super::{Value, VmError};
 
 /// 声明式登记一个模块的全部 native(替代手写 `match` + `dispatch` 路由)。生成该模块的
 /// `pub(super) fn register(&mut NativeRegistry)`;每条 `(class,name,desc) => <闭包>`,闭包须
@@ -62,7 +64,7 @@ pub(crate) use jdk_internal_reflect::{alloc_wrapper, primitive_wrapper, unbox_ar
 /// - `args` = 实参正序(`args[0]` = 第 0 形参)。
 ///
 /// 推一个 native 栈帧(未登记 → `UnsatisfiedLinkError` 时栈轨迹含此帧,直答"缺哪个
-/// native"),按声明类路由到包子模块 `dispatch`,出口**配对 pop**(覆盖所有 Ok/Err 路径)。
+/// native"),委托 [`invoke_inner`] 解析+执行,出口**配对 pop**(覆盖所有 Ok/Err 路径)。
 /// 返回值须匹配 `desc` 返回类型(void → [`Value::Void`])。
 pub(super) fn invoke(
     vm: &mut VmThread,
@@ -73,14 +75,34 @@ pub(super) fn invoke(
     args: &[Value],
 ) -> Result<Value, VmError> {
     vm.push_frame(class, name);
-    let result = dispatch(vm, class, name, desc, this, args);
+    let result = invoke_inner(vm, class, name, desc, this, args);
     vm.pop_frame();
     result
 }
 
-/// 按**声明类前缀**路由:任意类的 `registerNatives()V` → 空操作(rustj 编译期表,native 恒
-/// 已注册);`java/lang/*` → [`java_lang`];`jdk/internal/misc/*` → [`jdk_internal`];
-/// 其余 → `UnsatisfiedLinkError`(`nativeLookup.cpp` 解析失败的对应物)。
+/// `invoke` 内核(已 push_frame):(1) 任意类的 `registerNatives()V` 空操作(rustj 编译期表,
+/// native 恒已注册——JDK 侧 registerNatives 把 `Java_*`/`JVM_*` 登记进方法槽,rustj 无此
+/// 运行期步骤);(2) 命中 `NativeRegistry` → 调 fn 指针;(3) miss → 旧 [`dispatch`] 前缀路由
+/// fallback(渐进迁移期;全部模块迁完后删除,Task 11)。
+fn invoke_inner(
+    vm: &mut VmThread,
+    class: &str,
+    name: &str,
+    desc: &str,
+    this: Option<Reference>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    if name == "registerNatives" && desc == "()V" {
+        return Ok(Value::Void);
+    }
+    if let Some(f) = vm.native_resolve(class, name, desc) {
+        return f(vm, this, args);
+    }
+    dispatch(vm, class, name, desc, this, args)
+}
+
+/// 按**声明类前缀**路由(迁移期 fallback;每迁一个模块,删其对应臂,Task 4–10;全删于 Task 11)。
+/// `registerNatives` 已在 [`invoke_inner`] 处理,此处不再特判;`name`/`desc` 透传给各子模块 `dispatch`。
 fn dispatch(
     vm: &mut VmThread,
     class: &str,
@@ -89,11 +111,6 @@ fn dispatch(
     this: Option<Reference>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    // 任意类的 registerNatives()V —— 最高杠杆:解锁 System/Object 等真实 <clinit>
-    // (否则其 <clinit> 调它即 UnsatisfiedLinkError)。
-    if name == "registerNatives" && desc == "()V" {
-        return Ok(Value::Void);
-    }
     match class {
         // `java/lang/invoke/*`(MethodHandle/MemberName/MethodHandleNatives 子系统)优先于
         // `java/lang/` 通配——独立子模块,职责隔离(java_lang.rs 已 1700+ 行,§6)。
@@ -102,7 +119,6 @@ fn dispatch(
         }
         c if c.starts_with("java/lang/") => java_lang::dispatch(vm, c, name, desc, this, args),
         c if c.starts_with("java/io/") => java_io::dispatch(vm, c, name, desc, this, args),
-        c if c.starts_with("sun/nio/fs/") => sun_nio_fs::dispatch(vm, c, name, desc, this, args),
         "jdk/internal/misc/VM" | "jdk/internal/misc/CDS" | "jdk/internal/misc/Unsafe" => {
             jdk_internal::dispatch(vm, class, name, desc, this, args)
         }
@@ -113,8 +129,23 @@ fn dispatch(
         c if c.starts_with("jdk/internal/reflect/") => {
             jdk_internal_reflect::dispatch(vm, c, name, desc, this, args)
         }
-        _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
+        _ => Err(throw_unsatisfied_link_error(vm, class, name, desc)),
     }
+}
+
+/// 未登记 native → `UnsatisfiedLinkError`(带 `class.name desc` 诊断串,对应 HotSpot
+/// `nativeLookup.cpp` 解析失败的报错)。`super::throw_exception_with_message` 写真 Throwable
+/// 的 `detailMessage` 字段(4.x 异常桥),故诊断串经异常实例携带至 Java 侧可读。
+fn throw_unsatisfied_link_error(vm: &mut VmThread, class: &str, name: &str, desc: &str) -> VmError {
+    let msg = format!("{}.{} {}", class.replace('/', "."), name, desc);
+    super::throw_exception_with_message(vm, "java/lang/UnsatisfiedLinkError", &msg)
+}
+
+/// 把所有内置 native 模块的 `register` 串调,填满 `NativeRegistry`(`Vm::new` 时一次性调)。
+/// 渐进迁移:每迁一个模块,在此加一行 `<module>::register(reg);`(模块迁移见各 Task 4–10)。
+/// **Task 3 阶段为空**(所有模块仍走 `dispatch` fallback);全部迁完后 fallback 删除(Task 11)。
+pub(crate) fn register_all(reg: &mut NativeRegistry) {
+    sun_nio_fs::register(reg);
 }
 
 /// 原语关键字名(`"int"`/…/`"void"`)判定——`name2type` 的等价物

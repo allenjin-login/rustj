@@ -12,7 +12,7 @@ mod exception;
 mod field;
 mod invoke;
 pub mod launch;
-mod native;
+pub(crate) mod native;
 pub(crate) mod string;
 mod type_check;
 

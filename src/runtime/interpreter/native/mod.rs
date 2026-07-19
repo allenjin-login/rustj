@@ -23,6 +23,20 @@ use crate::runtime::{Reference, VmThread};
 
 use super::{throw_exception, Value, VmError};
 
+/// 声明式登记一个模块的全部 native(替代手写 `match` + `dispatch` 路由)。生成该模块的
+/// `pub(super) fn register(&mut NativeRegistry)`;每条 `(class,name,desc) => <闭包>`,闭包须
+/// **非捕获**(在 `register(..., f: NativeFn)` 位协变为零成本 fn 指针;捕获即编译错——护栏)。
+/// 须定义于子模块声明**之前**(文本作用域:子 mod 方能用裸 `natives!`)。用法见各 `native/<pkg>.rs`。
+macro_rules! natives {
+    ( $( ($class:literal, $name:literal, $desc:literal) => $body:expr );* $(;)? ) => {
+        pub(super) fn register(reg: &mut $crate::runtime::interpreter::native::NativeRegistry) {
+            $(
+                reg.register($class, $name, $desc, $body);
+            )*
+        }
+    };
+}
+
 mod java_io;
 mod java_lang;
 mod java_lang_invoke;
@@ -125,6 +139,13 @@ fn class_arg_name(vm: &VmThread, args: &[Value]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 宏展开 → 生成 `pub(super) fn register(&mut NativeRegistry)`,登记 2 条测试 native。
+    // 文本作用域:`natives!` 在本文件顶部定义、本 mod 在其后声明 → 本 mod 可见。
+    natives! {
+        ("test/Sample", "one", "()I") => |_vm, _this, _args| Ok(Value::Int(1));
+        ("test/Sample", "two", "()I") => |_vm, _this, _args| Ok(Value::Int(2));
+    }
 
     // 最小集的四个 native 均**不**触碰注册表(仅未登记路径 throw_exception 需之);
     // 故可用无注册表的 `Vm::default()` 直测分派逻辑。
@@ -325,5 +346,23 @@ mod tests {
             panic!("UnsatisfiedLinkError 应为引导桩实例");
         };
         assert_eq!(i.class_name(), "java/lang/UnsatisfiedLinkError");
+    }
+
+    /// `natives!` 宏生成的 `register(&mut NativeRegistry)` 须把每条 (class,name,desc)=>闭包
+    /// 登记进表;非捕获闭包协变为 fn 指针。
+    #[test]
+    fn natives_macro_generates_register() {
+        let mut reg = NativeRegistry::new();
+        register(&mut reg); // 宏在本 mod 作用域生成的 register。
+        let mut vm = crate::runtime::VmThread::default();
+        assert_eq!(
+            reg.resolve("test/Sample", "one", "()I").unwrap()(&mut vm, None, &[]).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            reg.resolve("test/Sample", "two", "()I").unwrap()(&mut vm, None, &[]).unwrap(),
+            Value::Int(2)
+        );
+        assert!(reg.resolve("test/Sample", "missing", "()I").is_none());
     }
 }

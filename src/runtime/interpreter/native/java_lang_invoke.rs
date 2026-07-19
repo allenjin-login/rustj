@@ -35,71 +35,71 @@ const REF_GET_STATIC: i32 = 2;
 /// `ACC_STATIC`(JVM access flag 0x0008)——判定字段/方法静态与否。
 const ACC_STATIC: i32 = 0x0008;
 
-/// `java/lang/invoke/*` native 分派。未登记 → `UnsatisfiedLinkError`。
-pub(super) fn dispatch(
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-    _this: Option<Reference>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    match (class, name, desc) {
-        // MethodHandleNatives.init(MemberName, Object)V —— 静态 native(MemberName 构造器首调)。
-        // 移植 methodHandles.cpp:202 init_MemberName + :365 init_field_MemberName(字段分支)。
-        ("java/lang/invoke/MethodHandleNatives", "init", "(Ljava/lang/invoke/MemberName;Ljava/lang/Object;)V") => {
-            mhn_init(vm, args)
-        }
+natives! {
+    // MethodHandleNatives.init(MemberName, Object)V —— 静态 native(MemberName 构造器首调)。
+    // 移植 methodHandles.cpp:202 init_MemberName + :365 init_field_MemberName(字段分支)。
+    (
+        "java/lang/invoke/MethodHandleNatives",
+        "init",
+        "(Ljava/lang/invoke/MemberName;Ljava/lang/Object;)V",
+    ) => |vm, _this, args| mhn_init(vm, args);
 
-        // MethodHandleNatives.resolve(MemberName, Class, int, boolean)MemberName —— 静态 native。
-        // MemberName.Factory.resolve(MemberName.java:958)调之。移植 `resolve_MemberName`→
-        // `init_method_MemberName`/`init_field_MemberName`(methodHandles.cpp:248/365)的 **flags 补全**
-        // 部分:`new MemberName(refc,name,type,refKind)` 已置 MN_IS_METHOD/CONSTRUCTOR(MemberName.java:759)
-        // 但**不置 ACC_STATIC**(mods=0)→ checkMethod 的 isStatic() 读 `flags & ACC_STATIC` 返 false →
-        // "expected a static method"(findStatic invokeStatic 路径)。resolve 据 refKind 补 ACC_STATIC +
-        // 种类位(OR 进,不抹除现有 modifiers)。**不查方法/字段本身**:B.5.2 钩子只读 member.clazz/
-        // name/flags(不读 vmtarget/vmindex),TRUSTED lookup 绕 checkAccess(MethodHandles.java:3737)
-        // 故不需真 modifiers。Java 侧 Factory.resolve 自清 `resolution`(MemberName.java:963)。
-        // 解锁 BMH.<clinit>→ClassSpecializer.findFactory→findStatic(speciesCode,"make",type)。
-        ("java/lang/invoke/MethodHandleNatives", "resolve", "(Ljava/lang/invoke/MemberName;Ljava/lang/Class;IZ)Ljava/lang/invoke/MemberName;") => {
-            let mname = match args.first().copied() {
-                Some(Value::Reference(r)) => r,
-                _ => Reference::null(),
-            };
-            resolve_member_flags(vm, mname);
-            Ok(Value::Reference(mname))
-        }
+    // MethodHandleNatives.resolve(MemberName, Class, int, boolean)MemberName —— 静态 native。
+    // MemberName.Factory.resolve(MemberName.java:958)调之。移植 `resolve_MemberName`→
+    // `init_method_MemberName`/`init_field_MemberName`(methodHandles.cpp:248/365)的 **flags 补全**
+    // 部分:`new MemberName(refc,name,type,refKind)` 已置 MN_IS_METHOD/CONSTRUCTOR(MemberName.java:759)
+    // 但**不置 ACC_STATIC**(mods=0)→ checkMethod 的 isStatic() 读 `flags & ACC_STATIC` 返 false →
+    // "expected a static method"(findStatic invokeStatic 路径)。resolve 据 refKind 补 ACC_STATIC +
+    // 种类位(OR 进,不抹除现有 modifiers)。**不查方法/字段本身**:B.5.2 钩子只读 member.clazz/
+    // name/flags(不读 vmtarget/vmindex),TRUSTED lookup 绕 checkAccess(MethodHandles.java:3737)
+    // 故不需真 modifiers。Java 侧 Factory.resolve 自清 `resolution`(MemberName.java:963)。
+    // 解锁 BMH.<clinit>→ClassSpecializer.findFactory→findStatic(speciesCode,"make",type)。
+    (
+        "java/lang/invoke/MethodHandleNatives",
+        "resolve",
+        "(Ljava/lang/invoke/MemberName;Ljava/lang/Class;IZ)Ljava/lang/invoke/MemberName;",
+    ) => |vm, _this, args| {
+        let mname = match args.first().copied() {
+            Some(Value::Reference(r)) => r,
+            _ => Reference::null(),
+        };
+        resolve_member_flags(vm, mname);
+        Ok(Value::Reference(mname))
+    };
 
-        // objectFieldOffset(MemberName)J —— DirectMethodHandle.make 实例字段分支调(DirectMethodHandle.java:120)
-        // 取偏移,存入 `Accessor.fieldOffset`(DMH 实例字段),供 prepared 字段 LF 的 `fieldOffset(dmh)`
-        // 节点读出、再喂 `Unsafe.getInt(base, ord)`。rustj 无真实内存偏移:**返字段在声明类扁平实例
-        // 布局中的序号(ord)**(同 `objectFieldOffset1` 的内部自洽模型),`Unsafe.getInt` 据 base 为
-        // Instance 时按 ord 直读实例槽。读 MemberName.clazz(声明类镜像)+ name(字段名)→
-        // `resolve_instance_field_by_name`(仅名匹配)。未找到 → -1。
-        ("java/lang/invoke/MethodHandleNatives", "objectFieldOffset", "(Ljava/lang/invoke/MemberName;)J") => {
-            object_field_offset(vm, args)
-        }
+    // objectFieldOffset(MemberName)J —— DirectMethodHandle.make 实例字段分支调(DirectMethodHandle.java:120)
+    // 取偏移,存入 `Accessor.fieldOffset`(DMH 实例字段),供 prepared 字段 LF 的 `fieldOffset(dmh)`
+    // 节点读出、再喂 `Unsafe.getInt(base, ord)`。rustj 无真实内存偏移:**返字段在声明类扁平实例
+    // 布局中的序号(ord)**(同 `objectFieldOffset1` 的内部自洽模型),`Unsafe.getInt` 据 base 为
+    // Instance 时按 ord 直读实例槽。读 MemberName.clazz(声明类镜像)+ name(字段名)→
+    // `resolve_instance_field_by_name`(仅名匹配)。未找到 → -1。
+    (
+        "java/lang/invoke/MethodHandleNatives",
+        "objectFieldOffset",
+        "(Ljava/lang/invoke/MemberName;)J",
+    ) => |vm, _this, args| object_field_offset(vm, args);
 
-        // staticFieldOffset(MemberName)J —— HotSpot `init_field_MemberName` 填的 vmindex(fd.offset()
-        // 占位)。**Phase G.1b**:物种类链接(ClassSpecializer.linkCodeToSpeciesData:938)经
-        // `Unsafe.putReference(staticFieldBase(sdField), staticFieldOffset(sdField), speciesData)` 写
-        // SpeciesData 到物种类静态 SD 字段 → 须返真序号。读 MemberName.clazz(声明类镜像)+
-        // MemberName.name(字段名)→ `resolve_static_field_by_name`(仅名匹配,MemberName.type 对字段
-        // 存 Class 对象非描述符)。序号 = 声明类 static_storage 索引;`staticFieldBase` 返同一声明类
-        // 镜像 → putReference 路由到该类 static_storage[ord] 自洽。未找到 → -1(putReference 越界兜底)。
-        ("java/lang/invoke/MethodHandleNatives", "staticFieldOffset", "(Ljava/lang/invoke/MemberName;)J") => {
-            static_field_offset(vm, args)
-        }
+    // staticFieldOffset(MemberName)J —— HotSpot `init_field_MemberName` 填的 vmindex(fd.offset()
+    // 占位)。**Phase G.1b**:物种类链接(ClassSpecializer.linkCodeToSpeciesData:938)经
+    // `Unsafe.putReference(staticFieldBase(sdField), staticFieldOffset(sdField), speciesData)` 写
+    // SpeciesData 到物种类静态 SD 字段 → 须返真序号。读 MemberName.clazz(声明类镜像)+
+    // MemberName.name(字段名)→ `resolve_static_field_by_name`(仅名匹配,MemberName.type 对字段
+    // 存 Class 对象非描述符)。序号 = 声明类 static_storage 索引;`staticFieldBase` 返同一声明类
+    // 镜像 → putReference 路由到该类 static_storage[ord] 自洽。未找到 → -1(putReference 越界兜底)。
+    (
+        "java/lang/invoke/MethodHandleNatives",
+        "staticFieldOffset",
+        "(Ljava/lang/invoke/MemberName;)J",
+    ) => |vm, _this, args| static_field_offset(vm, args);
 
-        // staticFieldBase(MemberName)Object —— HotSpot 返声明类镜像(`init_field_MemberName` set_clazz)。
-        // **Phase G.1b**:物种类链接读 sdField.clazz 作 putReference 的 base;putReference 据「base 是
-        // Class 镜像」路由到静态字段(static_storage[ord])。返 MemberName.clazz;无 clazz → null。
-        ("java/lang/invoke/MethodHandleNatives", "staticFieldBase", "(Ljava/lang/invoke/MemberName;)Ljava/lang/Object;") => {
-            static_field_base(vm, args)
-        }
-
-        _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
-    }
+    // staticFieldBase(MemberName)Object —— HotSpot 返声明类镜像(`init_field_MemberName` set_clazz)。
+    // **Phase G.1b**:物种类链接读 sdField.clazz 作 putReference 的 base;putReference 据「base 是
+    // Class 镜像」路由到静态字段(static_storage[ord])。返 MemberName.clazz;无 clazz → null。
+    (
+        "java/lang/invoke/MethodHandleNatives",
+        "staticFieldBase",
+        "(Ljava/lang/invoke/MemberName;)Ljava/lang/Object;",
+    ) => |vm, _this, args| static_field_base(vm, args);
 }
 
 /// 据 refKind 补 `MemberName.flags` 的成员种类位(MN_IS_METHOD/CONSTRUCTOR/FIELD)+ `ACC_STATIC`

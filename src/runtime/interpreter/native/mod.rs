@@ -112,11 +112,6 @@ fn dispatch(
     args: &[Value],
 ) -> Result<Value, VmError> {
     match class {
-        // `java/lang/invoke/*`(MethodHandle/MemberName/MethodHandleNatives 子系统)优先于
-        // `java/lang/` 通配——独立子模块,职责隔离(java_lang.rs 已 1700+ 行,§6)。
-        c if c.starts_with("java/lang/invoke/") => {
-            java_lang_invoke::dispatch(vm, c, name, desc, this, args)
-        }
         c if c.starts_with("java/lang/") => java_lang::dispatch(vm, c, name, desc, this, args),
         "jdk/internal/misc/VM" | "jdk/internal/misc/CDS" | "jdk/internal/misc/Unsafe" => {
             jdk_internal::dispatch(vm, class, name, desc, this, args)
@@ -143,6 +138,7 @@ pub(crate) fn register_all(reg: &mut NativeRegistry) {
     sun_nio_fs::register(reg);
     jdk_internal_loader::register(reg);
     java_io::register(reg);
+    java_lang_invoke::register(reg);
 }
 
 /// 原语关键字名(`"int"`/…/`"void"`)判定——`name2type` 的等价物

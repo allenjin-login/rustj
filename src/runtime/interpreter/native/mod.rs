@@ -29,7 +29,11 @@ mod java_lang_invoke;
 mod jdk_internal;
 mod jdk_internal_loader;
 mod jdk_internal_reflect;
+mod registry;
 mod sun_nio_fs;
+
+/// Native fn 指针注册表(Layer 4.17):替代 4.10c 编译期 `match`。
+pub(crate) use registry::{NativeFn, NativeRegistry};
 
 /// 反射装箱/拆箱原语族(G.4.1 lambda 适配器复用):`unbox_arg`(引用→原语读 value 字段)、
 /// `alloc_wrapper`(原语→包装实例)、`primitive_wrapper`(原语→包装类名)。

@@ -1,5 +1,7 @@
 //! `jdk/internal/misc/{VM,CDS,Unsafe}` 的 native 桥。语义移植自 `prims/jvm.cpp` 的 `JVM_*`。
-//! 由 [`super::dispatch`] 按声明类路由至此。
+//! 由 [`super`] 的 `NativeRegistry` 按 (class,name,desc) 命中——`register_all` 时调本模块
+//! `register`([`natives!`] 生成)登记各条;`invoke_inner` 查表得 fn 指针即调(4.10c-d 起
+//! jdk/internal/misc 上表)。
 
 use crate::oops::Oop;
 use crate::runtime::{Reference, Slot, Value, VmThread, VmError};
@@ -10,216 +12,195 @@ use super::super::throw_exception;
 /// 故 `byte_index` 逆算 `offset - 此值`。与 `arrayBaseOffset0` 返回值同源,内部自洽。
 const ARRAY_BYTE_BASE_OFFSET: i64 = 16;
 
-/// `jdk/internal/misc/*` native 分派。未登记 → `UnsatisfiedLinkError`。
-pub(super) fn dispatch(
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-    _this: Option<Reference>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    match (class, name, desc) {
-        // jdk.internal.misc.VM.initialize()V —— VM.java:451 私有 native,VM.<clinit> 首调,
-        // 做 JDK 启动期一次性引导(保存属性 / 直接内存上限 / …)。rustj 无 launcher 传递的启动态,
-        // 此处恒空操作(等价"VM 已初始化,无保存属性"——后续 getSavedProperty 读空表得 null)。
-        ("jdk/internal/misc/VM", "initialize", "()V") => Ok(Value::Void),
+natives! {
+    // jdk.internal.misc.VM.initialize()V —— VM.java:451 私有 native,VM.<clinit> 首调,
+    // 做 JDK 启动期一次性引导(保存属性 / 直接内存上限 / …)。rustj 无 launcher 传递的启动态,
+    // 此处恒空操作(等价"VM 已初始化,无保存属性"——后续 getSavedProperty 读空表得 null)。
+    ("jdk/internal/misc/VM", "initialize", "()V") => |_vm, _this, _args| Ok(Value::Void);
 
-        // jdk.internal.misc.CDS.initializeFromArchive(Ljava/lang/Class;)V —— CDS.java:130
-        // public static native。HotSpot `JVM_InitializeFromArchive`:从 CDS/AOT 归档恢复类的
-        // 归档静态状态;无归档(rustj 无 CDS)→ 空操作(归档字段留默认 null)。包装类(Integer/
-        // Long/…)$<clinit> 经 `runtimeSetup()` 调之以尝试恢复 archivedCache;空操作后走"新建缓存"
-        // 分支,即非 CDS 运行的规范行为。
-        ("jdk/internal/misc/CDS", "initializeFromArchive", "(Ljava/lang/Class;)V") => Ok(Value::Void),
+    // jdk.internal.misc.CDS.initializeFromArchive(Ljava/lang/Class;)V —— CDS.java:130
+    // public static native。HotSpot `JVM_InitializeFromArchive`:从 CDS/AOT 归档恢复类的
+    // 归档静态状态;无归档(rustj 无 CDS)→ 空操作(归档字段留默认 null)。包装类(Integer/
+    // Long/…)$<clinit> 经 `runtimeSetup()` 调之以尝试恢复 archivedCache;空操作后走"新建缓存"
+    // 分支,即非 CDS 运行的规范行为。
+    ("jdk/internal/misc/CDS", "initializeFromArchive", "(Ljava/lang/Class;)V") => |_vm, _this, _args| Ok(Value::Void);
 
-        // jdk.internal.misc.CDS.getCDSConfigStatus()I —— CDS.java:95 私有 native,<clinit> 经
-        // `configStatus = getCDSConfigStatus()` 调之。HotSpot 返回 CDS 配置位掩码(cdsConfig.hpp:
-        // IS_DUMPING_ARCHIVE / IS_USING_ARCHIVE / …);rustj 无 CDS → 恒 0(所有标志关闭),
-        // 即 isUsingArchive()/isDumpingArchive()/… 均假——规范的非 CDS 运行。
-        ("jdk/internal/misc/CDS", "getCDSConfigStatus", "()I") => Ok(Value::Int(0)),
+    // jdk.internal.misc.CDS.getCDSConfigStatus()I —— CDS.java:95 私有 native,<clinit> 经
+    // `configStatus = getCDSConfigStatus()` 调之。HotSpot 返回 CDS 配置位掩码(cdsConfig.hpp:
+    // IS_DUMPING_ARCHIVE / IS_USING_ARCHIVE / …);rustj 无 CDS → 恒 0(所有标志关闭),
+    // 即 isUsingArchive()/isDumpingArchive()/… 均假——规范的非 CDS 运行。
+    ("jdk/internal/misc/CDS", "getCDSConfigStatus", "()I") => |_vm, _this, _args| Ok(Value::Int(0));
 
-        // jdk.internal.misc.CDS.getRandomSeedForDumping()J —— CDS.java:143 public static native。
-        // HotSpot 仅在 `-Xshare:dump` 时返回派生自 JVM 版本的非零种子(可重复生成 CDS 归档);
-        // 非 dump 运行(rustj 永不 dump)→ 恒 0。调用方 `ImmutableCollections.<clinit>`(line 89)
-        // 得 0 后回退 `System.nanoTime()`(已绑定)算 SALT——即规范的运行时随机路径。
-        ("jdk/internal/misc/CDS", "getRandomSeedForDumping", "()J") => Ok(Value::Long(0)),
+    // jdk.internal.misc.CDS.getRandomSeedForDumping()J —— CDS.java:143 public static native。
+    // HotSpot 仅在 `-Xshare:dump` 时返回派生自 JVM 版本的非零种子(可重复生成 CDS 归档);
+    // 非 dump 运行(rustj 永不 dump)→ 恒 0。调用方 `ImmutableCollections.<clinit>`(line 89)
+    // 得 0 后回退 `System.nanoTime()`(已绑定)算 SALT——即规范的运行时随机路径。
+    ("jdk/internal/misc/CDS", "getRandomSeedForDumping", "()J") => |_vm, _this, _args| Ok(Value::Long(0));
 
-        // jdk.internal.misc.Unsafe 的数组布局 native —— Unsafe.<clinit> 经
-        // `theUnsafe.arrayBaseOffset(X[].class)` / `arrayIndexScale(X[].class)`(皆为**非 native**
-        // 字节码包装器)转调私有 native `arrayBaseOffset0` / `arrayIndexScale0`,初始化各
-        // ARRAY_*_BASE_OFFSET / _INDEX_SCALE 静态字段(ArraysSupport.<clinit> 读之,进而
-        // StringLatin1.hashCode → ArraysSupport.hashCodeOfUnsigned 触发其初始化)。rustj 数组
-        // 无真实内存偏移:基偏移取常量、刻度按组件类型大小,仅供偏移算术(mismatch 等);
-        // **不参与 String.hashCode 计算**——后者经 `unsignedHashCode` 的朴素 baload 循环。
-        ("jdk/internal/misc/Unsafe", "arrayBaseOffset0", "(Ljava/lang/Class;)I") => Ok(Value::Int(16)),
-        ("jdk/internal/misc/Unsafe", "arrayIndexScale0", "(Ljava/lang/Class;)I") => {
-            let scale = match super::class_arg_name(vm, args).as_deref() {
-                Some("[B") | Some("[Z") => 1,
-                Some("[C") | Some("[S") => 2,
-                Some("[I") | Some("[F") => 4,
-                Some("[J") | Some("[D") => 8,
-                _ => 1, // 引用数组/未知 → 1(保守;hash 不用此值)
-            };
-            Ok(Value::Int(scale))
-        }
+    // jdk.internal.misc.Unsafe 的数组布局 native —— Unsafe.<clinit> 经
+    // `theUnsafe.arrayBaseOffset(X[].class)` / `arrayIndexScale(X[].class)`(皆为**非 native**
+    // 字节码包装器)转调私有 native `arrayBaseOffset0` / `arrayIndexScale0`,初始化各
+    // ARRAY_*_BASE_OFFSET / _INDEX_SCALE 静态字段(ArraysSupport.<clinit> 读之,进而
+    // StringLatin1.hashCode → ArraysSupport.hashCodeOfUnsigned 触发其初始化)。rustj 数组
+    // 无真实内存偏移:基偏移取常量、刻度按组件类型大小,仅供偏移算术(mismatch 等);
+    // **不参与 String.hashCode 计算**——后者经 `unsignedHashCode` 的朴素 baload 循环。
+    ("jdk/internal/misc/Unsafe", "arrayBaseOffset0", "(Ljava/lang/Class;)I") => |_vm, _this, _args| Ok(Value::Int(16));
+    ("jdk/internal/misc/Unsafe", "arrayIndexScale0", "(Ljava/lang/Class;)I") => |vm, _this, args| {
+        let scale = match super::class_arg_name(vm, args).as_deref() {
+            Some("[B") | Some("[Z") => 1,
+            Some("[C") | Some("[S") => 2,
+            Some("[I") | Some("[F") => 4,
+            Some("[J") | Some("[D") => 8,
+            _ => 1, // 引用数组/未知 → 1(保守;hash 不用此值)
+        };
+        Ok(Value::Int(scale))
+    };
 
-        // jdk.internal.misc.Unsafe 的偏移读族 —— `getLong/getInt/getShort/getByte(Object,long)`
-        //(Unsafe.java:243/164/227/219 均 `public native`,描述符 `(Ljava/lang/Object;J){J,I,S,B}`)。
-        // 解锁 `String.startsWith`(prefix len>7)→ `ArraysSupport.mismatch` → `vectorizedMismatch`
-        //(纯 Java 字节码,`@IntrinsicCandidate` 非 native;HotSpot 内联 SIMD,rustj 跑其 Java 体)。
-        // `vectorizedMismatch`(ArraysSupport.java:118)对数组以 `getLongUnaligned/getIntUnaligned`
-        //(Unsafe.java:3563/3602,纯 Java)按 offset 对齐度**委派**到下列 native:8 对齐→getLong、
-        // 4 对齐→getInt、2 对齐→getShort、奇对齐→getByte。故四族均须绑,缺一则在未对齐 offset 落 ULE。
-        // **另**:`putByte(Object,long,byte)`(Unsafe.java:219 native)经 `DecimalDigits.uncheckedPutCharLatin1`
-        // 把数字字节写入 byte[],解锁 StringBuilder.append(int)/Integer.toString 等 int→string 链。
-        //
-        // rustj 无真实偏移内存:把 ArrayOop 视为**扁平小端字节缓冲**,按 byte_offset = offset - ABASE
-        //(ABASE 与 `arrayBaseOffset0` 同源恒 16)取 N 字节、按组件类型序列化、小端打包/拆包。
-        // byte[](String 紧凑串)为即时场景;`array_le_bytes` 通吃 byte/char/short/int/long/float/double
-        //(见下)。实参:第 0 = 数组 Reference,第 1 = offset Long(单个 category-2 槽,JVM 级单参)。
-        ("jdk/internal/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V") => put_byte(vm, args),
-        ("jdk/internal/misc/Unsafe", "getByte", "(Ljava/lang/Object;J)B") => get_byte(vm, args),
-        ("jdk/internal/misc/Unsafe", "getChar", "(Ljava/lang/Object;J)C") => get_char(vm, args),
-        ("jdk/internal/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S") => get_short(vm, args),
-        ("jdk/internal/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I") => get_int(vm, args),
-        ("jdk/internal/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J") => get_long(vm, args),
-        // jdk.internal.misc.Unsafe.putInt(Object,long,int) —— Unsafe.java native。**Phase G.2.3**:
-        // DMH 实例字段 putField prepared LF(Field.set 路径)经之写实例 int 槽:offset = ord
-        //(由 `MethodHandleNatives.objectFieldOffset` 给)→ `write_slot`(Instance=ord/Array=对齐单元素)。
-        ("jdk/internal/misc/Unsafe", "putInt", "(Ljava/lang/Object;JI)V") => put_int(vm, args),
+    // jdk.internal.misc.Unsafe 的偏移读族 —— `getLong/getInt/getShort/getByte(Object,long)`
+    //(Unsafe.java:243/164/227/219 均 `public native`,描述符 `(Ljava/lang/Object;J){J,I,S,B}`)。
+    // 解锁 `String.startsWith`(prefix len>7)→ `ArraysSupport.mismatch` → `vectorizedMismatch`
+    //(纯 Java 字节码,`@IntrinsicCandidate` 非 native;HotSpot 内联 SIMD,rustj 跑其 Java 体)。
+    // `vectorizedMismatch`(ArraysSupport.java:118)对数组以 `getLongUnaligned/getIntUnaligned`
+    //(Unsafe.java:3563/3602,纯 Java)按 offset 对齐度**委派**到下列 native:8 对齐→getLong、
+    // 4 对齐→getInt、2 对齐→getShort、奇对齐→getByte。故四族均须绑,缺一则在未对齐 offset 落 ULE。
+    // **另**:`putByte(Object,long,byte)`(Unsafe.java:219 native)经 `DecimalDigits.uncheckedPutCharLatin1`
+    // 把数字字节写入 byte[],解锁 StringBuilder.append(int)/Integer.toString 等 int→string 链。
+    //
+    // rustj 无真实偏移内存:把 ArrayOop 视为**扁平小端字节缓冲**,按 byte_offset = offset - ABASE
+    //(ABASE 与 `arrayBaseOffset0` 同源恒 16)取 N 字节、按组件类型序列化、小端打包/拆包。
+    // byte[](String 紧凑串)为即时场景;`array_le_bytes` 通吃 byte/char/short/int/long/float/double
+    //(见下)。实参:第 0 = 数组 Reference,第 1 = offset Long(单个 category-2 槽,JVM 级单参)。
+    ("jdk/internal/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V") => |vm, _this, args| put_byte(vm, args);
+    ("jdk/internal/misc/Unsafe", "getByte", "(Ljava/lang/Object;J)B") => |vm, _this, args| get_byte(vm, args);
+    ("jdk/internal/misc/Unsafe", "getChar", "(Ljava/lang/Object;J)C") => |vm, _this, args| get_char(vm, args);
+    ("jdk/internal/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S") => |vm, _this, args| get_short(vm, args);
+    ("jdk/internal/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I") => |vm, _this, args| get_int(vm, args);
+    ("jdk/internal/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J") => |vm, _this, args| get_long(vm, args);
+    // jdk.internal.misc.Unsafe.putInt(Object,long,int) —— Unsafe.java native。**Phase G.2.3**:
+    // DMH 实例字段 putField prepared LF(Field.set 路径)经之写实例 int 槽:offset = ord
+    //(由 `MethodHandleNatives.objectFieldOffset` 给)→ `write_slot`(Instance=ord/Array=对齐单元素)。
+    ("jdk/internal/misc/Unsafe", "putInt", "(Ljava/lang/Object;JI)V") => |vm, _this, args| put_int(vm, args);
 
-        // jdk.internal.misc.Unsafe.objectFieldOffset1(Ljava/lang/Class;Ljava/lang/String;)J
-        // —— Unsafe.java:1100 `objectFieldOffset(Class, String)`(jmod 内部转调 `objectFieldOffset1`,
-        // 注意 jdk-master 源码名为 `knownObjectFieldOffset0`,版本错位——以 jmod 为准)经
-        // `Class$Atomic.<clinit>` 调:`reflectionDataOffset = unsafe.objectFieldOffset(Class.class,
-        // "reflectionData")`。HotSpot 返字段在对象布局中的真实字节偏移;rustj **无真实内存偏移**,
-        // 改返字段在声明类扁平实例布局中的**序号**(ord)——后续 `compareAndSetReference` 用同一 ord
-        // 索引实例槽位,内部自洽。第 1 参 = 声明类的 Class 镜像(如 Class.class 镜像),第 2 参 =
-        // 字段名(真 String 实例)。未找到字段 → 返 -1(public 包装器据 `< 0` 抛 InternalError)。
-        ("jdk/internal/misc/Unsafe", "objectFieldOffset1", "(Ljava/lang/Class;Ljava/lang/String;)J") => {
-            object_field_offset(vm, args)
-        }
+    // jdk.internal.misc.Unsafe.objectFieldOffset1(Ljava/lang/Class;Ljava/lang/String;)J
+    // —— Unsafe.java:1100 `objectFieldOffset(Class, String)`(jmod 内部转调 `objectFieldOffset1`,
+    // 注意 jdk-master 源码名为 `knownObjectFieldOffset0`,版本错位——以 jmod 为准)经
+    // `Class$Atomic.<clinit>` 调:`reflectionDataOffset = unsafe.objectFieldOffset(Class.class,
+    // "reflectionData")`。HotSpot 返字段在对象布局中的真实字节偏移;rustj **无真实内存偏移**,
+    // 改返字段在声明类扁平实例布局中的**序号**(ord)——后续 `compareAndSetReference` 用同一 ord
+    // 索引实例槽位,内部自洽。第 1 参 = 声明类的 Class 镜像(如 Class.class 镜像),第 2 参 =
+    // 字段名(真 String 实例)。未找到字段 → 返 -1(public 包装器据 `< 0` 抛 InternalError)。
+    ("jdk/internal/misc/Unsafe", "objectFieldOffset1", "(Ljava/lang/Class;Ljava/lang/String;)J") => |vm, _this, args| object_field_offset(vm, args);
 
-        // jdk.internal.misc.Unsafe.compareAndSetReference(O,J,expected,x)Z —— Unsafe.java:1453
-        // native。`Class$Atomic.casReflectionData` 经 `reflectionData()`/`newReflectionData` 的
-        // `while(true)` 重试调之:单线程首 CAS **必须成功**否则死循环。HotSpot 做真实引用 CAS;
-        // rustj 用 ord(由 `objectFieldOffset1` 给出)读实例当前槽,与 expected 比较引用身份
-        // (同 id 或同 null)→ 相等则写新、返 true,否则 false。仅 Slot::Reference 字段
-        // (reflectionData/annotationType/annotationData 均引用字段);非引用槽 → false。
-        (
-            "jdk/internal/misc/Unsafe",
-            "compareAndSetReference",
-            "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
-        ) => compare_and_set_reference(vm, args),
+    // jdk.internal.misc.Unsafe.compareAndSetReference(O,J,expected,x)Z —— Unsafe.java:1453
+    // native。`Class$Atomic.casReflectionData` 经 `reflectionData()`/`newReflectionData` 的
+    // `while(true)` 重试调之:单线程首 CAS **必须成功**否则死循环。HotSpot 做真实引用 CAS;
+    // rustj 用 ord(由 `objectFieldOffset1` 给出)读实例当前槽,与 expected 比较引用身份
+    // (同 id 或同 null)→ 相等则写新、返 true,否则 false。仅 Slot::Reference 字段
+    // (reflectionData/annotationType/annotationData 均引用字段);非引用槽 → false。
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndSetReference",
+        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+    ) => |vm, _this, args| compare_and_set_reference(vm, args);
 
-        // jdk.internal.misc.Unsafe.compareAndSetInt(O,J,expected,x)Z —— Unsafe.java:1514 native,
-        // @IntrinsicCandidate(C11 atomic_compare_exchange_strong)。并发山起手:CHM 的 sizeCtl/
-        // cellsBusy/lockState 等 volatile int 字段经之 CAS(initTable/transfer/counterCells)。
-        // rustj 单线程:ord = offset;读实例当前 int 槽 == expected → 写 x 返 true,否则 false。
-        // 仅 Slot::Int 字段;非 int 槽/非 Instance → false(不抛)。镜像 compareAndSetReference 之 int 版。
-        (
-            "jdk/internal/misc/Unsafe",
-            "compareAndSetInt",
-            "(Ljava/lang/Object;JII)Z",
-        ) => compare_and_set_int(vm, args),
+    // jdk.internal.misc.Unsafe.compareAndSetInt(O,J,expected,x)Z —— Unsafe.java:1514 native,
+    // @IntrinsicCandidate(C11 atomic_compare_exchange_strong)。并发山起手:CHM 的 sizeCtl/
+    // cellsBusy/lockState 等 volatile int 字段经之 CAS(initTable/transfer/counterCells)。
+    // rustj 单线程:ord = offset;读实例当前 int 槽 == expected → 写 x 返 true,否则 false。
+    // 仅 Slot::Int 字段;非 int 槽/非 Instance → false(不抛)。镜像 compareAndSetReference 之 int 版。
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndSetInt",
+        "(Ljava/lang/Object;JII)Z",
+    ) => |vm, _this, args| compare_and_set_int(vm, args);
 
-        // jdk.internal.misc.Unsafe volatile 读写原语族(Layer 4.22)——并发山正式入场。CHM 的
-        // `Node[] table` 经 `tabAt`(CHM.java:771)→ `getReferenceAcquire`(非 native 委派)→
-        // `getReferenceVolatile`(Unsafe.java:2117 native)按 byte 偏移读引用槽;`initTable` 的 sizeCtl
-        // 经 `compareAndSetInt`(已绑),`transfer` 的 transferIndex(volatile long)经 `compareAndSetLong`
-        // (Unsafe.java:2061)。acquire/release/weak/getAndAddInt 均为**非 native 字节码委派**(转调下列
-        // native),故仅需绑这 6 个 native。**单线程下 volatile=plain**(无重排/内存屏障):read/write/CAS
-        // 退化为普通槽访问。共用 offset→slot 模型:Instance=ord(同 compareAndSetInt),Array=(offset-ABASE)/scale
-        // 索引(对象数组 scale=1,故 index=offset-16;CHM.tabAt 的 offset=(i<<ASHIFT)+ABASE,ASHIFT=0)。
-        (
-            "jdk/internal/misc/Unsafe",
-            "getReferenceVolatile",
-            "(Ljava/lang/Object;J)Ljava/lang/Object;",
-        ) => get_reference_volatile(vm, args),
-        (
-            "jdk/internal/misc/Unsafe",
-            "putReferenceVolatile",
-            "(Ljava/lang/Object;JLjava/lang/Object;)V",
-        ) => put_reference_volatile(vm, args),
-        (
-            "jdk/internal/misc/Unsafe",
-            "getIntVolatile",
-            "(Ljava/lang/Object;J)I",
-        ) => get_int_volatile(vm, args),
-        (
-            "jdk/internal/misc/Unsafe",
-            "putIntVolatile",
-            "(Ljava/lang/Object;JI)V",
-        ) => put_int_volatile(vm, args),
-        // jdk.internal.misc.Unsafe.getLongVolatile(Object,long)J —— Unsafe.java:2439 native。
-        // **Phase B.4a**:o=null + NEXT_THREAD_ID_OFFSET → 堆外「下一 tid」计数器
-        //(ThreadIdentifiers.next()→getAndAddLong 路径);否则 Instance=ord 读 long 槽(单线程 volatile=plain)。
-        ("jdk/internal/misc/Unsafe", "getLongVolatile", "(Ljava/lang/Object;J)J") => {
-            get_long_volatile(vm, args)
-        }
-        (
-            "jdk/internal/misc/Unsafe",
-            "compareAndSetLong",
-            "(Ljava/lang/Object;JJJ)Z",
-        ) => compare_and_set_long(vm, args),
-        (
-            "jdk/internal/misc/Unsafe",
-            "compareAndExchangeInt",
-            "(Ljava/lang/Object;JII)I",
-        ) => compare_and_exchange_int(vm, args),
+    // jdk.internal.misc.Unsafe volatile 读写原语族(Layer 4.22)——并发山正式入场。CHM 的
+    // `Node[] table` 经 `tabAt`(CHM.java:771)→ `getReferenceAcquire`(非 native 委派)→
+    // `getReferenceVolatile`(Unsafe.java:2117 native)按 byte 偏移读引用槽;`initTable` 的 sizeCtl
+    // 经 `compareAndSetInt`(已绑),`transfer` 的 transferIndex(volatile long)经 `compareAndSetLong`
+    // (Unsafe.java:2061)。acquire/release/weak/getAndAddInt 均为**非 native 字节码委派**(转调下列
+    // native),故仅需绑这 6 个 native。**单线程下 volatile=plain**(无重排/内存屏障):read/write/CAS
+    // 退化为普通槽访问。共用 offset→slot 模型:Instance=ord(同 compareAndSetInt),Array=(offset-ABASE)/scale
+    // 索引(对象数组 scale=1,故 index=offset-16;CHM.tabAt 的 offset=(i<<ASHIFT)+ABASE,ASHIFT=0)。
+    (
+        "jdk/internal/misc/Unsafe",
+        "getReferenceVolatile",
+        "(Ljava/lang/Object;J)Ljava/lang/Object;",
+    ) => |vm, _this, args| get_reference_volatile(vm, args);
+    (
+        "jdk/internal/misc/Unsafe",
+        "putReferenceVolatile",
+        "(Ljava/lang/Object;JLjava/lang/Object;)V",
+    ) => |vm, _this, args| put_reference_volatile(vm, args);
+    (
+        "jdk/internal/misc/Unsafe",
+        "getIntVolatile",
+        "(Ljava/lang/Object;J)I",
+    ) => |vm, _this, args| get_int_volatile(vm, args);
+    (
+        "jdk/internal/misc/Unsafe",
+        "putIntVolatile",
+        "(Ljava/lang/Object;JI)V",
+    ) => |vm, _this, args| put_int_volatile(vm, args);
+    // jdk.internal.misc.Unsafe.getLongVolatile(Object,long)J —— Unsafe.java:2439 native。
+    // **Phase B.4a**:o=null + NEXT_THREAD_ID_OFFSET → 堆外「下一 tid」计数器
+    //(ThreadIdentifiers.next()→getAndAddLong 路径);否则 Instance=ord 读 long 槽(单线程 volatile=plain)。
+    ("jdk/internal/misc/Unsafe", "getLongVolatile", "(Ljava/lang/Object;J)J") => |vm, _this, args| get_long_volatile(vm, args);
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndSetLong",
+        "(Ljava/lang/Object;JJJ)Z",
+    ) => |vm, _this, args| compare_and_set_long(vm, args);
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndExchangeInt",
+        "(Ljava/lang/Object;JII)I",
+    ) => |vm, _this, args| compare_and_exchange_int(vm, args);
 
-        // jdk.internal.misc.Unsafe.ensureClassInitialized0(Ljava/lang/Class;)V —— Unsafe.java:3878
-        // `private native`(jmod javap 实测确认;Unsafe.java:1190 字节码 `ensureClassInitialized`
-        // null-check 后委派本 native)。强制目标类跑 <clinit>(JVMS-5.5;等价
-        // `JVM_EnsureClassInitialization`)。取 Class 镜像内部名转调既有 `ensure_class_initialized`
-        //(clinit.rs:幂等 Done/InProgress→返、Failed→NoClassDefFoundError、NotStarted→超类先+本类
-        // clinit,异常包 ExceptionInInitializerError)。null 参 → NPE(契约同 ensureClassInitialized)。
-        // 解锁 URLClassPath.<clinit> → SharedSecrets.getJavaNetURLAccess → ensureClassInitialized(URL)
-        // → MethodHandles$Lookup.ensureInitialized 链。
-        ("jdk/internal/misc/Unsafe", "ensureClassInitialized0", "(Ljava/lang/Class;)V") => {
-            ensure_class_initialized_0(vm, args)
-        }
+    // jdk.internal.misc.Unsafe.ensureClassInitialized0(Ljava/lang/Class;)V —— Unsafe.java:3878
+    // `private native`(jmod javap 实测确认;Unsafe.java:1190 字节码 `ensureClassInitialized`
+    // null-check 后委派本 native)。强制目标类跑 <clinit>(JVMS-5.5;等价
+    // `JVM_EnsureClassInitialization`)。取 Class 镜像内部名转调既有 `ensure_class_initialized`
+    //(clinit.rs:幂等 Done/InProgress→返、Failed→NoClassDefFoundError、NotStarted→超类先+本类
+    // clinit,异常包 ExceptionInInitializerError)。null 参 → NPE(契约同 ensureClassInitialized)。
+    // 解锁 URLClassPath.<clinit> → SharedSecrets.getJavaNetURLAccess → ensureClassInitialized(URL)
+    // → MethodHandles$Lookup.ensureInitialized 链。
+    ("jdk/internal/misc/Unsafe", "ensureClassInitialized0", "(Ljava/lang/Class;)V") => |vm, _this, args| ensure_class_initialized_0(vm, args);
 
-        // jdk.internal.misc.Unsafe.shouldBeInitialized0(Ljava/lang/Class;)Z —— Unsafe.java:3877
-        // `private native`(Unsafe.java:1172 字节码 `shouldBeInitialized` 委派本 native)。返 true =
-        // 类尚未初始化(调 ensureClassInitialized 会有效果)。取 Class 镜像名 → 查 `init_state`;
-        // 非 Done 即需初始化。解锁 DirectMethodHandle.shouldBeInitialized → DMH ensureInitialized 判定。
-        ("jdk/internal/misc/Unsafe", "shouldBeInitialized0", "(Ljava/lang/Class;)Z") => {
-            should_be_initialized_0(vm, args)
-        }
+    // jdk.internal.misc.Unsafe.shouldBeInitialized0(Ljava/lang/Class;)Z —— Unsafe.java:3877
+    // `private native`(Unsafe.java:1172 字节码 `shouldBeInitialized` 委派本 native)。返 true =
+    // 类尚未初始化(调 ensureClassInitialized 会有效果)。取 Class 镜像名 → 查 `init_state`;
+    // 非 Done 即需初始化。解锁 DirectMethodHandle.shouldBeInitialized → DMH ensureInitialized 判定。
+    ("jdk/internal/misc/Unsafe", "shouldBeInitialized0", "(Ljava/lang/Class;)Z") => |vm, _this, args| should_be_initialized_0(vm, args);
 
-        // jdk.internal.misc.Unsafe.fullFence()V —— Unsafe.java:3472 `public native`(唯一 fence native;
-        // storeFence/loadFence 为 @IntrinsicCandidate 字节码,无 intrinsic 时 fall back 调 fullFence)。
-        // 内存屏障(StoreLoad+LoadLoad+StoreStore+LoadStore);rustj 单线程模型无重排 → **no-op**。
-        // 解锁 ClassSpecializer.linkCodeToSpeciesData(ClassSpecializer.java:936/943)的 `UNSAFE.storeFence()`
-        // 物种数据链接(write SpeciesData 到 species 类静态字段前后)。
-        ("jdk/internal/misc/Unsafe", "fullFence", "()V") => Ok(Value::Void),
+    // jdk.internal.misc.Unsafe.fullFence()V —— Unsafe.java:3472 `public native`(唯一 fence native;
+    // storeFence/loadFence 为 @IntrinsicCandidate 字节码,无 intrinsic 时 fall back 调 fullFence)。
+    // 内存屏障(StoreLoad+LoadLoad+StoreStore+LoadStore);rustj 单线程模型无重排 → **no-op**。
+    // 解锁 ClassSpecializer.linkCodeToSpeciesData(ClassSpecializer.java:936/943)的 `UNSAFE.storeFence()`
+    // 物种数据链接(write SpeciesData 到 species 类静态字段前后)。
+    ("jdk/internal/misc/Unsafe", "fullFence", "()V") => |_vm, _this, _args| Ok(Value::Void);
 
-        // jdk.internal.misc.Unsafe.putReference/getReference(O,J...) —— Unsafe.java native
-        //(jmod javap 实测 `public final native`;@IntrinsicCandidate)。**Phase G.1b**:物种 SD 字段链接
-        //(ClassSpecializer.java:938/913)经之读写物种类的静态 speciesData 字段——base = 声明类 Class 镜像
-        //(由 `staticFieldBase` 给)、offset = 静态字段序号(由 `staticFieldOffset` 给)。故须 **Class 镜像
-        // 路由**:base 是 Class 镜像(`mirror_internal_name` Some)→ 写/读该类 `static_storage[ord]`;
-        // 否则退化为实例/数组(`write_slot`/`read_slot`,单线程 volatile=plain)。解锁 BMH.<clinit>
-        // 物种生成链 defineClass→linkCodeToSpeciesData 的 putReference/readSpeciesDataFromCode 的 getReference。
-        (
-            "jdk/internal/misc/Unsafe",
-            "putReference",
-            "(Ljava/lang/Object;JLjava/lang/Object;)V",
-        ) => put_reference(vm, args),
-        (
-            "jdk/internal/misc/Unsafe",
-            "getReference",
-            "(Ljava/lang/Object;J)Ljava/lang/Object;",
-        ) => get_reference(vm, args),
+    // jdk.internal.misc.Unsafe.putReference/getReference(O,J...) —— Unsafe.java native
+    //(jmod javap 实测 `public final native`;@IntrinsicCandidate)。**Phase G.1b**:物种 SD 字段链接
+    //(ClassSpecializer.java:938/913)经之读写物种类的静态 speciesData 字段——base = 声明类 Class 镜像
+    //(由 `staticFieldBase` 给)、offset = 静态字段序号(由 `staticFieldOffset` 给)。故须 **Class 镜像
+    // 路由**:base 是 Class 镜像(`mirror_internal_name` Some)→ 写/读该类 `static_storage[ord]`;
+    // 否则退化为实例/数组(`write_slot`/`read_slot`,单线程 volatile=plain)。解锁 BMH.<clinit>
+    // 物种生成链 defineClass→linkCodeToSpeciesData 的 putReference/readSpeciesDataFromCode 的 getReference。
+    (
+        "jdk/internal/misc/Unsafe",
+        "putReference",
+        "(Ljava/lang/Object;JLjava/lang/Object;)V",
+    ) => |vm, _this, args| put_reference(vm, args);
+    (
+        "jdk/internal/misc/Unsafe",
+        "getReference",
+        "(Ljava/lang/Object;J)Ljava/lang/Object;",
+    ) => |vm, _this, args| get_reference(vm, args);
 
-        // 注:addressSize()/pageSize()/isBigEndian()/unalignedAccess() 均为返回常量字段
-        // (ADDRESS_SIZE / PAGE_SIZE / BIG_ENDIAN / UNALIGNED_ACCESS)的字节码方法;这些字段在
-        // Unsafe.class 中已是字面量初始化(不经 native),故 <clinit> 无更多 native 依赖。
-
-        // 未登记 → UnsatisfiedLinkError。
-        _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
-    }
+    // 注:addressSize()/pageSize()/isBigEndian()/unalignedAccess() 均为返回常量字段
+    // (ADDRESS_SIZE / PAGE_SIZE / BIG_ENDIAN / UNALIGNED_ACCESS)的字节码方法;这些字段在
+    // Unsafe.class 中已是字面量初始化(不经 native),故 <clinit> 无更多 native 依赖。
 }
 
 /// Unsafe byte[] 访问的偏移 → 索引:`ARRAY_BYTE_BASE_OFFSET(16) + index` 的逆算。

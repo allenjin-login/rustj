@@ -7,8 +7,9 @@
 //! `os::dll_load` / `dll_unload` / `dll_lookup`——rustj 移植为 [`crate::runtime::os`]
 //! (跨平台 `LoadLibraryW`/`GetProcAddress`/`FreeLibrary`/`GetModuleHandleW`)。
 //!
-//! 由 [`super::dispatch`] 按声明类路由至此(`jdk/internal/loader/NativeLibraries` /
-//! `jdk/internal/loader/NativeLibrary`)。
+//! 由 [`super`] 的 `NativeRegistry` 按 (class,name,desc) 命中——`register_all` 时调本模块
+//! `register`([`natives!`] 生成)登记各条;`invoke_inner` 查表得 fn 指针即调
+//! (`jdk/internal/loader/NativeLibraries` / `NativeLibrary` / `BootLoader`)。
 //!
 //! **Step 0 源码依据**:
 //! - NativeLibraries.c:102 `load(impl, name, isBuiltin, throwExceptionIfFail)Z`:
@@ -32,59 +33,47 @@ use crate::runtime::{os, Reference, Slot, Value, VmThread, VmError};
 
 use super::super::{string, throw_exception};
 
-/// `jdk/internal/loader/*` native 分派。未登记 → `UnsatisfiedLinkError`。
-pub(super) fn dispatch(
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-    _this: Option<Reference>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    match (class, name, desc) {
-        // NativeLibraries.load(impl, name, isBuiltin, throwExceptionIfFail)Z —— 描述符经 jmod 实测
-        // (NativeLibraries.class,major 69)。isBuiltin→process_handle;否则 os::dll_load(name)。
-        (
-            "jdk/internal/loader/NativeLibraries",
-            "load",
-            "(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z",
-        ) => native_load(vm, args),
+natives! {
+    // NativeLibraries.load(impl, name, isBuiltin, throwExceptionIfFail)Z —— 描述符经 jmod 实测
+    // (NativeLibraries.class,major 69)。isBuiltin→process_handle;否则 os::dll_load(name)。
+    (
+        "jdk/internal/loader/NativeLibraries",
+        "load",
+        "(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z",
+    ) => |vm, _this, args| native_load(vm, args);
 
-        // NativeLibraries.unload(name, isBuiltin, handle)V —— 描述符经 jmod 实测。rustj 无
-        // JNI_OnUnload 调用环境;仅 !isBuiltin 时 os::dll_unload。恒空操作返回。
-        (
-            "jdk/internal/loader/NativeLibraries",
-            "unload",
-            "(Ljava/lang/String;ZJ)V",
-        ) => native_unload(vm, args),
+    // NativeLibraries.unload(name, isBuiltin, handle)V —— 描述符经 jmod 实测。rustj 无
+    // JNI_OnUnload 调用环境;仅 !isBuiltin 时 os::dll_unload。恒空操作返回。
+    (
+        "jdk/internal/loader/NativeLibraries",
+        "unload",
+        "(Ljava/lang/String;ZJ)V",
+    ) => |vm, _this, args| native_unload(vm, args);
 
-        // NativeLibraries.findBuiltinLib(name)String —— 描述符经 jmod 实测。rustj 无静态链接
-        // builtin 库 → 恒 null(上层 loadLibrary 据 null 走 !isBuiltin 分支 = dll_load 路径)。
-        (
-            "jdk/internal/loader/NativeLibraries",
-            "findBuiltinLib",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-        ) => Ok(Value::Reference(Reference::null())),
+    // NativeLibraries.findBuiltinLib(name)String —— 描述符经 jmod 实测。rustj 无静态链接
+    // builtin 库 → 恒 null(上层 loadLibrary 据 null 走 !isBuiltin 分支 = dll_load 路径)。
+    (
+        "jdk/internal/loader/NativeLibraries",
+        "findBuiltinLib",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ) => |_vm, _this, _args| Ok(Value::Reference(Reference::null()));
 
-        // NativeLibrary.findEntry0(handle, name)J —— 描述符经 jmod 实测 = os::dll_lookup。
-        (
-            "jdk/internal/loader/NativeLibrary",
-            "findEntry0",
-            "(JLjava/lang/String;)J",
-        ) => find_entry0(vm, args),
+    // NativeLibrary.findEntry0(handle, name)J —— 描述符经 jmod 实测 = os::dll_lookup。
+    (
+        "jdk/internal/loader/NativeLibrary",
+        "findEntry0",
+        "(JLjava/lang/String;)J",
+    ) => |vm, _this, args| find_entry0(vm, args);
 
-        // BootLoader.setBootLoaderUnnamedModule0(Module)V —— BootLoader.java:334 private static
-        // native。<clinit>:71 调用。HotSpot JVM_SetBootLoaderUnnamedModule 把 boot loader 关联其
-        // unnamed module 到原生模块层;rustj 纯 Rust 模型无原生模块层 → 空操作(Module 已 Java 侧
-        // 经 jla.defineUnnamedModule 建)。解锁 WindowsNativeDispatcher.<clinit>→BootLoader.<clinit>。
-        (
-            "jdk/internal/loader/BootLoader",
-            "setBootLoaderUnnamedModule0",
-            "(Ljava/lang/Module;)V",
-        ) => Ok(Value::Void),
-
-        _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
-    }
+    // BootLoader.setBootLoaderUnnamedModule0(Module)V —— BootLoader.java:334 private static
+    // native。<clinit>:71 调用。HotSpot JVM_SetBootLoaderUnnamedModule 把 boot loader 关联其
+    // unnamed module 到原生模块层;rustj 纯 Rust 模型无原生模块层 → 空操作(Module 已 Java 侧
+    // 经 jla.defineUnnamedModule 建)。解锁 WindowsNativeDispatcher.<clinit>→BootLoader.<clinit>。
+    (
+        "jdk/internal/loader/BootLoader",
+        "setBootLoaderUnnamedModule0",
+        "(Ljava/lang/Module;)V",
+    ) => |_vm, _this, _args| Ok(Value::Void);
 }
 
 /// 取实例的声明类内部名(写回字段时按类反查扁平布局序号)。

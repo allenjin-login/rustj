@@ -30,7 +30,7 @@ use super::{Value, VmError};
 /// **非捕获**(在 `register(..., f: NativeFn)` 位协变为零成本 fn 指针;捕获即编译错——护栏)。
 /// 须定义于子模块声明**之前**(文本作用域:子 mod 方能用裸 `natives!`)。用法见各 `native/<pkg>.rs`。
 macro_rules! natives {
-    ( $( ($class:literal, $name:literal, $desc:literal) => $body:expr );* $(;)? ) => {
+    ( $( ($class:literal, $name:literal, $desc:literal $(,)?) => $body:expr );* $(;)? ) => {
         pub(super) fn register(reg: &mut $crate::runtime::interpreter::native::NativeRegistry) {
             $(
                 reg.register($class, $name, $desc, $body);
@@ -122,10 +122,6 @@ fn dispatch(
         "jdk/internal/misc/VM" | "jdk/internal/misc/CDS" | "jdk/internal/misc/Unsafe" => {
             jdk_internal::dispatch(vm, class, name, desc, this, args)
         }
-        "jdk/internal/loader/NativeLibraries" | "jdk/internal/loader/NativeLibrary"
-        | "jdk/internal/loader/BootLoader" => {
-            jdk_internal_loader::dispatch(vm, class, name, desc, this, args)
-        }
         c if c.starts_with("jdk/internal/reflect/") => {
             jdk_internal_reflect::dispatch(vm, c, name, desc, this, args)
         }
@@ -146,6 +142,7 @@ fn throw_unsatisfied_link_error(vm: &mut VmThread, class: &str, name: &str, desc
 /// **Task 3 阶段为空**(所有模块仍走 `dispatch` fallback);全部迁完后 fallback 删除(Task 11)。
 pub(crate) fn register_all(reg: &mut NativeRegistry) {
     sun_nio_fs::register(reg);
+    jdk_internal_loader::register(reg);
 }
 
 /// 原语关键字名(`"int"`/…/`"void"`)判定——`name2type` 的等价物

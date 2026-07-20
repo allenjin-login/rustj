@@ -13,4 +13,5 @@ name = "rustj"
 version = "0.1.0"
 dependencies = [
  "bimap",
+ "rustj",
 ]

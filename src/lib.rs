@@ -15,3 +15,6 @@ pub mod constant_pool;
 pub mod metadata;
 pub mod oops;
 pub mod runtime;
+
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;

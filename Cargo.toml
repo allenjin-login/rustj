@@ -7,3 +7,13 @@ edition = "2024"
 # bimap:Class 镜像双向表(name↔ref 双射;用户授权本次破零依赖,取代手写双 HashMap——
 # 双射不变量 + 双向查询由库保证)。
 bimap = "0.6"
+
+[features]
+# testkit:集成测试公用基础设施(compile/run/守卫宏/断言宏)。dev-deps 自引用使
+# `cargo test` 无参启用;`cargo build`/release 不启用 → 不带测试 dead code。
+testkit = []
+
+[dev-dependencies]
+# 自引用:让 `cargo test` 编译 tests/*.rs 时自动启用 testkit feature
+#(cfg(test) 对集成测试无效,故走 feature + dev-deps)。
+rustj = { path = ".", features = ["testkit"] }

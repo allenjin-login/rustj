@@ -15,6 +15,7 @@ pub mod launch;
 pub(crate) mod native;
 pub(crate) mod string;
 mod type_check;
+pub(crate) mod cp_util;
 
 use crate::bytecode::opcode::{BytecodeError, Opcode};
 use crate::classfile::attributes::ExceptionTableEntry;

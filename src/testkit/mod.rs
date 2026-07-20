@@ -6,8 +6,10 @@
 //! 用法(`tests/*.rs`):`use rustj::testkit::*;` 引入函数;宏经 `#[macro_export]`
 //! 在 crate 根,`use rustj::testkit::*;` 亦经下方 `pub use` 引入。
 
+pub mod compile;
 pub mod env;
 
+pub use compile::{compile, compile_and_load, compile_dir, load_dir};
 pub use env::{find_javabase_jmod, javac_available};
 pub use crate::{require_javabase, require_javac};
 

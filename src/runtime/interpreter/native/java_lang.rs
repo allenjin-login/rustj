@@ -1,6 +1,7 @@
 //! `java/lang/*` 的 native 桥(`Throwable` / `Object` / `System` / `Float` / `Double` /
 //! `Class` / `Runtime` / `String` / `StackTraceElement`)。语义移植自 `prims/jvm.cpp` 的
-//! `JVM_*` 与 JDK 侧 `Java_*`。由 [`super::dispatch`] 按 `"java/lang/"` 前缀路由至此。
+//! `JVM_*` 与 JDK 侧 `Java_*`。经 [`NativeRegistry`] 按 (class,name,desc) 登记(`register_all` 时调
+//! 本模块 `register` —— [`natives!`] 宏生成),`invoke_inner` 查表得 fn 指针即调。
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,33 +10,24 @@ use crate::runtime::{Reference, Slot, Value, VmThread, VmError};
 
 use super::super::{capture_backtrace, throw_exception};
 
-/// `java/lang/*` native 分派。未登记(类前缀命中但 (name,desc) 不匹配)→ `UnsatisfiedLinkError`。
-pub(super) fn dispatch(
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-    this: Option<Reference>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    match (class, name, desc) {
+natives! {
         // Throwable.fillInStackTrace(I)Ljava/lang/Throwable; —— 每个 Throwable 构造器首调
         // (捕获栈回溯)。rustj 经 capture_backtrace 快照调用链入 exception_meta 并置真
         // Throwable 的 backtrace/depth 字段,对应 HotSpot 的栈回溯捕获;返回 this 以便链式。
-        ("java/lang/Throwable", "fillInStackTrace", "(I)Ljava/lang/Throwable;") => match this {
+        ("java/lang/Throwable", "fillInStackTrace", "(I)Ljava/lang/Throwable;") => |vm, this, _args| match this {
             Some(r) => {
                 capture_backtrace(vm, r);
                 Ok(Value::Reference(r))
             }
             None => Err(throw_exception(vm, "java/lang/NullPointerException")),
-        },
+        };
 
         // Object.hashCode()I —— synchronizer.cpp get_next_hash mode 4(对象标识/地址)。
         // 句柄 id 即堆上唯一标识;null 收者(理论不可达,实例方法)兜底 0。
-        ("java/lang/Object", "hashCode", "()I") => {
+        ("java/lang/Object", "hashCode", "()I") => |_vm, this, _args| {
             let id = this.and_then(Reference::id).unwrap_or(0) as i32;
             Ok(Value::Int(id))
-        }
+        };
 
         // System.identityHashCode(Object)I —— System.java:497 @IntrinsicCandidate public static
         // native。jvm.cpp:629 JVM_IHashCode:`handle==nullptr ? 0 : FastHashCode(obj)`(jvm.cpp:631)。
@@ -43,13 +35,13 @@ pub(super) fn dispatch(
         // 直接 `id as i32`(null → 0)。静态法:receiver(None);args[0]=Object x。
         // 解锁 Enum.hashCode:190→ImmutableCollections$SetN.probe→Set.of→FileSystemProvider.<clinit>
         // →DefaultFileSystemProvider.<clinit>→FileSystems.getDefault→Path.of。
-        ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => {
+        ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => |_vm, _this, args| {
             let id = match args.first().copied() {
                 Some(Value::Reference(r)) => Reference::id(r).unwrap_or(0) as i32,
                 _ => 0,
             };
             Ok(Value::Int(id))
-        }
+        };
 
         // Object.notify()/notifyAll() + wait0(long) —— jvm.cpp JVM_MonitorNotify/NotifyAll/Wait;
         // 语义移植自 ObjectSynchronizer::notify/notifyall/wait(synchronizer.cpp:543/556/514)。
@@ -60,16 +52,16 @@ pub(super) fn dispatch(
         // wait()V(352)→wait(0)、wait(J)V(377)→`wait0(J)`、wait(JI)V(492)→wait(J) **皆为字节码包装**,
         // 唯一 native 为 `wait0(J)V`(396,private final)。故本表绑 `wait0` 为真路径;wait()V/wait(J)V/
         // wait(JI)V 为防御性兜底(桩/非 JDK25 Object 若直接声 native 时可达,真 Object 永经字节码→wait0)。
-        ("java/lang/Object", "notify", "()V") => match this {
+        ("java/lang/Object", "notify", "()V") => |vm, this, _args| match this {
             None => Err(throw_exception(vm, "java/lang/NullPointerException")),
             Some(r) => vm.object_notify(r).map(|()| Value::Void),
-        },
-        ("java/lang/Object", "notifyAll", "()V") => match this {
+        };
+        ("java/lang/Object", "notifyAll", "()V") => |vm, this, _args| match this {
             None => Err(throw_exception(vm, "java/lang/NullPointerException")),
             Some(r) => vm.object_notify_all(r).map(|()| Value::Void),
-        },
+        };
         // wait0(long):真 native(Object.java:396)。wait(J)/wait()/wait(JI) 字节码包装最终汇此。
-        ("java/lang/Object", "wait0", "(J)V") => match this {
+        ("java/lang/Object", "wait0", "(J)V") => |vm, this, args| match this {
             None => Err(throw_exception(vm, "java/lang/NullPointerException")),
             Some(r) => {
                 let millis = match args.first().copied() {
@@ -78,13 +70,13 @@ pub(super) fn dispatch(
                 };
                 vm.object_wait(r, millis).map(|()| Value::Void)
             }
-        },
+        };
         // 防御性兜底:若 Object 以 native 形式声 wait(桩/非 JDK25),委派 object_wait 保语义一致。
-        ("java/lang/Object", "wait", "()V") => match this {
+        ("java/lang/Object", "wait", "()V") => |vm, this, _args| match this {
             None => Err(throw_exception(vm, "java/lang/NullPointerException")),
             Some(r) => vm.object_wait(r, 0).map(|()| Value::Void),
-        },
-        ("java/lang/Object", "wait", "(J)V") => match this {
+        };
+        ("java/lang/Object", "wait", "(J)V") => |vm, this, args| match this {
             None => Err(throw_exception(vm, "java/lang/NullPointerException")),
             Some(r) => {
                 let millis = match args.first().copied() {
@@ -93,8 +85,8 @@ pub(super) fn dispatch(
                 };
                 vm.object_wait(r, millis).map(|()| Value::Void)
             }
-        },
-        ("java/lang/Object", "wait", "(JI)V") => match this {
+        };
+        ("java/lang/Object", "wait", "(JI)V") => |vm, this, args| match this {
             None => Err(throw_exception(vm, "java/lang/NullPointerException")),
             Some(r) => {
                 // nanos 仅亚毫秒取整(JDK 侧 wait(JI) 归并到毫秒);rustj 忽略 nanos 用 millis。
@@ -104,13 +96,13 @@ pub(super) fn dispatch(
                 };
                 vm.object_wait(r, millis).map(|()| Value::Void)
             }
-        },
+        };
 
         // Object.getClass()Ljava/lang/Class; —— Object.java:68 public final native
         // (HotSpot 为 intrinsic)。返接收者运行时类的 Class 镜像(intern:同类恒同引用,使
         // `obj.getClass() == Foo.class` 成立)。Instance→类名(Class 镜像自身为 java/lang/Class
         // Instance → 其 getClass 返 java/lang/Class 镜像,自洽);Array→数组描述符([I/…)。
-        ("java/lang/Object", "getClass", "()Ljava/lang/Class;") => {
+        ("java/lang/Object", "getClass", "()Ljava/lang/Class;") => |vm, this, _args| {
             let Some(r) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
@@ -123,14 +115,14 @@ pub(super) fn dispatch(
                 }
             };
             Ok(Value::Reference(vm.intern_class_mirror(&name)))
-        }
+        };
 
         // Object.clone()Ljava/lang/Object; —— Object.java:protect native。jvm.cpp JVM_Clone
         // (javaClasses.cpp `java_lang_Object` 浅拷贝):同运行时类的新对象,逐字段复制(实例)或
         // 逐元素复制(数组)。`Cloneable` 检查(JVM_Clone 抛 CloneNotSupportedException)暂略——
         // rustj 容忍非 Cloneable 类的 clone(仅 MemberName.clone 等内部用,均实现 Cloneable)。
         // 解锁 MemberName.clone(DirectMethodHandle.makePreparedFieldLambdaForm 调之)。
-        ("java/lang/Object", "clone", "()Ljava/lang/Object;") => {
+        ("java/lang/Object", "clone", "()Ljava/lang/Object;") => |vm, this, _args| {
             let Some(r) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
@@ -141,13 +133,13 @@ pub(super) fn dispatch(
                 None => return Err(throw_exception(vm, "java/lang/InternalError")),
             };
             Ok(Value::Reference(vm.heap_mut().alloc(cloned)))
-        }
+        };
 
         // System.arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V —— jvm.cpp:293-305
         // JVM_ArrayCopy → typeArrayKlass/objArrayKlass::copy_array。检查序(null→NPE、
         // 非数组/类型不符→ASE、负值/越界→AIOOBE)、引用 checkcast、重叠 memmove 见
         // `arraycopy::system_arraycopy`。高价值 native:解锁 StringBuilder/String 字节拷贝。
-        ("java/lang/System", "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V") => {
+        ("java/lang/System", "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V") => |vm, _this, args| {
             let (src, src_pos, dst, dst_pos, length) =
                 match (args.first(), args.get(1), args.get(2), args.get(3), args.get(4)) {
                     (
@@ -160,34 +152,32 @@ pub(super) fn dispatch(
                     _ => return Err(VmError::BadConstant("arraycopy 实参缺失/类型不符")),
                 };
             super::super::arraycopy::system_arraycopy(vm, src, src_pos, dst, dst_pos, length)
-        }
+        };
 
         // Array.newArray(Class componentType, int length)Object —— reflect/Array.java:483 private
         // native(Array.newInstance:76 调)。按组件类型 + 长度造默认初始化数组。解锁
         // `LambdaForm$BasicType.<clinit>`(Arrays.copyOf→Array.newInstance)→ DMH LF 准备。
         // 对应 HotSpot reflect.cpp `JVM_NewArray` / arrayKlass 分派。
-        ("java/lang/reflect/Array", "newArray", "(Ljava/lang/Class;I)Ljava/lang/Object;") => {
-            array_new_array(vm, args)
-        }
+        ("java/lang/reflect/Array", "newArray", "(Ljava/lang/Class;I)Ljava/lang/Object;") => |vm, _this, args| array_new_array(vm, args);
 
         // System.currentTimeMillis()J —— jvm.cpp JVM_CurrentTimeMillis:墙钟毫秒(自 Unix 纪元)。
-        ("java/lang/System", "currentTimeMillis", "()J") => {
+        ("java/lang/System", "currentTimeMillis", "()J") => |_vm, _this, _args| {
             let millis = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             Ok(Value::Long(millis))
-        }
+        };
 
         // System.nanoTime()J —— jvm.cpp JVM_NanoTime。
         // 注:HotSpot 用单调高精度计数器;此处暂以墙钟纳秒充数(单调性债,顺延)。
-        ("java/lang/System", "nanoTime", "()J") => {
+        ("java/lang/System", "nanoTime", "()J") => |_vm, _this, _args| {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0);
             Ok(Value::Long(nanos))
-        }
+        };
 
         // Float/Double 的 IEEE-754 位转换 native(均 @IntrinsicCandidate)——位模式原样重解,
         // Rust `to_bits`/`from_bits` 安全实现。解锁 `Math.<clinit>`(其 negativeZeroFloatBits /
@@ -195,27 +185,27 @@ pub(super) fn dispatch(
         // 进而解锁 `Arrays.copyOfRange`(`Math.min`)→ `String.<init>` → `StringBuilder.toString`。
         // 注:`floatToIntBits`/`doubleToLongBits`(非 raw)是纯 Java 字节码包装器(NaN 折叠到
         // 规范值后转调本 raw native),故不入此表。
-        ("java/lang/Float", "floatToRawIntBits", "(F)I") => match args.first() {
+        ("java/lang/Float", "floatToRawIntBits", "(F)I") => |_vm, _this, args| match args.first() {
             Some(Value::Float(f)) => Ok(Value::Int(f.to_bits() as i32)),
             _ => Err(VmError::BadConstant("floatToRawIntBits 实参须为 float")),
-        },
-        ("java/lang/Float", "intBitsToFloat", "(I)F") => match args.first() {
+        };
+        ("java/lang/Float", "intBitsToFloat", "(I)F") => |_vm, _this, args| match args.first() {
             Some(Value::Int(i)) => Ok(Value::Float(f32::from_bits(*i as u32))),
             _ => Err(VmError::BadConstant("intBitsToFloat 实参须为 int")),
-        },
-        ("java/lang/Double", "doubleToRawLongBits", "(D)J") => match args.first() {
+        };
+        ("java/lang/Double", "doubleToRawLongBits", "(D)J") => |_vm, _this, args| match args.first() {
             Some(Value::Double(d)) => Ok(Value::Long(d.to_bits() as i64)),
             _ => Err(VmError::BadConstant("doubleToRawLongBits 实参须为 double")),
-        },
-        ("java/lang/Double", "longBitsToDouble", "(J)D") => match args.first() {
+        };
+        ("java/lang/Double", "longBitsToDouble", "(J)D") => |_vm, _this, args| match args.first() {
             Some(Value::Long(l)) => Ok(Value::Double(f64::from_bits(*l as u64))),
             _ => Err(VmError::BadConstant("longBitsToDouble 实参须为 long")),
-        },
+        };
 
         // Class.getPrimitiveClass(Ljava/lang/String;)Ljava/lang/Class;
         // —— jvm.cpp:770 JVM_FindPrimitiveClass:name2type → Universe::java_mirror。
         // 原语名 → Class 镜像;非原语名 → ClassNotFoundException。
-        ("java/lang/Class", "getPrimitiveClass", "(Ljava/lang/String;)Ljava/lang/Class;") => {
+        ("java/lang/Class", "getPrimitiveClass", "(Ljava/lang/String;)Ljava/lang/Class;") => |vm, _this, args| {
             let Value::Reference(r) = args.first().copied().unwrap_or(Value::Void) else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
@@ -228,7 +218,7 @@ pub(super) fn dispatch(
                 return Err(throw_exception(vm, "java/lang/ClassNotFoundException"));
             }
             Ok(Value::Reference(vm.intern_class_mirror(&text)))
-        }
+        };
 
         // Class.forName0(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;
         // —— Class.java 私有 static native,经 `forName(name, init, loader)` 调。第 4 参 `caller`
@@ -237,7 +227,7 @@ pub(super) fn dispatch(
         // `initialize=true` 触发 `ensure_class_initialized` → 返类镜像;未找到 →
         // `ClassNotFoundException`(jvm.cpp THROW_MSG_NULL)。loader 在 rustj 恒 Bootstrap
         // (Class.classLoader=null),故不查 ClassPath——反射仅解析已加载的类。
-        ("java/lang/Class", "forName0", "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;") => {
+        ("java/lang/Class", "forName0", "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;") => |vm, _this, args| {
             let Value::Reference(r) = args.first().copied().unwrap_or(Value::Void) else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
@@ -254,7 +244,7 @@ pub(super) fn dispatch(
                 super::super::clinit::ensure_class_initialized(vm, &internal)?;
             }
             Ok(Value::Reference(vm.intern_class_mirror(&internal)))
-        }
+        };
         // Class.getDeclaredFields0(Z)[Ljava/lang/reflect/Field; —— Class.java:3246 私有 native,
         // 经 `privateGetDeclaredFields`→`Reflection.filterFields`(透传)后由 `copyFields` 包装。
         // 移植 HotSpot semantics:遍历声明类 `cf.fields`,按 `publicOnly`(ACC_PUBLIC)过滤,逐字段
@@ -262,17 +252,13 @@ pub(super) fn dispatch(
         // 字段(`trustedFinal` 默认 false),返回 `[Ljava/lang/reflect/Field;`。`slot` = 字段在**本类
         // 声明序**(`copyField` 经 `Field.copy()` 透传;getName/getModifiers 不读 slot,4.15b get/set
         // 用到时再定语义)。`type` = 字段描述符→内部名→Class 镜像(原语 "I"→"int" 原语镜像)。
-        ("java/lang/Class", "getDeclaredFields0", "(Z)[Ljava/lang/reflect/Field;") => {
-            get_declared_fields0(vm, this, args)
-        }
+        ("java/lang/Class", "getDeclaredFields0", "(Z)[Ljava/lang/reflect/Field;") => get_declared_fields0;
         // Class.getDeclaredMethods0(Z)[Ljava/lang/reflect/Method; —— Class.java:3247 私有 native,
         // 经 `privateGetDeclaredMethods`→`Reflection.filterMethods`→`copyMethods` 包装。遍历声明类
         // `cf.methods`,按 publicOnly(ACC_PUBLIC)过滤,逐方法构造真 `java/lang/reflect/Method`
         // Instance 并置 `clazz`/`slot`/`name`/`returnType`/`parameterTypes`/`exceptionTypes`/`modifiers`
         // (`parameterTypes`/`exceptionTypes` 为 Class[],经方法描述符解析)。返 `[Ljava/lang/reflect/Method;`。
-        ("java/lang/Class", "getDeclaredMethods0", "(Z)[Ljava/lang/reflect/Method;") => {
-            get_declared_methods0(vm, this, args)
-        }
+        ("java/lang/Class", "getDeclaredMethods0", "(Z)[Ljava/lang/reflect/Method;") => get_declared_methods0;
         // Class.getDeclaredConstructors0(Z)[Ljava/lang/reflect/Constructor; —— Class.java:3248 私有
         // native,经 `privateGetDeclaredConstructors`→`Reflection.filterConstructors`→`copyConstructors`
         // 包装。构造器无 name/returnType,字段为 `clazz`/`slot`/`parameterTypes`/`exceptionTypes`/
@@ -281,11 +267,11 @@ pub(super) fn dispatch(
             "java/lang/Class",
             "getDeclaredConstructors0",
             "(Z)[Ljava/lang/reflect/Constructor;",
-        ) => get_declared_constructors0(vm, this, args),
+        ) => get_declared_constructors0;
         // Class.desiredAssertionStatus0(Ljava/lang/Class;)Z —— Class.java 真原生(`desiredAssertionStatus()`
         // 字节码 `return desiredAssertionStatus0(this)` 调)。rustj 无断言支持 → 恒 false(断言禁用,
         // 即 `$assertionsDisabled = true`)。
-        ("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z") => Ok(Value::Int(0)),
+        ("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z") => |_vm, _this, _args| Ok(Value::Int(0));
 
         // Class 的"声明上下文"查询族 —— 三 private native,均返 null 表示"无外层"(顶级类)。
         // 顶级/原语/数组类无 EnclosingMethod/declaring/simple-binary 信息;HotSpot 据类属性返 null。
@@ -294,14 +280,14 @@ pub(super) fn dispatch(
         // getDeclaringClass0=null→isTopLevelClass=true→getSimpleBinaryName 早返 null→getSimpleName0
         // 走"顶级类取名剥包"分支。嵌套/匿名类场景顺延(返 null 对它们不准确,本闸门仅顶级类)。
         ("java/lang/Class", "getEnclosingMethod0", "()[Ljava/lang/Object;") => {
-            Ok(Value::Reference(Reference::null()))
-        }
+            |_vm, _this, _args| Ok(Value::Reference(Reference::null()))
+        };
         ("java/lang/Class", "getDeclaringClass0", "()Ljava/lang/Class;") => {
-            Ok(Value::Reference(Reference::null()))
-        }
+            |_vm, _this, _args| Ok(Value::Reference(Reference::null()))
+        };
         ("java/lang/Class", "getSimpleBinaryName0", "()Ljava/lang/String;") => {
-            Ok(Value::Reference(Reference::null()))
-        }
+            |_vm, _this, _args| Ok(Value::Reference(Reference::null()))
+        };
 
         // Class.getConstantPool()Ljdk/internal/reflect/ConstantPool; —— Class.java 私有 native,供注解机制
         // (Executable.declaredAnnotations → AnnotationParser.parseAnnotations 取 CP 解析注解字节)。
@@ -311,27 +297,27 @@ pub(super) fn dispatch(
         // 正确返 false,解锁 `Method.invoke` 字节码路径。注解反射完整化(ConstantPool 17 natives + 真字节)
         // 顺延至注解层。此为 Layer 4.15b 探针驱动发现的最小桩。
         ("java/lang/Class", "getConstantPool", "()Ljdk/internal/reflect/ConstantPool;") => {
-            Ok(Value::Reference(Reference::null()))
-        }
+            |_vm, _this, _args| Ok(Value::Reference(Reference::null()))
+        };
         // Class.isHidden()Z —— Class.java:4033 真原生。rustj 无 hidden class(无 defineHiddenClass),
         // 恒 false。被 Class.descriptorString(Class.java:3956) 调用以区分隐式类描述符形;false → 走普通
         // `L<name>;` 分支。解锁 ClassSpecializer.<clinit>(ClassSpecializer.java:73 经 ConstantUtils.
         // referenceClassDesc → Class.descriptorString)。Phase G.0 探针驱动发现。
-        ("java/lang/Class", "isHidden", "()Z") => Ok(Value::Int(0)),
+        ("java/lang/Class", "isHidden", "()Z") => |_vm, _this, _args| Ok(Value::Int(0));
         // Method/Constructor.getAnnotationBytes()[B —— Executable 子类的包私有 native,返该成员的
         // RuntimeVisibleAnnotations 属性原始字节(无属性 → null)。rustj 暂返 null(注解机制最小桩,同上):
         // parseAnnotations(null) → emptyMap,isAnnotationPresent 对无 @CallerSensitive 的方法正确返 false。
         ("java/lang/reflect/Method", "getAnnotationBytes", "()[B") => {
-            Ok(Value::Reference(Reference::null()))
-        }
+            |_vm, _this, _args| Ok(Value::Reference(Reference::null()))
+        };
         ("java/lang/reflect/Constructor", "getAnnotationBytes", "()[B") => {
-            Ok(Value::Reference(Reference::null()))
-        }
+            |_vm, _this, _args| Ok(Value::Reference(Reference::null()))
+        };
 
         // Class.initClassName()Ljava/lang/String; —— Class.java:967 真原生;getName() 字节码
         // 首次(`name == null`)调此。按镜像反查内部名→外部形(`/`→`.`),经 string::intern 造真
         // String,回填 `name` 字段并返之;后续 getName 直接读字段(不再进 native)。
-        ("java/lang/Class", "initClassName", "()Ljava/lang/String;") => {
+        ("java/lang/Class", "initClassName", "()Ljava/lang/String;") => |vm, this, _args| {
             let Some(this) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
@@ -342,11 +328,11 @@ pub(super) fn dispatch(
             let s = super::super::string::intern(vm, &external)?;
             vm.set_class_instance_field(this, "name", Slot::Reference(s));
             Ok(Value::Reference(s))
-        }
+        };
 
         // Class.isInstance(Ljava/lang/Object;)Z —— Class.java:768 真原生。obj 的运行时类是否
         // 本镜像类的子类型 = is_instance(obj_class, this_internal)(registry 语义:子类型关系)。
-        ("java/lang/Class", "isInstance", "(Ljava/lang/Object;)Z") => {
+        ("java/lang/Class", "isInstance", "(Ljava/lang/Object;)Z") => |vm, this, args| {
             let Some(this) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
@@ -374,11 +360,11 @@ pub(super) fn dispatch(
             } else {
                 0
             }))
-        }
+        };
 
         // Class.isAssignableFrom(Ljava/lang/Class;)Z —— Class.java:795 真原生。arg 镜像类是否
         // 本镜像类的子类型 = is_instance(arg_internal, this_internal)。
-        ("java/lang/Class", "isAssignableFrom", "(Ljava/lang/Class;)Z") => {
+        ("java/lang/Class", "isAssignableFrom", "(Ljava/lang/Class;)Z") => |vm, this, args| {
             let Some(this) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
@@ -399,12 +385,12 @@ pub(super) fn dispatch(
             } else {
                 0
             }))
-        }
+        };
 
         // Class.getSuperclass()Ljava/lang/Class; —— Class.java:1066 真原生。镜像类的直接超类
         // → 其镜像;数组→Object;原语/void(注册表无对应 LoadedClass)→ null。接口语义顺延
         //(接口 classfile 的 super 为 Object,故接口暂返 Object 镜像;完整接口判定顺延)。
-        ("java/lang/Class", "getSuperclass", "()Ljava/lang/Class;") => {
+        ("java/lang/Class", "getSuperclass", "()Ljava/lang/Class;") => |vm, this, _args| {
             let Some(this) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
@@ -426,29 +412,29 @@ pub(super) fn dispatch(
                 None => Reference::null(),
             };
             Ok(Value::Reference(result))
-        }
+        };
 
         // Runtime.maxMemory()J —— jvm.cpp JVM_MaxMemory:堆上限。rustj 堆为无界 Vec → 取 i64::MAX
         // (VM.saveProperties 存进 directMemory,本场景不用;真值无意义)。
-        ("java/lang/Runtime", "maxMemory", "()J") => Ok(Value::Long(i64::MAX)),
+        ("java/lang/Runtime", "maxMemory", "()J") => |_vm, _this, _args| Ok(Value::Long(i64::MAX));
 
         // Runtime.availableProcessors()I —— jvm.cpp JVM_ActiveProcessorCount:CPU 核数。
         // 经 std::thread::available_parallelism;失败或 >i32::MAX → 1(规范下限 ≥1)。
         // 解锁 ConcurrentHashMap.<clinit>(runtimeSetup 读 NCPU)等依赖核数的 <clinit>。
-        ("java/lang/Runtime", "availableProcessors", "()I") => {
+        ("java/lang/Runtime", "availableProcessors", "()I") => |_vm, _this, _args| {
             let n = std::thread::available_parallelism()
                 .map(|nz| nz.get())
                 .unwrap_or(1)
                 .try_into()
                 .unwrap_or(1);
             Ok(Value::Int(n))
-        }
+        };
 
         // String.intern()Ljava/lang/String; —— String.java:5086 native。读 this 文本 → 经
         // StringPool 规范化(同文本恒同引用),返规范引用。对应 jvm.cpp JVM_InternString / HotSpot
         // StringTable。String 的其余方法(equals/hashCode/length/…)退役 Oop::String 后跑真字节码
         // (经 invokevirtual 正常分派 → StringLatin1/StringUTF16),不经本表。
-        ("java/lang/String", "intern", "()Ljava/lang/String;") => {
+        ("java/lang/String", "intern", "()Ljava/lang/String;") => |vm, this, _args| {
             let Some(this_ref) = this else {
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
@@ -456,7 +442,7 @@ pub(super) fn dispatch(
                 return Err(throw_exception(vm, "java/lang/NullPointerException"));
             };
             Ok(Value::Reference(super::super::string::intern(vm, &text)?))
-        }
+        };
 
         // StackTraceElement.initStackTraceElements(ste[], backtrace, depth)V —— STE.java:590
         // private static native,由 STE.of(STE.java:556,经 Throwable.getOurStackTrace 转调)
@@ -468,7 +454,7 @@ pub(super) fn dispatch(
             "java/lang/StackTraceElement",
             "initStackTraceElements",
             "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V",
-        ) => {
+        ) => |vm, _this, args| {
             let (elements, backtrace, depth) = match (args.first(), args.get(1), args.get(2)) {
                 (Some(Value::Reference(e)), Some(Value::Reference(b)), Some(Value::Int(d))) => {
                     (*e, *b, *d)
@@ -477,13 +463,13 @@ pub(super) fn dispatch(
             };
             init_stack_trace_elements(vm, elements, backtrace, depth)?;
             Ok(Value::Void)
-        }
+        };
 
         // Reference.refersTo0(Object)Z —— Reference.java:373 native。this.referent 与 o 比
         // 引用身份(JVM_ReferenceRefersTo)。referent 由 Reference.<init>(T) 置(Reference.java:532,
         // 普通实例字段——rustj 无 GC,不特殊处理)。子类(WeakReference 等)扁平布局 referent 同序,
         // 故按**实例声明类**查 ord。
-        ("java/lang/ref/Reference", "refersTo0", "(Ljava/lang/Object;)Z") => {
+        ("java/lang/ref/Reference", "refersTo0", "(Ljava/lang/Object;)Z") => |vm, this, args| {
             let (this_ref, o) = match (this, args.first()) {
                 (Some(t), Some(Value::Reference(o))) => (t, *o),
                 _ => return Err(throw_exception(vm, "java/lang/NullPointerException")),
@@ -510,7 +496,7 @@ pub(super) fn dispatch(
                 (Some(ord), Some(Oop::Instance(i))) if matches!(i.field(ord), Slot::Reference(r) if r == o)
             );
             Ok(Value::Int(if refers { 1 } else { 0 }))
-        }
+        };
 
         // ClassLoader.findLoadedClass0(Ljava/lang/String;)Ljava/lang/Class; —— ClassLoader.java:1270
         // `private final native`(实例方法;receiver = ClassLoader,经 `findLoadedClass`(包装器先 checkName)
@@ -520,8 +506,8 @@ pub(super) fn dispatch(
         // `BuiltinClassLoader.loadClassOrNull:592`→`findLoadedClass` 的**已加载类快速路径**(命中即返,
         // 不进 module/parent 委派)。name null → NPE(JNI 解引用 jstring)。
         ("java/lang/ClassLoader", "findLoadedClass0", "(Ljava/lang/String;)Ljava/lang/Class;") => {
-            find_loaded_class0(vm, args)
-        }
+            |vm, _this, args| find_loaded_class0(vm, args)
+        };
 
         // ClassLoader.defineClass0(loader, lookup, name, b, off, len, pd, initialize, flags, classData)Class
         // —— ClassLoader.java:1111 `private static native`,经 `MethodHandles.Lookup.defineClass(byte[])`
@@ -541,7 +527,7 @@ pub(super) fn dispatch(
             "java/lang/ClassLoader",
             "defineClass0",
             "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
-        ) => define_class0(vm, args),
+        ) => |vm, _this, args| define_class0(vm, args);
 
         // System.mapLibraryName(Ljava/lang/String;)Ljava/lang/String; —— System.java:1699
         // `public static native`。移植 `Java_java_lang_System_mapLibraryName`(System.c:296):
@@ -551,8 +537,8 @@ pub(super) fn dispatch(
         // `WindowsNativeDispatcher.<clinit>:1125`→`BootLoader.loadLibrary("net"/"nio")`→
         // `NativeLibraries.findFromPaths`→`mapLibraryName` 链。
         ("java/lang/System", "mapLibraryName", "(Ljava/lang/String;)Ljava/lang/String;") => {
-            map_library_name(vm, args)
-        }
+            |vm, _this, args| map_library_name(vm, args)
+        };
 
         // Thread.currentThread()Ljava/lang/Thread; —— Thread.java:476 `public static native`。
         // 移植 `JVM_CurrentThread`(jvm.cpp):返当前线程的 Thread 实例。rustj 单线程 → 唯一 "main"
@@ -561,32 +547,32 @@ pub(super) fn dispatch(
         // System props / Reflect 链触发的 Thread 路径)、`Thread.currentThread().getContextClassLoader()`
         // 等 NIO/反射/类加载链对线程上下文的依赖。
         ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;") => {
-            Ok(Value::Reference(vm.current_thread()))
-        }
+            |vm, _this, _args| Ok(Value::Reference(vm.current_thread()))
+        };
 
         // Thread.holdsLock(Ljava/lang/Object;)Z —— Thread.java:2178 `public static native`。
         // 移植 `JVM_HoldsLock`(jvm.cpp):当前线程是否持有 `obj` 管程。null → NPE(JDK 行为:
         // `holdsLock(null)` 抛 NPE)。查 `Vm::holds_lock`(monitors 表 owner==当前线程)。
-        ("java/lang/Thread", "holdsLock", "(Ljava/lang/Object;)Z") => {
+        ("java/lang/Thread", "holdsLock", "(Ljava/lang/Object;)Z") => |vm, _this, args| {
             let obj = match args.first().copied().unwrap_or(Value::Void) {
                 Value::Reference(r) => r,
                 _ => Reference::null(),
             };
             vm.holds_lock(obj).map(|b| Value::Int(b as i32))
-        }
+        };
 
         // Thread.yield0()V —— Thread.java:519 `private static native`。移植 `JVM_Yield`
         // (os::yield_thread / os::naked_yield):提示调度器让出 CPU。rustj → `std::thread::yield_now`。
-        ("java/lang/Thread", "yield0", "()V") => {
+        ("java/lang/Thread", "yield0", "()V") => |_vm, _this, _args| {
             std::thread::yield_now();
             Ok(Value::Void)
-        }
+        };
 
         // Thread.sleepNanos0(J)V —— Thread.java:569 `private static native throws InterruptedException`。
         // 移植 `JVM_Sleep`(os::sleep):当前线程睡眠 nanos 纳秒;被中断(`Thread.interrupt`)则清标志
         // + 抛 InterruptedException。`std::thread::sleep` 不可中断 → 分片轮询(≤5ms)查中断标志
         //(latency 可接受;sleep 粒度本粗)。入口亦检中断(已中断即抛)。
-        ("java/lang/Thread", "sleepNanos0", "(J)V") => {
+        ("java/lang/Thread", "sleepNanos0", "(J)V") => |vm, _this, args| {
             let nanos = match args.first().copied().unwrap_or(Value::Long(0)) {
                 Value::Long(n) => n.max(0),
                 _ => 0,
@@ -619,32 +605,32 @@ pub(super) fn dispatch(
                 let chunk = remaining.min(std::time::Duration::from_millis(5));
                 std::thread::sleep(chunk);
             }
-        }
+        };
 
         // Thread.interrupt0()V —— Thread.java:1595/2623 `private native`(实例)。`Thread.interrupt()`
         // 字节码先置 `interrupted=true`,再调本 native 通知 VM。移植 `JVM_Interrupt`:置镜像标志 +
         // 唤醒目标若阻塞于 Object.wait(使其抛 InterruptedException)。
-        ("java/lang/Thread", "interrupt0", "()V") => {
+        ("java/lang/Thread", "interrupt0", "()V") => |vm, this, _args| {
             let this_ref = this.unwrap_or_else(Reference::null);
             vm.interrupt_thread(this_ref).map(|()| Value::Void)
-        }
+        };
 
         // Thread.clearInterruptEvent()V —— Thread.java:1701/2627 `private static native`。由
         // `clearInterrupt()`/`getAndClearInterrupt()` 字节码(已置 `interrupted=false`)调用。清当前
         // 线程镜像标志(与字段同步)。对应 HotSpot `JVM_ClearInterruptEvent`。
-        ("java/lang/Thread", "clearInterruptEvent", "()V") => {
+        ("java/lang/Thread", "clearInterruptEvent", "()V") => |vm, _this, _args| {
             vm.clear_interrupt_event();
             Ok(Value::Void)
-        }
+        };
 
         // Thread.start0()V —— Thread.java:1507 `private native`(实例)。移植 `JVM_StartThread`
         // (os::create_thread):创建新 OS 线程跑虚分派 `run()V`(子类 override 优先)。**Phase B.3b
         // 真起线程**:`Vm::start_thread`(threads.rs)取 `Arc::clone(&shared)` → `std::thread::spawn`
         // 子线程 `Vm::from_shared` 派生 + 跑 `run()V` + eetop 生命周期 + JoinHandle 入表。
-        ("java/lang/Thread", "start0", "()V") => {
+        ("java/lang/Thread", "start0", "()V") => |vm, this, _args| {
             let this_ref = this.unwrap_or_else(Reference::null);
             vm.start_thread(this_ref).map(|()| Value::Void)
-        }
+        };
 
         // Thread.ensureMaterializedForStackWalk(Object) —— Thread.java `private native`,由
         // `runWith(ScopedValuebindings, Runnable)`(Thread.java:1538)调用。原意:为栈遍历物化
@@ -652,21 +638,18 @@ pub(super) fn dispatch(
         // 不绑则 `new Thread(r,name)` 的 Thread.run()→runWith→ensureMaterializedForStackWalk 抛 ULE。
         // reachabilityFence(Object) 为空字节码(无需绑)。
         ("java/lang/Thread", "ensureMaterializedForStackWalk", "(Ljava/lang/Object;)V") => {
-            Ok(Value::Void)
-        }
+            |_vm, _this, _args| Ok(Value::Void)
+        };
 
         // Thread.getNextThreadIdOffset()J —— Thread.java:2628 `private static native`。返回「下一
         // 线程 tid」计数器的地址(HotSpot 注释:"off-heap and shared with the VM")。rustj 无堆外内存,
         // 故返回**哨兵偏移** [`NEXT_THREAD_ID_OFFSET`](vm.rs);`Unsafe.getLongVolatile(null, 此值)` /
         // `compareAndSetLong(null, 此值, ..)`(jdk_internal.rs)特判路由至 `ThreadManager.next_tid`。
         // 解锁 `ThreadIdentifiers.next()` = `getAndAddLong(null, NEXT_TID_OFFSET, 1)`(Thread 构造器 tid 分配)。
-        ("java/lang/Thread", "getNextThreadIdOffset", "()J") => {
+        ("java/lang/Thread", "getNextThreadIdOffset", "()J") => |_vm, _this, _args| {
             Ok(Value::Long(crate::runtime::vm::NEXT_THREAD_ID_OFFSET))
-        }
+        };
 
-        // 未登记 → UnsatisfiedLinkError(nativeLookup.cpp 解析失败的对应物)。
-        _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
-    }
 }
 
 /// `Array.newArray(componentType, length)`:组件 Class 镜像 → 内部名 → 数组描述符 + 默认槽 → 造数组。

@@ -580,13 +580,14 @@ mod sync_assertions {
     }
 
     /// Layer 4.17:`VmThread::native_resolve` 经 `Vm.native_registry`(RwLock 读锁,拷 fn 指针,
-    /// 释锁)返 `Option<NativeFn>`。未登记(表空或无此 native)→ `None`。
+    /// 释锁)返 `Option<NativeFn>`。未登记(无此 native)→ `None`。
     #[test]
     fn native_resolve_returns_none_for_unregistered() {
         let reg = ClassRegistry::new();
         let vm = VmThread::new(reg);
-        // Task 3 时 register_all 仍空 → Object.hashCode 未登记 → None。
-        assert!(vm.native_resolve("java/lang/Object", "hashCode", "()I").is_none());
+        // `Vm::new` 已 `register_all` 填满全部内置 native;取一个全模块都不登记的伪三元组
+        // (与 mod.rs `unbound_native_throws_unsatisfied_link_error` 同键)→ 必 `None`。
+        assert!(vm.native_resolve("java/lang/Foo", "bar", "()V").is_none());
     }
 
     /// Layer 4.17:`NativeRegistry: Send + Sync`(RwLock<NativeRegistry> 为 Vm 字段,Vm: Send+Sync 的前置)。

@@ -101,20 +101,18 @@ fn invoke_inner(
     dispatch(vm, class, name, desc, this, args)
 }
 
-/// 按**声明类前缀**路由(迁移期 fallback;每迁一个模块,删其对应臂,Task 4–10;全删于 Task 11)。
-/// `registerNatives` 已在 [`invoke_inner`] 处理,此处不再特判;`name`/`desc` 透传给各子模块 `dispatch`。
+/// 迁移期 fallback(`java/lang/` 已上 [`NativeRegistry`] 表,本函数恒未命中 → ULE)。
+/// **Task 11 将删除本函数**:`invoke_inner` 直调 [`throw_unsatisfied_link_error`]
+/// (registry 命中或 ULE,二选一)。保留至 Task 11 以隔离「最后一模块迁移」与「fallback 删除」两步。
 fn dispatch(
     vm: &mut VmThread,
     class: &str,
     name: &str,
     desc: &str,
-    this: Option<Reference>,
-    args: &[Value],
+    _this: Option<Reference>,
+    _args: &[Value],
 ) -> Result<Value, VmError> {
-    match class {
-        c if c.starts_with("java/lang/") => java_lang::dispatch(vm, c, name, desc, this, args),
-        _ => Err(throw_unsatisfied_link_error(vm, class, name, desc)),
-    }
+    Err(throw_unsatisfied_link_error(vm, class, name, desc))
 }
 
 /// 未登记 native → `UnsatisfiedLinkError`(带 `class.name desc` 诊断串,对应 HotSpot
@@ -135,6 +133,7 @@ pub(crate) fn register_all(reg: &mut NativeRegistry) {
     java_lang_invoke::register(reg);
     jdk_internal::register(reg);
     jdk_internal_reflect::register(reg);
+    java_lang::register(reg);
 }
 
 /// 原语关键字名(`"int"`/…/`"void"`)判定——`name2type` 的等价物

@@ -16,6 +16,7 @@ use crate::metadata::descriptor::{parse_field_descriptor, FieldType};
 use crate::oops::Oop;
 use crate::runtime::{Frame, Slot, VmThread};
 
+use super::cp_util::{class_name, name_and_type, utf8};
 use super::{clinit, throw_exception, Interpreter, VmError};
 
 /// 解析 `Fieldref` 常量池条目 → `(类内部名, 字段名, 描述符)`。owned 字符串。
@@ -42,35 +43,6 @@ pub(super) fn resolve_class_name(cp: &ConstantPool, class_index: u16) -> Result<
         return Err(VmError::BadConstant("new 操作数须为 Class"));
     };
     utf8(cp, *name_index)
-}
-
-/// 解析 `Class` 条目 → 类内部名。
-fn class_name(cp: &ConstantPool, class_index: u16) -> Result<String, VmError> {
-    let ConstantPoolEntry::Class { name_index } = cp.get(class_index)?
-    else {
-        return Err(VmError::BadConstant("Fieldref.class 须为 Class"));
-    };
-    utf8(cp, *name_index)
-}
-
-/// 解析 `NameAndType` 条目 → `(字段名, 描述符)`。
-fn name_and_type(cp: &ConstantPool, index: u16) -> Result<(String, String), VmError> {
-    let ConstantPoolEntry::NameAndType {
-        name_index,
-        descriptor_index,
-    } = cp.get(index)?
-    else {
-        return Err(VmError::BadConstant("Fieldref 须含 NameAndType"));
-    };
-    Ok((utf8(cp, *name_index)?, utf8(cp, *descriptor_index)?))
-}
-
-/// 取 `Utf8` 条目的字符串(owned)。
-fn utf8(cp: &ConstantPool, index: u16) -> Result<String, VmError> {
-    match cp.get(index)? {
-        ConstantPoolEntry::Utf8(s) => Ok(s.clone()),
-        _ => Err(VmError::BadConstant("期望 Utf8 条目")),
-    }
 }
 
 /// 按字段类型从操作数栈弹出一个值 → 槽(byte/char/short/boolean 以 int 承载)。

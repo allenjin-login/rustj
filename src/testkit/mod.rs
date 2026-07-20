@@ -6,6 +6,12 @@
 //! 用法(`tests/*.rs`):`use rustj::testkit::*;` 引入函数;宏经 `#[macro_export]`
 //! 在 crate 根,`use rustj::testkit::*;` 亦经下方 `pub use` 引入。
 
+pub mod env;
+
+pub use env::{find_javabase_jmod, javac_available};
+pub use crate::{require_javabase, require_javac};
+
+// Task 1 feature 机制探针(保留,T11 决定去留)。
 pub fn probe() -> bool {
     true
 }

@@ -15,63 +15,53 @@
 //! 2. 调用 getCallerClass 的方法(`@CallerSensitive` 方法 M,如 `registerAsParallelCapable`)—— 跳过;
 //! 3. **M 的调用者**——返回其 Class 镜像(`frame_class_at(2)`)。
 //!
-//! 由 [`super::dispatch`] 按声明类路由至此(`jdk/internal/reflect/Reflection`)。
+//! 由 [`super`] 的 `NativeRegistry` 按 (class,name,desc) 命中——`register_all` 时调本模块
+//! `register`([`natives!`] 生成)登记各条;`invoke_inner` 查表得 fn 指针即调
+//! (`jdk/internal/reflect/Reflection` 及 Direct*HandleAccessor$NativeAccessor)。
 
 use crate::oops::Oop;
 use crate::runtime::{Frame, Interpreter, LocalVars, Reference, Slot, Value, VmThread, VmError};
 
 use super::super::throw_exception;
 
-/// `jdk/internal/reflect/*` native 分派。未登记 → `UnsatisfiedLinkError`。
-pub(super) fn dispatch(
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-    _this: Option<Reference>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    match (class, name, desc) {
-        // Reflection.getCallerClass()Ljava/lang/Class; —— Reflection.java:73 native,
-        // @CallerSensitive 基础设施。`native::invoke` 已推自身帧(栈顶);自顶第 2 层 =
-        // "调用 getCallerClass 的方法"的调用者 → intern 其 Class 镜像。栈深不足 → null
-        //(真实 HotSpot 抛 InternalError;rustj 取 null 最小安全语义,调用方据语境处理)。
-        ("jdk/internal/reflect/Reflection", "getCallerClass", "()Ljava/lang/Class;") => {
-            // 拥有 caller 名(frame_class_at 借 &vm;intern_class_mirror 需 &mut vm)。
-            match vm.frame_class_at(2).map(|s| s.to_string()) {
-                Some(caller) => Ok(Value::Reference(vm.intern_class_mirror(&caller))),
-                None => Ok(Value::Reference(Reference::null())),
-            }
+natives! {
+    // Reflection.getCallerClass()Ljava/lang/Class; —— Reflection.java:73 native,
+    // @CallerSensitive 基础设施。`native::invoke` 已推自身帧(栈顶);自顶第 2 层 =
+    // "调用 getCallerClass 的方法"的调用者 → intern 其 Class 镜像。栈深不足 → null
+    //(真实 HotSpot 抛 InternalError;rustj 取 null 最小安全语义,调用方据语境处理)。
+    ("jdk/internal/reflect/Reflection", "getCallerClass", "()Ljava/lang/Class;") => |vm, _this, _args| {
+        // 拥有 caller 名(frame_class_at 借 &vm;intern_class_mirror 需 &mut vm)。
+        match vm.frame_class_at(2).map(|s| s.to_string()) {
+            Some(caller) => Ok(Value::Reference(vm.intern_class_mirror(&caller))),
+            None => Ok(Value::Reference(Reference::null())),
         }
-        // Reflection.getClassAccessFlags(Ljava/lang/Class;)I —— jmod(jdk-25.0.2)javap 确认
-        // 为 `public static native`(jdk-master 源码已改字节码委派 Class.getClassFileAccessFlags,
-        // 版本错位,以本机 jmod 实测为准)。返回 Class 的 class-file access flags 低 13 位。
-        ("jdk/internal/reflect/Reflection", "getClassAccessFlags", "(Ljava/lang/Class;)I") => {
-            Ok(Value::Int(get_class_access_flags(vm, args)?))
-        }
-        // DirectMethodHandleAccessor$NativeAccessor.invoke0(Method, Object, Object[])Object ——
-        // = HotSpot `JVM_InvokeMethod`(prims/jvm.cpp:3282)→ `Reflection::invoke_method` →
-        // `Reflection::invoke`(runtime/reflection.cpp)。Layer 4.15b 反射调用主交付物。绕过
-        // MethodHandle 直接调用墙:NativeAccessor 路径(`useNativeAccessor` 在 rustj 不跑 initPhase3
-        // 时恒 true)。语义:读 Method.clazz/slot/modifiers → cf.methods[slot] 解析目标 → 实例虚分派 /
-        // 静态直调 → interpret_with → 返回装箱(void→null);目标异常包 InvocationTargetException。
-        (
-            "jdk/internal/reflect/DirectMethodHandleAccessor$NativeAccessor",
-            "invoke0",
-            "(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
-        ) => invoke_method_native(vm, args),
-        // DirectConstructorHandleAccessor$NativeAccessor.newInstance0(Constructor, Object[])Object ——
-        // = HotSpot `JVM_NewInstanceFromConstructor`(jvm.cpp:3306)→ `Reflection::invoke_constructor`。
-        // 语义:读 Constructor.clazz/slot → new_instance 分配裸实例(不跑 <init>)→ cf.methods[slot]
-        // 须为 <init> → locals[0]=新实例, [1..]=拆箱实参 → interpret_with 跑 <init> → 返新实例;
-        // 目标异常包 InvocationTargetException。抽象类 → InstantiationException。
-        (
-            "jdk/internal/reflect/DirectConstructorHandleAccessor$NativeAccessor",
-            "newInstance0",
-            "(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)Ljava/lang/Object;",
-        ) => new_instance_native(vm, args),
-        _ => Err(throw_exception(vm, "java/lang/UnsatisfiedLinkError")),
-    }
+    };
+    // Reflection.getClassAccessFlags(Ljava/lang/Class;)I —— jmod(jdk-25.0.2)javap 确认
+    // 为 `public static native`(jdk-master 源码已改字节码委派 Class.getClassFileAccessFlags,
+    // 版本错位,以本机 jmod 实测为准)。返回 Class 的 class-file access flags 低 13 位。
+    ("jdk/internal/reflect/Reflection", "getClassAccessFlags", "(Ljava/lang/Class;)I") =>
+        |vm, _this, args| Ok(Value::Int(get_class_access_flags(vm, args)?));
+    // DirectMethodHandleAccessor$NativeAccessor.invoke0(Method, Object, Object[])Object ——
+    // = HotSpot `JVM_InvokeMethod`(prims/jvm.cpp:3282)→ `Reflection::invoke_method` →
+    // `Reflection::invoke`(runtime/reflection.cpp)。Layer 4.15b 反射调用主交付物。绕过
+    // MethodHandle 直接调用墙:NativeAccessor 路径(`useNativeAccessor` 在 rustj 不跑 initPhase3
+    // 时恒 true)。语义:读 Method.clazz/slot/modifiers → cf.methods[slot] 解析目标 → 实例虚分派 /
+    // 静态直调 → interpret_with → 返回装箱(void→null);目标异常包 InvocationTargetException。
+    (
+        "jdk/internal/reflect/DirectMethodHandleAccessor$NativeAccessor",
+        "invoke0",
+        "(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+    ) => |vm, _this, args| invoke_method_native(vm, args);
+    // DirectConstructorHandleAccessor$NativeAccessor.newInstance0(Constructor, Object[])Object ——
+    // = HotSpot `JVM_NewInstanceFromConstructor`(jvm.cpp:3306)→ `Reflection::invoke_constructor`。
+    // 语义:读 Constructor.clazz/slot → new_instance 分配裸实例(不跑 <init>)→ cf.methods[slot]
+    // 须为 <init> → locals[0]=新实例, [1..]=拆箱实参 → interpret_with 跑 <init> → 返新实例;
+    // 目标异常包 InvocationTargetException。抽象类 → InstantiationException。
+    (
+        "jdk/internal/reflect/DirectConstructorHandleAccessor$NativeAccessor",
+        "newInstance0",
+        "(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)Ljava/lang/Object;",
+    ) => |vm, _this, args| new_instance_native(vm, args);
 }
 
 /// `Reflection.getClassAccessFlags(Class)I` native 语义移植(对应 `Class.getClassFileAccessFlags`,

@@ -113,9 +113,6 @@ fn dispatch(
 ) -> Result<Value, VmError> {
     match class {
         c if c.starts_with("java/lang/") => java_lang::dispatch(vm, c, name, desc, this, args),
-        c if c.starts_with("jdk/internal/reflect/") => {
-            jdk_internal_reflect::dispatch(vm, c, name, desc, this, args)
-        }
         _ => Err(throw_unsatisfied_link_error(vm, class, name, desc)),
     }
 }
@@ -137,6 +134,7 @@ pub(crate) fn register_all(reg: &mut NativeRegistry) {
     java_io::register(reg);
     java_lang_invoke::register(reg);
     jdk_internal::register(reg);
+    jdk_internal_reflect::register(reg);
 }
 
 /// 原语关键字名(`"int"`/…/`"void"`)判定——`name2type` 的等价物

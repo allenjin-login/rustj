@@ -719,7 +719,7 @@ fn find_loaded_class0(vm: &mut VmThread, args: &[Value]) -> Result<Value, VmErro
 
 /// `ClassLoader.defineClass0(loader, lookup, name, b, off, len, pd, initialize, flags, classData)Class`
 /// —— ClassLoader.java:1111 `private static native`,移植 `jvm_lookup_define_class`(jvm.cpp:914)。
-/// 见 [`dispatch`](super::super::native::dispatch) 处 arm 注释。从 `b[off..off+len]` 取类字节 →
+/// 从 `b[off..off+len]` 取类字节 →
 /// `classfile::parse`(jvm.cpp:978 `resolve_from_stream`)→ `ClassRegistry::define_class`(注册到运行时表)
 /// → `intern_class_mirror` → `initialize` 真? `ensure_class_initialized`(jvm.cpp:1020 `ik->initialize`):
 /// 否 → 返镜像(仅注册)。`loader`/`lookup`/`pd`/`flags`/`classData` 忽略(单 bootstrap loader/单注册表)。

@@ -12,8 +12,8 @@
 //!
 //! **结构**(解决"一堵大 match"的可维护性,CLAUDE.md §6):[`invoke`] 仅做栈帧 push/pop +
 //! 委托 [`invoke_inner`],后者**先查 [`NativeRegistry`]**(fn 指针表,各子模块经 [`natives!`]
-//! 宏声明式登记)→ 命中即调 fn 指针;miss 走 [`dispatch`] 前缀路由 fallback(渐进迁移期,
-//! Task 4–10 逐模块退役;Task 11 全删)。新增 native 只在对应子模块的 `natives! { ... }` 加一行
+//! 宏声明式登记)→ 命中即调 fn 指针;miss → [`throw_unsatisfied_link_error`](对应 HotSpot
+//! `nativeLookup.cpp` 解析失败)。新增 native 只在对应子模块的 `natives! { ... }` 加一行
 //!(并 [`register_all`] 登记),不再扫全表。
 //!
 //! **Step 0 源码依据**:
@@ -25,7 +25,7 @@ use crate::runtime::{Reference, VmThread};
 
 use super::{Value, VmError};
 
-/// 声明式登记一个模块的全部 native(替代手写 `match` + `dispatch` 路由)。生成该模块的
+/// 声明式登记一个模块的全部 native(替代逐条手写 `register` 调用)。生成该模块的
 /// `pub(super) fn register(&mut NativeRegistry)`;每条 `(class,name,desc) => <闭包>`,闭包须
 /// **非捕获**(在 `register(..., f: NativeFn)` 位协变为零成本 fn 指针;捕获即编译错——护栏)。
 /// 须定义于子模块声明**之前**(文本作用域:子 mod 方能用裸 `natives!`)。用法见各 `native/<pkg>.rs`。
@@ -82,8 +82,8 @@ pub(super) fn invoke(
 
 /// `invoke` 内核(已 push_frame):(1) 任意类的 `registerNatives()V` 空操作(rustj 编译期表,
 /// native 恒已注册——JDK 侧 registerNatives 把 `Java_*`/`JVM_*` 登记进方法槽,rustj 无此
-/// 运行期步骤);(2) 命中 `NativeRegistry` → 调 fn 指针;(3) miss → 旧 [`dispatch`] 前缀路由
-/// fallback(渐进迁移期;全部模块迁完后删除,Task 11)。
+/// 运行期步骤);(2) 命中 `NativeRegistry` → 调 fn 指针;(3) miss →
+/// [`throw_unsatisfied_link_error`](对应 HotSpot `nativeLookup.cpp` 解析失败)。
 fn invoke_inner(
     vm: &mut VmThread,
     class: &str,
@@ -98,20 +98,6 @@ fn invoke_inner(
     if let Some(f) = vm.native_resolve(class, name, desc) {
         return f(vm, this, args);
     }
-    dispatch(vm, class, name, desc, this, args)
-}
-
-/// 迁移期 fallback(`java/lang/` 已上 [`NativeRegistry`] 表,本函数恒未命中 → ULE)。
-/// **Task 11 将删除本函数**:`invoke_inner` 直调 [`throw_unsatisfied_link_error`]
-/// (registry 命中或 ULE,二选一)。保留至 Task 11 以隔离「最后一模块迁移」与「fallback 删除」两步。
-fn dispatch(
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-    _this: Option<Reference>,
-    _args: &[Value],
-) -> Result<Value, VmError> {
     Err(throw_unsatisfied_link_error(vm, class, name, desc))
 }
 
@@ -124,8 +110,9 @@ fn throw_unsatisfied_link_error(vm: &mut VmThread, class: &str, name: &str, desc
 }
 
 /// 把所有内置 native 模块的 `register` 串调,填满 `NativeRegistry`(`Vm::new` 时一次性调)。
-/// 渐进迁移:每迁一个模块,在此加一行 `<module>::register(reg);`(模块迁移见各 Task 4–10)。
-/// **Task 3 阶段为空**(所有模块仍走 `dispatch` fallback);全部迁完后 fallback 删除(Task 11)。
+/// 七个子模块(sun_nio_fs / jdk_internal_loader / java_io / java_lang_invoke / jdk_internal /
+/// jdk_internal_reflect / java_lang)各贡献自己的 `natives!` 块;新增内置 native 只在对应模块
+/// 加一行,再在此串调。
 pub(crate) fn register_all(reg: &mut NativeRegistry) {
     sun_nio_fs::register(reg);
     jdk_internal_loader::register(reg);
@@ -365,6 +352,29 @@ mod tests {
             panic!("UnsatisfiedLinkError 应为引导桩实例");
         };
         assert_eq!(i.class_name(), "java/lang/UnsatisfiedLinkError");
+    }
+
+    /// ULE 须携带 `class.name desc` 诊断串(`throw_unsatisfied_link_error` 设 detailMessage,
+    /// 对应 HotSpot `nativeLookup.cpp` 解析失败的报错)。`format_trace` 读 exception_meta.message
+    /// (`record_message` 恒写,无 String 预载依赖)→ 头类后 `: <message>`。
+    #[test]
+    fn unbound_native_throws_unsatisfied_link_error_with_message() {
+        let reg = crate::oops::ClassRegistry::new();
+        let mut vm = crate::runtime::VmThread::new(reg);
+        let crate::runtime::VmError::ThrownException(exc) =
+            invoke(&mut vm, "java/lang/Foo", "bar", "()V", None, &[]).unwrap_err()
+        else {
+            panic!("未登记 native 应抛 ThrownException");
+        };
+        let trace = vm.format_trace(exc);
+        assert!(
+            trace.starts_with("java/lang/UnsatisfiedLinkError"),
+            "异常头须为 ULE: {trace}"
+        );
+        assert!(
+            trace.contains("java.lang.Foo.bar ()V"),
+            "ULE 须携带 class.name desc 诊断串: {trace}"
+        );
     }
 
     /// `natives!` 宏生成的 `register(&mut NativeRegistry)` 须把每条 (class,name,desc)=>闭包

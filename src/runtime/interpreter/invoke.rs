@@ -25,6 +25,7 @@ use crate::oops::lambda::{
 use crate::oops::{ClassRegistry, LoadedClass, ArrayOop, LambdaOop, Oop};
 use crate::runtime::{Frame, LocalVars, Reference, Slot, VmThread};
 
+use super::cp_util::{class_name, name_and_type, utf8};
 use super::{clinit, exception, native, string, throw_exception, Interpreter, Value, VmError};
 
 /// 字段引用类(`MethodHandleNatives.java:103-106`),编码于 MemberName.flags 的最高 4 位
@@ -982,35 +983,6 @@ pub(super) fn resolve_methodref(
     let class_name = class_name(cp, class_index)?;
     let (name, desc) = name_and_type(cp, name_and_type_index)?;
     Ok((class_name, name, desc))
-}
-
-/// 解析 `Class` 条目 → 类内部名。
-fn class_name(cp: &ConstantPool, class_index: u16) -> Result<String, VmError> {
-    let ConstantPoolEntry::Class { name_index } = cp.get(class_index)?
-    else {
-        return Err(VmError::BadConstant("Methodref.class 须为 Class"));
-    };
-    utf8(cp, *name_index)
-}
-
-/// 解析 `NameAndType` 条目 → `(方法名, 描述符)`。
-fn name_and_type(cp: &ConstantPool, index: u16) -> Result<(String, String), VmError> {
-    let ConstantPoolEntry::NameAndType {
-        name_index,
-        descriptor_index,
-    } = cp.get(index)?
-    else {
-        return Err(VmError::BadConstant("Methodref 须含 NameAndType"));
-    };
-    Ok((utf8(cp, *name_index)?, utf8(cp, *descriptor_index)?))
-}
-
-/// 取 `Utf8` 条目的字符串(owned)。
-fn utf8(cp: &ConstantPool, index: u16) -> Result<String, VmError> {
-    match cp.get(index)? {
-        ConstantPoolEntry::Utf8(s) => Ok(s.clone()),
-        _ => Err(VmError::BadConstant("期望 Utf8 条目")),
-    }
 }
 
 /// 取 `Utf8` 条目的 `&str`(零分配,借自常量池)——供栈轨迹 `with_identity`。

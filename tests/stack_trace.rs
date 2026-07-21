@@ -6,27 +6,8 @@
 //! 需 `javac`(PATH);缺则跳过。
 
 use rustj::testkit::*;
-use rustj::constant_pool::ConstantPoolEntry;
-use rustj::metadata::{ClassFile, MethodInfo};
 use rustj::oops::Oop;
 use rustj::runtime::{Frame, Interpreter, VmThread, VmError};
-
-fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| {
-            let n = matches!(
-                cf.constant_pool.get(m.name_index),
-                Ok(ConstantPoolEntry::Utf8(s)) if s == name
-            );
-            let d = matches!(
-                cf.constant_pool.get(m.descriptor_index),
-                Ok(ConstantPoolEntry::Utf8(s)) if s == desc
-            );
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
 
 const SOURCE: &str = r#"
 public class Trace {

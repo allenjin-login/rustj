@@ -10,56 +10,15 @@
 //!
 //! 需 `javac`(PATH)与本机 `java.base.jmod`;缺一则跳过。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use rustj::classfile::parse;
 use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::{Frame, Interpreter, Value, VmThread};
+use rustj::testkit::*;
 
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    std::env::var("JAVA_HOME")
-        .ok()
-        .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
-        .filter(|p| p.exists())
-}
-
-fn compile_dir(source: &str, public_name: &str) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("rustj-b4d-{n}-{}-{public_name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-    let out = Command::new("javac").arg("-d").arg(&dir).arg(&src).output().expect("javac 执行失败");
-    assert!(
-        out.status.success(),
-        "javac 失败:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
+/// 按名+描述符在类中找方法。
 fn find_method<'a>(
     cf: &'a rustj::metadata::ClassFile,
     name: &str,
@@ -117,16 +76,10 @@ public class Probe implements Runnable {
 /// → 自定义 handler 记录 throwable(caught != null 且 message=="boom")。
 #[test]
 fn uncaught_exception_dispatched() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:无 java.base.jmod");
-        return;
-    };
+    require_javac!();
+    require_javabase!(jmod);
 
-    let dir = compile_dir(SOURCE, "Probe");
+    let dir = compile_dir(SOURCE, "Probe", &[]);
     let mut registry = ClassRegistry::new();
     let pcf = parse(&std::fs::read(dir.join("Probe.class")).unwrap()).unwrap();
     registry.load(pcf).unwrap();

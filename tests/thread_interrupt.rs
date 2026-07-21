@@ -16,45 +16,11 @@
 //! 需 `javac`(PATH)与本机 `java.base.jmod`;缺一则跳过。
 
 use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread};
+use rustj::runtime::VmThread;
 use rustj::testkit::*;
-
-/// 按名+描述符在类中找方法。
-fn find_method<'a>(
-    cf: &'a rustj::metadata::ClassFile,
-    name: &str,
-    desc: &str,
-) -> &'a rustj::metadata::MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| {
-            let n = matches!(cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-            let d = matches!(cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == desc);
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
-
-/// 解释执行静态方法(无参),返回值或 `VmError`。
-fn run_static(
-    registry: &std::sync::Arc<ClassRegistry>,
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-) -> Result<Value, rustj::runtime::VmError> {
-    let lc = registry.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
-    let method = find_method(&lc.cf, name, desc);
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    interp.interpret_with(&mut frame, vm)
-}
 
 /// 装载 Probe + java.base 关键类,返回 (registry, vm)。
 fn load() -> (std::sync::Arc<ClassRegistry>, VmThread) {
@@ -133,12 +99,8 @@ public class Probe implements Runnable {
 }
 "#;
 
-fn assert_int(reg: &std::sync::Arc<ClassRegistry>, vm: &mut VmThread, name: &str, expected: i32) {
-    let v = match run_static(reg, vm, "Probe", name, "()I").expect("{name} 应非抛") {
-        Value::Int(v) => v,
-        other => panic!("{name} 须返 int,得 {other:?}"),
-    };
-    assert_eq!(v, expected, "{name} 须返 {expected}");
+fn assert_int(vm: &mut VmThread, name: &str, expected: i32) {
+    assert_eq!(run_static_int(vm, "Probe", name).unwrap(), expected, "{name} 须返 {expected}");
 }
 
 /// **RED→GREEN**(Phase B.4c):自中断后 `isInterrupted()` 真(不清标志)。
@@ -146,8 +108,8 @@ fn assert_int(reg: &std::sync::Arc<ClassRegistry>, vm: &mut VmThread, name: &str
 fn self_interrupt_visible() {
     require_javac!();
     require_javabase!(jmod);
-    let (reg, mut vm) = load();
-    assert_int(&reg, &mut vm, "selfInterrupt", 1);
+    let (_, mut vm) = load();
+    assert_int(&mut vm, "selfInterrupt", 1);
 }
 
 /// **RED→GREEN**(Phase B.4c):`Thread.interrupted()` 首返 true 并清标志,次返 false。
@@ -155,8 +117,8 @@ fn self_interrupt_visible() {
 fn interrupted_clears_flag() {
     require_javac!();
     require_javabase!(jmod);
-    let (reg, mut vm) = load();
-    assert_int(&reg, &mut vm, "interruptedClears", 1);
+    let (_, mut vm) = load();
+    assert_int(&mut vm, "interruptedClears", 1);
 }
 
 /// **RED→GREEN**(Phase B.4c):子线程 `lock.wait()` 被中断 → InterruptedException(catch 置 result=42)。
@@ -164,8 +126,8 @@ fn interrupted_clears_flag() {
 fn wait_interrupted_throws() {
     require_javac!();
     require_javabase!(jmod);
-    let (reg, mut vm) = load();
-    assert_int(&reg, &mut vm, "waitInterrupt", 42);
+    let (_, mut vm) = load();
+    assert_int(&mut vm, "waitInterrupt", 42);
 }
 
 /// **RED→GREEN**(Phase B.4c):子线程 `Thread.sleep(20s)` 被中断 → InterruptedException。
@@ -173,6 +135,6 @@ fn wait_interrupted_throws() {
 fn sleep_interrupted_throws() {
     require_javac!();
     require_javabase!(jmod);
-    let (reg, mut vm) = load();
-    assert_int(&reg, &mut vm, "sleepInterrupt", 42);
+    let (_, mut vm) = load();
+    assert_int(&mut vm, "sleepInterrupt", 42);
 }

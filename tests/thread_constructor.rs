@@ -11,64 +11,11 @@
 //! 需 `javac`(PATH)与本机 `java.base.jmod`;缺一则跳过。
 
 use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::{ClassRegistry, Oop};
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Reference, Value, VmThread};
+use rustj::runtime::{Reference, Value, VmThread};
 use rustj::testkit::*;
-
-/// 按名+描述符在类中找方法。
-fn find_method<'a>(
-    cf: &'a rustj::metadata::ClassFile,
-    name: &str,
-    desc: &str,
-) -> &'a rustj::metadata::MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| {
-            let n = matches!(cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-            let d = matches!(cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == desc);
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
-
-/// 解释执行静态方法(可带参),返回值或 `VmError`。(testkit::run_args 不传 vm/不返回 Result)
-fn run_static(
-    registry: &std::sync::Arc<ClassRegistry>,
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-    args: &[Value],
-) -> Result<Value, rustj::runtime::VmError> {
-    let lc = registry.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
-    let method = find_method(&lc.cf, name, desc);
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let mut slot: u16 = 0;
-    for v in args {
-        match v {
-            Value::Long(x) => {
-                frame.locals.set_long(slot, *x).unwrap();
-                slot = slot.saturating_add(2);
-            }
-            Value::Int(x) => {
-                frame.locals.set_int(slot, *x).unwrap();
-                slot = slot.saturating_add(1);
-            }
-            Value::Reference(r) => {
-                frame.locals.set_reference(slot, *r).unwrap();
-                slot = slot.saturating_add(1);
-            }
-            _ => panic!("run_static 不支持该参数类型:{v:?}"),
-        }
-    }
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    interp.interpret_with(&mut frame, vm)
-}
 
 const SOURCE: &str = r#"
 public class Probe implements Runnable {
@@ -124,8 +71,7 @@ fn thread_constructor_end_to_end() {
     };
 
     // 4) makeThread(probe) → new Thread(p, "w") 构造器跑通,返 Thread 引用。
-    let thread = match run_static(
-        &registry,
+    let thread = match run_static_args(
         &mut vm,
         "Probe",
         "makeThread",
@@ -140,8 +86,7 @@ fn thread_constructor_end_to_end() {
     assert!(!thread.is_null(), "new Thread(p,\"w\") 须返非 null");
 
     // 5) name == "w"(构造器置 this.name=name,非 null 故绕开 genThreadName)。
-    let name_ok = match run_static(
-        &registry,
+    let name_ok = match run_static_args(
         &mut vm,
         "Probe",
         "nameIsW",
@@ -154,8 +99,7 @@ fn thread_constructor_end_to_end() {
     assert!(name_ok, "getName().equals(\"w\") 须为 true");
 
     // threadGroup.getName() ∈ {main, system}(main 线程 holder.group)。
-    let group_ok = match run_static(
-        &registry,
+    let group_ok = match run_static_args(
         &mut vm,
         "Probe",
         "groupIsMain",
@@ -168,8 +112,7 @@ fn thread_constructor_end_to_end() {
     assert!(group_ok, "getThreadGroup().getName 须为 main/system");
 
     // id > 0(ThreadIdentifiers.next 递增;main 线程占 tid=1,子 ≥ 2)。
-    let id = match run_static(
-        &registry,
+    let id = match run_static_args(
         &mut vm,
         "Probe",
         "idOf",
@@ -182,8 +125,7 @@ fn thread_constructor_end_to_end() {
     assert!(id > 0, "getId 须 > 0,得 {id}");
 
     // priority == 5(NORM_PRIORITY;main 持 NORM_PRIORITY,组 maxPriority=10,min=5)。
-    let pri = match run_static(
-        &registry,
+    let pri = match run_static_args(
         &mut vm,
         "Probe",
         "priorityOf",
@@ -196,8 +138,7 @@ fn thread_constructor_end_to_end() {
     assert_eq!(pri, 5, "getPriority 须 == NORM_PRIORITY(5),得 {pri}");
 
     // isDaemon == false(main 非 daemon → 子非 daemon)。
-    let daemon = match run_static(
-        &registry,
+    let daemon = match run_static_args(
         &mut vm,
         "Probe",
         "daemonOf",

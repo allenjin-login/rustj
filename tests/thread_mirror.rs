@@ -6,40 +6,11 @@
 //! 需 `javac`(PATH)与本机 `java.base.jmod`;缺一则跳过。
 
 use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
+use rustj::runtime::Value;
 use rustj::testkit::*;
-
-/// 按名+描述符在类中找方法。
-fn find_method<'a>(
-    cf: &'a rustj::metadata::ClassFile,
-    cp: &rustj::constant_pool::ConstantPool,
-    name: &str,
-    desc: &str,
-) -> &'a rustj::metadata::MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| {
-            let n = matches!(cp.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-            let d = matches!(cp.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == desc);
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
-
-/// 解释执行一个静态方法(无参)。
-fn run_static(registry: &std::sync::Arc<ClassRegistry>, class: &str, name: &str, desc: &str) -> Result<Value, VmError> {
-    let lc = registry.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
-    let method = find_method(&lc.cf, &lc.cf.constant_pool, name, desc);
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = VmThread::new(std::sync::Arc::clone(registry));
-    interp.interpret_with(&mut frame, &mut vm)
-}
 
 const SOURCE: &str = r#"
 public class ThreadGate {
@@ -74,14 +45,14 @@ fn main_thread_mirror_has_name_main_and_tid_one() {
 
     // 3) threadId() → 1L(alloc_main_thread 置 tid 字段)。
     assert_eq!(
-        run_static(&registry, "ThreadGate", "tid", "()J").unwrap(),
+        run_result(&registry, "ThreadGate", "tid", "()J").0.unwrap(),
         Value::Long(1),
         "main 线程 tid 须为 1"
     );
 
     // 4) isMain() → true("main".equals(getName()))。
     assert_eq!(
-        run_static(&registry, "ThreadGate", "isMain", "()Z").unwrap(),
+        run_result(&registry, "ThreadGate", "isMain", "()Z").0.unwrap(),
         Value::Int(1),
         "main 线程 name 须为 \"main\""
     );

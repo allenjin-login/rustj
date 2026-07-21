@@ -13,45 +13,11 @@
 //! 需 `javac`(PATH)与本机 `java.base.jmod`;缺一则跳过。
 
 use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread};
+use rustj::runtime::{Value, VmThread};
 use rustj::testkit::*;
-
-/// 按名+描述符在类中找方法。
-fn find_method<'a>(
-    cf: &'a rustj::metadata::ClassFile,
-    name: &str,
-    desc: &str,
-) -> &'a rustj::metadata::MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| {
-            let n = matches!(cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-            let d = matches!(cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == desc);
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
-
-/// 解释执行静态方法(无参),返回值或 `VmError`。
-fn run_static(
-    registry: &std::sync::Arc<ClassRegistry>,
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-) -> Result<Value, rustj::runtime::VmError> {
-    let lc = registry.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
-    let method = find_method(&lc.cf, name, desc);
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    interp.interpret_with(&mut frame, vm)
-}
 
 const SOURCE: &str = r#"
 public class Probe implements Runnable {
@@ -113,7 +79,7 @@ fn start_join_end_to_end() {
     let mut vm = VmThread::new(std::sync::Arc::clone(&registry));
 
     // t.start() → 子线程跑 run() 置 result=42;t.join() 阻塞-唤醒;返 result。
-    let result = match run_static(&registry, &mut vm, "Probe", "runAndJoin", "()I").expect("runAndJoin 应非抛") {
+    let result = match run_static_in(&mut vm, "Probe", "runAndJoin", "()I").expect("runAndJoin 应非抛") {
         Value::Int(v) => v,
         other => panic!("runAndJoin 须返 int,得 {other:?}"),
     };
@@ -121,7 +87,7 @@ fn start_join_end_to_end() {
 
     // join() 返回意味着 terminate 的 notifyAll 唤醒了 joiner(否则永久 wait 死锁)。
     // counter==40000 证子线程 run() 忙循环跑完(非提前死锁)。
-    let counter = match run_static(&registry, &mut vm, "Probe", "getCounter", "()I").expect("getCounter 应非抛") {
+    let counter = match run_static_in(&mut vm, "Probe", "getCounter", "()I").expect("getCounter 应非抛") {
         Value::Int(v) => v,
         other => panic!("getCounter 须返 int,得 {other:?}"),
     };
@@ -155,7 +121,7 @@ fn double_start_throws_imse() {
     let registry = std::sync::Arc::new(registry);
     let mut vm = VmThread::new(std::sync::Arc::clone(&registry));
 
-    let result = match run_static(&registry, &mut vm, "Probe", "doubleStart", "()I").expect("doubleStart 应非抛") {
+    let result = match run_static_in(&mut vm, "Probe", "doubleStart", "()I").expect("doubleStart 应非抛") {
         Value::Int(v) => v,
         other => panic!("doubleStart 须返 int,得 {other:?}"),
     };

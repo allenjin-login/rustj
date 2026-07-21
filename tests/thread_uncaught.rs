@@ -11,44 +11,11 @@
 //! 需 `javac`(PATH)与本机 `java.base.jmod`;缺一则跳过。
 
 use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread};
+use rustj::runtime::{Value, VmThread};
 use rustj::testkit::*;
-
-/// 按名+描述符在类中找方法。
-fn find_method<'a>(
-    cf: &'a rustj::metadata::ClassFile,
-    name: &str,
-    desc: &str,
-) -> &'a rustj::metadata::MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| {
-            let n = matches!(cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-            let d = matches!(cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == desc);
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
-
-fn run_static(
-    registry: &std::sync::Arc<ClassRegistry>,
-    vm: &mut VmThread,
-    class: &str,
-    name: &str,
-    desc: &str,
-) -> Result<Value, rustj::runtime::VmError> {
-    let lc = registry.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
-    let method = find_method(&lc.cf, name, desc);
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    interp.interpret_with(&mut frame, vm)
-}
 
 const SOURCE: &str = r#"
 public class Probe implements Runnable {
@@ -105,7 +72,7 @@ fn uncaught_exception_dispatched() {
     let registry = std::sync::Arc::new(registry);
     let mut vm = VmThread::new(std::sync::Arc::clone(&registry));
 
-    let result = match run_static(&registry, &mut vm, "Probe", "uncaughtDispatched", "()I")
+    let result = match run_static_in(&mut vm, "Probe", "uncaughtDispatched", "()I")
         .expect("uncaughtDispatched 应非抛")
     {
         Value::Int(v) => v,

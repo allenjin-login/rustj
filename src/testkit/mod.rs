@@ -18,7 +18,7 @@ pub use asserts::as_int;
 pub use compile::{compile, compile_and_load, compile_dir, load_dir};
 pub use env::{find_javabase_jmod, javac_available};
 pub use lookup::{find_method, utf8};
-pub use runner::{run, run_err, run_result, run_static_in, run_raw_int, run_raw_value};
+pub use runner::{run, run_err, run_result, run_static_in, run_static_int, run_raw_int, run_raw_value};
 pub use crate::{
     assert_double, assert_float, assert_int, assert_is_thrown, assert_long, assert_throws,
     require_javabase, require_javac,

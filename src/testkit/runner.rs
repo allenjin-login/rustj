@@ -85,6 +85,18 @@ pub fn run_static_in(
     interp.interpret_with(&mut frame, vm)
 }
 
+/// 运行 `class.name()`(无参、返回 int 的静态方法,desc `()I`),**复用调用方 `VmThread`**,
+/// 返回 int。委托 [`run_static_in`] 并解 `Value::Int`。异常以 `VmError` 透传(`?`)。
+///
+/// 提取自 12 个测试文件各自重复的 `run_static_int(vm, class, name)`(它们 Err=异常类名串;
+/// 此处统一 VmError——调研确认无调用点依赖 Err 串形式,`assert_eq!(.., Ok(N))` 经 VmError:PartialEq 可编译)。
+pub fn run_static_int(vm: &mut VmThread, class: &str, name: &str) -> Result<i32, VmError> {
+    match run_static_in(vm, class, name, "()I")? {
+        Value::Int(n) => Ok(n),
+        _other => Err(VmError::BadConstant("run_static_int 期望 int 返回")),
+    }
+}
+
 // ===== 低层(不经 VmThread;纯指令算术)=====
 
 /// 执行静态 int 方法 `name{desc}`,实参按顺序写入 local 0..,返回 int。

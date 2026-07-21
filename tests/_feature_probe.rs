@@ -140,3 +140,12 @@ fn probe_assert_throws_and_is_thrown() {
     let (r, vm) = run_result(&reg, "AssertProbe", "boom", "()I");
     assert_throws!(r, vm, "java/lang/ArithmeticException");
 }
+
+#[test]
+fn probe_run_static_int() {
+    require_javac!();
+    let reg = std::sync::Arc::new(compile_and_load(RUNNER_SRC, "RunnerProbe"));
+    let mut vm = rustj::runtime::VmThread::new(std::sync::Arc::clone(&reg));
+    // seven() 返回 7 (无参 ()I) → run_static_int 解 int。
+    assert_eq!(run_static_int(&mut vm, "RunnerProbe", "seven"), Ok(7));
+}

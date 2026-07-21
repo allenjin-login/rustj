@@ -5,120 +5,17 @@
 //! 这是 Layer 4.2 的"能否跑通真实字节码"判据。需要 PATH 中有 `javac`(无则跳过)。
 //! 层次:`Shape`(id, kind/describe) ← `Square`(side, 重写 kind, area) ← `Rect`(h, 重写 kind/area)。
 
-use std::path::PathBuf;
-use std::process::Command;
+use std::sync::Arc;
 
-use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
-use rustj::metadata::{ClassFile, MethodInfo};
 use rustj::oops::ClassRegistry;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-static COMPILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn compile_dir(source: &str, public_name: &str) -> PathBuf {
-    let seq = COMPILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("rustj-virt-{}-{seq}-{public_name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-
-    let output = Command::new("javac")
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        output.status.success(),
-        "javac 编译失败:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    dir
-}
+use rustj::runtime::Value;
+use rustj::testkit::*;
 
 fn compile_and_load_all(source: &str, public_name: &str) -> ClassRegistry {
-    let dir = compile_dir(source, public_name);
+    let dir = compile_dir(source, public_name, &[]);
     let mut registry = ClassRegistry::new();
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) == Some("class") {
-            let bytes = std::fs::read(&path).unwrap();
-            let cf = parse(&bytes).expect("解析应成功");
-            registry.load(cf).expect("加载应成功");
-        }
-    }
+    load_dir(&mut registry, &dir);
     registry
-}
-
-fn utf8(cf: &ClassFile, index: u16) -> String {
-    match cf.constant_pool.get(index).unwrap() {
-        ConstantPoolEntry::Utf8(s) => s.clone(),
-        e => panic!("expected Utf8 at {index}, got {e:?}"),
-    }
-}
-
-fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| utf8(cf, m.name_index) == name && utf8(cf, m.descriptor_index) == desc)
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
-
-fn run(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
-    run_result(registry, class_name, name, desc).unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
-}
-
-fn run_result(
-    registry: &std::sync::Arc<ClassRegistry>,
-    class_name: &str,
-    name: &str,
-    desc: &str,
-) -> Result<Value, VmError> {
-    let lc = registry
-        .get(class_name)
-        .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
-    let method = find_method(&lc.cf, name, desc);
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = VmThread::new(std::sync::Arc::clone(registry));
-    interp.interpret_with(&mut frame, &mut vm)
-}
-
-/// 执行方法,断言其抛出运行时异常(统一为 `ThrownException`),返回异常对象的类内部名。
-fn run_thrown_class(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> String {
-    let lc = registry
-        .get(class_name)
-        .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
-    let method = find_method(&lc.cf, name, desc);
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = VmThread::new(std::sync::Arc::clone(registry));
-    let err = interp
-        .interpret_with(&mut frame, &mut vm)
-        .expect_err("期望抛出异常");
-    let VmError::ThrownException(exc) = err else {
-        panic!("应抛 ThrownException, 得 {err:?}")
-    };
-    match vm.heap().get(exc) {
-        Some(rustj::oops::Oop::Instance(i)) => i.class_name().to_string(),
-        other => panic!("异常应为实例对象, 得 {other:?}"),
-    }
 }
 
 const SOURCE: &str = r#"
@@ -182,23 +79,17 @@ public class Vm {
 
 #[test]
 fn invokevirtual_is_polymorphic() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let registry = compile_and_load_all(SOURCE, "Vm");
-    let registry = std::sync::Arc::new(registry);
+    let registry = Arc::new(registry);
     assert_eq!(run(&registry, "Vm", "polyKind", "()I"), Value::Int(12));
 }
 
 #[test]
 fn inherited_fields_and_multi_level_override() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let registry = compile_and_load_all(SOURCE, "Vm");
-    let registry = std::sync::Arc::new(registry);
+    let registry = Arc::new(registry);
     assert_eq!(
         run(&registry, "Vm", "inheritedFieldAndOverride", "()I"),
         Value::Int(32)
@@ -211,23 +102,17 @@ fn inherited_fields_and_multi_level_override() {
 
 #[test]
 fn exact_class_dispatch_without_override() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let registry = compile_and_load_all(SOURCE, "Vm");
-    let registry = std::sync::Arc::new(registry);
+    let registry = Arc::new(registry);
     assert_eq!(run(&registry, "Vm", "exactClassNoOverride", "()I"), Value::Int(64));
 }
 
 #[test]
 fn new_subclass_defaults_inherited_fields() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let registry = compile_and_load_all(SOURCE, "Vm");
-    let registry = std::sync::Arc::new(registry);
+    let registry = Arc::new(registry);
     assert_eq!(
         run(&registry, "Vm", "defaultInheritedFields", "()I"),
         Value::Int(0)
@@ -236,14 +121,9 @@ fn new_subclass_defaults_inherited_fields() {
 
 #[test]
 fn invokevirtual_on_null_is_nullpointer() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let registry = compile_and_load_all(SOURCE, "Vm");
-    let registry = std::sync::Arc::new(registry);
-    assert_eq!(
-        run_thrown_class(&registry, "Vm", "nullVirtual", "()I"),
-        "java/lang/NullPointerException"
-    );
+    let registry = Arc::new(registry);
+    let (result, mut vm) = run_result(&registry, "Vm", "nullVirtual", "()I");
+    assert_throws!(result, &mut vm, "java/lang/NullPointerException");
 }

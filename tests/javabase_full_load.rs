@@ -9,38 +9,16 @@
 //! **注意**:本闸门仅度量"加载"(parse+register),不跑 `<clinit>`(初始化)——后者依赖
 //! 各类 native,是后续层的前线。
 
-use std::path::{Path, PathBuf};
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::class_loader::zip::ZipReader;
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(jh) = std::env::var("JAVA_HOME") {
-        let p = Path::new(&jh).join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
+use rustj::testkit::*;
 
 /// **里程碑闸门**:java.base.jmod 全部类条目经 `load_closure` 加载零失败。
 #[test]
 fn javabase_all_classes_load_zero_failures() {
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:本机未找到 java.base.jmod");
-        return;
-    };
+    require_javabase!(jmod);
     let bytes = std::fs::read(&jmod).unwrap();
     let zr = ZipReader::new(&bytes).expect("jmod 解析");
 

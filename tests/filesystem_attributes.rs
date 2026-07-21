@@ -7,34 +7,12 @@
 //! `BA_REGULAR=0x02`(普通文件)/`BA_DIRECTORY=0x04`(目录)/`BA_HIDDEN=0x08`(隐藏);
 //! 不存在(INVALID_FILE_ATTRIBUTES)→ 0。rustj 读 File 实例 `path` 字段后 `std::fs::metadata`。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::initialize_system_class;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
+use rustj::runtime::VmThread;
+use rustj::testkit::*;
 
 const ATTR_PROBE_SOURCE: &str = r#"
 public class AttrProbe {
@@ -54,65 +32,13 @@ public class AttrProbe {
 }
 "#;
 
-fn run_static_int(vm: &mut VmThread, class: &str, name: &str) -> Result<i32, String> {
-    let reg = vm.registry().expect("类注册表");
-    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
-    let method = lc.cf.methods.iter().find(|m| {
-        use rustj::constant_pool::ConstantPoolEntry;
-        let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-        let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()I");
-        n && d
-    }).unwrap_or_else(|| panic!("未找到方法 {class}.{name}()I"));
-    let code = method.code.as_ref().unwrap();
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    match interp.interpret_with(&mut frame, vm) {
-        Ok(Value::Int(n)) => Ok(n),
-        Ok(other) => Err(format!("{class}.{name} 期望 int,得 {other:?}")),
-        Err(VmError::ThrownException(r)) => {
-            let exc_name = match vm.heap().get(r) {
-                Some(rustj::oops::Oop::Instance(i)) => i.class_name().to_string(),
-                o => format!("{o:?}"),
-            };
-            Err(exc_name)
-        }
-        Err(e) => Err(format!("内部错误:{e:?}")),
-    }
-}
-
 /// **集成闸门**(Layer 4.28):`getBooleanAttributes0` 经 `std::fs::metadata` 返属性位掩码 →
 /// `File.isDirectory/isFile/exists` 可用。修前抛 UnsatisfiedLinkError。
 #[test]
 fn get_boolean_attributes0_reports_dir_file_missing() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:无 java.base.jmod");
-        return;
-    };
-    let dir = std::env::temp_dir().join(format!(
-        "rustj-attr-{}-{}",
-        std::process::id(),
-        std::sync::atomic::AtomicU64::new(0)
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("AttrProbe.java"), ATTR_PROBE_SOURCE).unwrap();
-    let out = Command::new("javac")
-        .arg("-d")
-        .arg(&dir)
-        .arg(dir.join("AttrProbe.java"))
-        .output()
-        .expect("javac 失败");
-    assert!(
-        out.status.success(),
-        "javac 失败:{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    require_javac!();
+    require_javabase!(jmod);
+    let dir = compile_dir(ATTR_PROBE_SOURCE, "AttrProbe", &[]);
 
     let mut registry = ClassRegistry::new();
     registry

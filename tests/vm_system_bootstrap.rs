@@ -11,90 +11,12 @@
 //!(`initialize_system_class`):**无任何 Java 辅助类**,直接 `Integer.valueOf(42).intValue()=42`、
 //! `VM.getSavedProperty("x")` 返 null(非异常)、`VM.initLevel()`=1。需 `javac` + 本机 jmod;缺一跳过。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::initialize_system_class;
 use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    std::env::var("JAVA_HOME")
-        .ok()
-        .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
-        .filter(|p| p.exists())
-}
-
-fn compile_dir(source: &str, public_name: &str) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "rustj-boot-{n}-{}-{public_name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-    let out = Command::new("javac")
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        out.status.success(),
-        "javac 失败:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-/// 解释执行一个**无参静态方法**(共用传入 Vm)。抛 Java 异常时把类名带出,便于定位下一缺口。
-fn run_static_int(vm: &mut VmThread, class: &str, name: &str) -> Result<i32, String> {
-    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表"));
-    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
-    let method = lc.cf.methods.iter().find(|m| {
-        use rustj::constant_pool::ConstantPoolEntry;
-        let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-        let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()I");
-        n && d
-    }).unwrap_or_else(|| panic!("未找到方法 {class}.{name}()I"));
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    match interp.interpret_with(&mut frame, vm) {
-        Ok(Value::Int(n)) => Ok(n),
-        Ok(other) => Err(format!("{class}.{name} 期望 int,得 {other:?}")),
-        Err(VmError::ThrownException(r)) => {
-            let exc_name = match vm.heap().get(r) {
-                Some(rustj::oops::Oop::Instance(i)) => i.class_name().to_string(),
-                o => format!("(非 Instance Oop:{o:?})"),
-            };
-            Err(exc_name)
-        }
-        Err(e) => Err(format!("内部错误:{e:?}")),
-    }
-}
+use rustj::testkit::*;
 
 const SOURCE: &str = r#"
 public class Boot {
@@ -124,17 +46,11 @@ public class PropsProbe {
 /// 解锁 `ClassLoaders.<clinit>:85`(`getSystemClassLoader()` 链的下一缺口)。
 #[test]
 fn initialize_system_class_sets_system_props() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:无 java.base.jmod");
-        return;
-    };
+    require_javac!();
+    require_javabase!(jmod);
 
     // 1) javac 编 PropsProbe(无辅助类);载入注册表。
-    let dir = compile_dir(PROPS_PROBE_SOURCE, "PropsProbe");
+    let dir = compile_dir(PROPS_PROBE_SOURCE, "PropsProbe", &[]);
     let mut registry = ClassRegistry::new();
     registry
         .load(rustj::classfile::parse(&std::fs::read(dir.join("PropsProbe.class")).unwrap()).unwrap())
@@ -181,15 +97,9 @@ public class FsProbe {
 /// 属性(`file.separator`/`path.separator`/`user.dir`/…,值来自 OS)→ `WinNTFileSystem.<init>` 不再 NPE。
 #[test]
 fn initialize_system_class_populates_launcher_props() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:无 java.base.jmod");
-        return;
-    };
-    let dir = compile_dir(FS_PROBE_SOURCE, "FsProbe");
+    require_javac!();
+    require_javabase!(jmod);
+    let dir = compile_dir(FS_PROBE_SOURCE, "FsProbe", &[]);
     let mut registry = ClassRegistry::new();
     registry
         .load(rustj::classfile::parse(&std::fs::read(dir.join("FsProbe.class")).unwrap()).unwrap())
@@ -219,17 +129,11 @@ fn initialize_system_class_populates_launcher_props() {
 /// **集成闸门**:VM 原生 Phase 1 引导(`initialize_system_class`)→ 无 Java 辅助类即可跑真 java.base。
 #[test]
 fn initialize_system_class_bootstraps_saved_props() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:无 java.base.jmod");
-        return;
-    };
+    require_javac!();
+    require_javabase!(jmod);
 
     // 1) javac 编 Boot(无 RustjBootstrap 辅助类);载入注册表。
-    let dir = compile_dir(SOURCE, "Boot");
+    let dir = compile_dir(SOURCE, "Boot", &[]);
     let mut registry = ClassRegistry::new();
     registry
         .load(rustj::classfile::parse(&std::fs::read(dir.join("Boot.class")).unwrap()).unwrap())
@@ -255,12 +159,7 @@ fn initialize_system_class_bootstraps_saved_props() {
     // getSavedProperty(String) 返 String;未设键 → null。返 null 表示 savedProps 已就绪(否则抛异常)。
     let reg = vm.registry().expect("类注册表");
     let lc = reg.get("jdk/internal/misc/VM").expect("VM 须已加载");
-    let get_prop = lc.cf.methods.iter().find(|m| {
-        use rustj::constant_pool::ConstantPoolEntry;
-        let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "getSavedProperty");
-        let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "(Ljava/lang/String;)Ljava/lang/String;");
-        n && d
-    }).expect("VM 须有 getSavedProperty");
+    let get_prop = find_method(&lc.cf, "getSavedProperty", "(Ljava/lang/String;)Ljava/lang/String;");
     let code = get_prop.code.as_ref().unwrap();
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     // local[0] = null String 实参(getSavedProperty 在 savedProps 就绪时不抛,直接返 Map.get → null)。

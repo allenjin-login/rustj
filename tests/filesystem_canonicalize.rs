@@ -10,34 +10,12 @@
 //! 修前:canonicalize0 未登记 → `java/io/*` 落 `_ => UnsatisfiedLinkError`(Error,非 IOException,
 //! 不被 `getCanonicalPath` 的 catch 捕获)→ 传播出 `cwdLen()`。修后:返 cwd 规范路径长度(>0)。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::initialize_system_class;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
+use rustj::runtime::{Frame, Interpreter, Value, VmError, VmThread};
+use rustj::testkit::*;
 
 const CANON_PROBE_SOURCE: &str = r#"
 public class CanonProbe {
@@ -55,34 +33,9 @@ public class CanonProbe {
 /// `new File("").getCanonicalPath()` 返当前目录规范路径(长度 > 0)。修前抛 UnsatisfiedLinkError。
 #[test]
 fn canonicalize0_resolves_cwd() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:无 java.base.jmod");
-        return;
-    };
-    let dir = std::env::temp_dir().join(format!(
-        "rustj-canon-{}-{}",
-        std::process::id(),
-        std::sync::atomic::AtomicU64::new(0)
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("CanonProbe.java"), CANON_PROBE_SOURCE).unwrap();
-    let out = Command::new("javac")
-        .arg("-d")
-        .arg(&dir)
-        .arg(dir.join("CanonProbe.java"))
-        .output()
-        .expect("javac 失败");
-    assert!(
-        out.status.success(),
-        "javac 失败:{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    require_javac!();
+    require_javabase!(jmod);
+    let dir = compile_dir(CANON_PROBE_SOURCE, "CanonProbe", &[]);
 
     let mut registry = ClassRegistry::new();
     registry
@@ -110,12 +63,7 @@ fn canonicalize0_resolves_cwd() {
     let lc = reg
         .get("CanonProbe")
         .expect("CanonProbe 须加载");
-    let method = lc.cf.methods.iter().find(|m| {
-        use rustj::constant_pool::ConstantPoolEntry;
-        let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "cwdLen");
-        let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()I");
-        n && d
-    }).expect("须有 cwdLen()I");
+    let method = find_method(&lc.cf, "cwdLen", "()I");
     let code = method.code.as_ref().unwrap();
     let mut frame = Frame::new(code.max_locals, code.max_stack);
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)

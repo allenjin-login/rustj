@@ -8,9 +8,6 @@
 //!
 //! 需 javac + 本机 jmod;缺一跳过。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
@@ -19,29 +16,7 @@ use rustj::runtime::interpreter::launch::{
     bootstrap_java_lang_invoke, bootstrap_module_system, initialize_system_class,
 };
 use rustj::runtime::{VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    std::env::var("JAVA_HOME")
-        .ok()
-        .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
-        .filter(|p| p.exists())
-}
+use rustj::testkit::*;
 
 /// 载入 BMH 物种生成依赖:java.lang.invoke 核心 + Class-File API(java.lang.classfile)+
 /// 常量描述符(java.lang.constant / jdk.internal.constant)。

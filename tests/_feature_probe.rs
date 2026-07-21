@@ -63,3 +63,49 @@ fn probe_load_dir_and_compile_and_load() {
     let reg2 = compile_and_load("public class ProbeCal {}", "ProbeCal");
     assert!(reg2.get("ProbeCal").is_some(), "ProbeCal 应已载入");
 }
+
+// Task 7: 执行探针(runner + lookup + args)
+const RUNNER_SRC: &str = r#"
+public class RunnerProbe {
+    public static int seven() { return 7; }
+    public static int add(int a, int b) { return a + b; }
+    public static int boom() { int d = 0; return 1 / d; }
+    public static double half() { return 2.5; }
+}
+"#;
+
+#[test]
+fn probe_run_and_run_result() {
+    require_javac!();
+    let reg = std::sync::Arc::new(compile_and_load(RUNNER_SRC, "RunnerProbe"));
+    assert!(matches!(run(&reg, "RunnerProbe", "seven", "()I"), rustj::runtime::Value::Int(7)));
+    let (r, _vm) = run_result(&reg, "RunnerProbe", "seven", "()I");
+    assert!(matches!(r, Ok(rustj::runtime::Value::Int(7))));
+}
+
+#[test]
+fn probe_run_err() {
+    require_javac!();
+    let reg = std::sync::Arc::new(compile_and_load(RUNNER_SRC, "RunnerProbe"));
+    let err = run_err(&reg, "RunnerProbe", "boom", "()I");
+    assert!(matches!(err, rustj::runtime::VmError::ThrownException(_)), "期望 ThrownException,得 {err:?}");
+}
+
+#[test]
+fn probe_run_static_in() {
+    require_javac!();
+    let reg = std::sync::Arc::new(compile_and_load(RUNNER_SRC, "RunnerProbe"));
+    let mut vm = rustj::runtime::VmThread::new(std::sync::Arc::clone(&reg));
+    let v = run_static_in(&mut vm, "RunnerProbe", "seven", "()I").unwrap();
+    assert!(matches!(v, rustj::runtime::Value::Int(7)));
+}
+
+#[test]
+fn probe_run_raw() {
+    require_javac!();
+    let reg = std::sync::Arc::new(compile_and_load(RUNNER_SRC, "RunnerProbe"));
+    let lc = reg.get("RunnerProbe").unwrap();
+    assert_eq!(run_raw_int(&lc.cf, "seven", "()I", &[]), 7);
+    assert_eq!(run_raw_int(&lc.cf, "add", "(II)I", &[3, 4]), 7);
+    assert!(matches!(run_raw_value(&lc.cf, "add", "(II)I", &[Arg::I(3), Arg::I(4)]), rustj::runtime::Value::Int(7)));
+}

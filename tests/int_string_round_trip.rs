@@ -2,24 +2,14 @@
 //! `Integer.parseInt`)。验证 4.10w putByte/getByte + DecimalDigits 链端到端。绿则证明 int↔string
 //! 真实可用;红则首个失败即下一层。需 javac + java.base.jmod;缺一则跳过。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
-}
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java").join(ver).join("jmods/java.base.jmod");
-        if p.exists() { return Some(p); }
-    }
-    std::env::var("JAVA_HOME").ok().map(|jh| Path::new(&jh).join("jmods/java.base.jmod")).filter(|p| p.exists())
-}
+use rustj::runtime::{Frame, Interpreter, Value, VmError, VmThread};
+use rustj::testkit::*;
 
 const SOURCE: &str = r#"
 public class IntStr {
@@ -74,7 +64,7 @@ fn run_int(vm: &mut VmThread, name: &str) -> Result<i32, VmError> {
 /// **探测**:int↔string 全往返。
 #[test]
 fn int_string_round_trip() {
-    if !javac_available() { eprintln!("跳过:无 javac"); return; }
+    require_javac!();
     let Some(jmod) = find_javabase_jmod() else { eprintln!("跳过:无 java.base.jmod"); return; };
 
     let dir = compile_dir(SOURCE, "IntStr");

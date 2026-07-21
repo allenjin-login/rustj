@@ -10,33 +10,21 @@
 //! 本闸门用两个**不可交换**运算门钉死槽位顺序:错排即值错,非崩溃。
 //! 需 `javac`(PATH);缺则跳过。
 
-use std::process::Command;
-
 use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
-use rustj::metadata::{ClassFile, MethodInfo};
-use rustj::oops::ClassRegistry;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+use rustj::oops::{ClassRegistry, Oop};
+use rustj::runtime::{Frame, Interpreter, Value, VmError, VmThread};
+use rustj::testkit::*;
 
 /// 编译 SOURCE → 加载 `MultiArg`(仅依赖 java/lang/Object 根类,无需 java.base.jmod)。
 fn compile_and_load() -> ClassRegistry {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let s = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("rustj-ma-{}-{s}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("MultiArg.java");
     std::fs::write(&src, SOURCE).unwrap();
-    let out = Command::new("javac")
+    let out = std::process::Command::new("javac")
         .arg("-d")
         .arg(&dir)
         .arg(&src)
@@ -54,23 +42,6 @@ fn compile_and_load() -> ClassRegistry {
     reg
 }
 
-fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| {
-            let n = matches!(
-                cf.constant_pool.get(m.name_index),
-                Ok(ConstantPoolEntry::Utf8(s)) if s == name
-            );
-            let d = matches!(
-                cf.constant_pool.get(m.descriptor_index),
-                Ok(ConstantPoolEntry::Utf8(s)) if s == desc
-            );
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
-
 /// 运行 `MultiArg.name(desc)`(无参静态方法)。抛 Java 异常时带出类名便于诊断。
 fn run(reg: &std::sync::Arc<ClassRegistry>, name: &str, desc: &str) -> Value {
     let lc = reg.get("MultiArg").unwrap();
@@ -82,8 +53,7 @@ fn run(reg: &std::sync::Arc<ClassRegistry>, name: &str, desc: &str) -> Value {
     let mut vm = VmThread::new(std::sync::Arc::clone(reg));
     match interp.interpret_with(&mut frame, &mut vm) {
         Ok(v) => v,
-        Err(rustj::runtime::VmError::ThrownException(r)) => {
-            use rustj::oops::Oop;
+        Err(VmError::ThrownException(r)) => {
             let cls = match vm.heap().get(r) {
                 Some(Oop::Instance(i)) => i.class_name().to_string(),
                 o => format!("(非 Instance:{o:?})"),
@@ -135,10 +105,7 @@ public class MultiArg {
 
 #[test]
 fn invokespecial_two_args_keep_order() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load();
     let reg = std::sync::Arc::new(reg);
     // 正确 70;若 invokespecial 漏 reverse → ctor 把 b 写入 x、a 写入 y → -70。
@@ -147,10 +114,7 @@ fn invokespecial_two_args_keep_order() {
 
 #[test]
 fn invokevirtual_three_args_keep_order() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load();
     let reg = std::sync::Arc::new(reg);
     // 正确 10305;若 invokevirtual 漏 reverse → 实参倒置入局部变量 → 900。

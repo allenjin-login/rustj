@@ -6,80 +6,9 @@
 //! 源文件含多个顶层类(`Point`/`Counter`/`Holder`/`Objects`),全数加载进同一注册表,
 //! 以覆盖跨类字段访问。
 
-use std::path::PathBuf;
-use std::process::Command;
-
-use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
-use rustj::metadata::{ClassFile, MethodInfo};
-use rustj::oops::ClassRegistry;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// 全局计数器:为每次编译分配唯一临时目录,避免并行测试争用同一目录。
-static COMPILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// 编译源文件到临时目录,返回该目录(含全部生成的 `.class`)。
-fn compile_dir(source: &str, public_name: &str) -> PathBuf {
-    let seq = COMPILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("rustj-objects-{}-{seq}-{public_name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-
-    let output = Command::new("javac")
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        output.status.success(),
-        "javac 编译失败:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    dir
-}
-
-/// 编译 + 加载目录下**所有** `.class` 进同一注册表(覆盖跨类字段访问)。
-fn compile_and_load_all(source: &str, public_name: &str) -> ClassRegistry {
-    let dir = compile_dir(source, public_name);
-    let mut registry = ClassRegistry::new();
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) == Some("class") {
-            let bytes = std::fs::read(&path).unwrap();
-            let cf = parse(&bytes).expect("解析应成功");
-            registry.load(cf).expect("加载应成功");
-        }
-    }
-    registry
-}
-
-fn utf8(cf: &ClassFile, index: u16) -> String {
-    match cf.constant_pool.get(index).unwrap() {
-        ConstantPoolEntry::Utf8(s) => s.clone(),
-        e => panic!("expected Utf8 at {index}, got {e:?}"),
-    }
-}
-
-fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| utf8(cf, m.name_index) == name && utf8(cf, m.descriptor_index) == desc)
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
+use rustj::oops::{ClassRegistry, Oop};
+use rustj::runtime::{Frame, Interpreter, Value, VmError, VmThread};
+use rustj::testkit::*;
 
 /// 实参:按 JVM 调用约定(long/double 占两槽)写入局部变量。
 enum Arg {
@@ -89,17 +18,6 @@ enum Arg {
 
 /// 执行静态方法,返回结果值(失败则 panic)。
 fn run(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str, args: &[Arg]) -> Value {
-    run_result(registry, class_name, name, desc, args).unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
-}
-
-/// 执行静态方法,返回 `Result`(供断言异常路径)。
-fn run_result(
-    registry: &std::sync::Arc<ClassRegistry>,
-    class_name: &str,
-    name: &str,
-    desc: &str,
-    args: &[Arg],
-) -> Result<Value, VmError> {
     let lc = registry
         .get(class_name)
         .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
@@ -123,7 +41,9 @@ fn run_result(
 
     let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
     let mut vm = VmThread::new(std::sync::Arc::clone(registry));
-    interp.interpret_with(&mut frame, &mut vm)
+    interp
+        .interpret_with(&mut frame, &mut vm)
+        .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
 }
 
 /// 执行方法,断言其抛出运行时异常(统一为 `ThrownException`),返回异常对象的类内部名。
@@ -143,7 +63,7 @@ fn run_thrown_class(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, 
         panic!("应抛 ThrownException, 得 {err:?}")
     };
     match vm.heap().get(exc) {
-        Some(rustj::oops::Oop::Instance(i)) => i.class_name().to_string(),
+        Some(Oop::Instance(i)) => i.class_name().to_string(),
         other => panic!("异常应为实例对象, 得 {other:?}"),
     }
 }
@@ -210,11 +130,8 @@ public class Objects {
 
 #[test]
 fn new_and_instance_int_fields_round_trip() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
-    let registry = compile_and_load_all(SOURCE, "Objects");
+    require_javac!();
+    let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "makeAndSum", "(II)I", &[Arg::I(3), Arg::I(4)]),
@@ -228,11 +145,8 @@ fn new_and_instance_int_fields_round_trip() {
 
 #[test]
 fn instance_long_field_round_trip() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
-    let registry = compile_and_load_all(SOURCE, "Objects");
+    require_javac!();
+    let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "tagRoundTrip", "(J)J", &[Arg::L(123_456_789_012)]),
@@ -242,11 +156,8 @@ fn instance_long_field_round_trip() {
 
 #[test]
 fn static_int_field_round_trip_and_accumulate() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
-    let registry = compile_and_load_all(SOURCE, "Objects");
+    require_javac!();
+    let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "staticRoundTrip", "(I)I", &[Arg::I(42)]),
@@ -260,11 +171,8 @@ fn static_int_field_round_trip_and_accumulate() {
 
 #[test]
 fn static_long_field_accumulate() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
-    let registry = compile_and_load_all(SOURCE, "Objects");
+    require_javac!();
+    let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "staticLongAccumulate", "(I)J", &[Arg::I(100)]),
@@ -274,11 +182,8 @@ fn static_long_field_accumulate() {
 
 #[test]
 fn reference_field_cross_object_access() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
-    let registry = compile_and_load_all(SOURCE, "Objects");
+    require_javac!();
+    let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "viaHolder", "(I)I", &[Arg::I(7)]),
@@ -288,11 +193,8 @@ fn reference_field_cross_object_access() {
 
 #[test]
 fn new_object_has_default_zero_fields() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
-    let registry = compile_and_load_all(SOURCE, "Objects");
+    require_javac!();
+    let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run(&registry, "Objects", "defaultField", "()I", &[]),
@@ -302,11 +204,8 @@ fn new_object_has_default_zero_fields() {
 
 #[test]
 fn getfield_on_null_is_nullpointer() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
-    let registry = compile_and_load_all(SOURCE, "Objects");
+    require_javac!();
+    let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
         run_thrown_class(&registry, "Objects", "nullField", "()I"),

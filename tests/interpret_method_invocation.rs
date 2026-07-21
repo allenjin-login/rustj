@@ -5,69 +5,9 @@
 //! 这是 Layer 3.3 的"能否跑通真实字节码"判据(4.1 起改走 `ClassRegistry` + `Vm`)。
 //! 需要 PATH 中有 `javac`(无则跳过)。方法刻意只用数值 + `invokestatic`(同类自调/递归/互调)。
 
-use std::path::PathBuf;
-use std::process::Command;
-
-use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
-use rustj::metadata::{ClassFile, MethodInfo};
 use rustj::oops::ClassRegistry;
 use rustj::runtime::{Frame, Interpreter, Value, VmThread};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn compile(source: &str, class_name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rustj-invoke-{}-{class_name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let src = dir.join(format!("{class_name}.java"));
-    std::fs::write(&src, source).unwrap();
-
-    let output = Command::new("javac")
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        output.status.success(),
-        "javac 编译失败:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    dir.join(format!("{class_name}.class"))
-}
-
-/// 编译 + 解析 + 加载进注册表(字段布局随之解析)。返回注册表。
-fn compile_and_load(source: &str, class_name: &str) -> ClassRegistry {
-    let class_path = compile(source, class_name);
-    let bytes = std::fs::read(&class_path).unwrap();
-    let cf = parse(&bytes).expect("解析应成功");
-    let mut registry = ClassRegistry::new();
-    registry.load(cf).expect("加载应成功");
-    registry
-}
-
-fn utf8(cf: &ClassFile, index: u16) -> String {
-    match cf.constant_pool.get(index).unwrap() {
-        ConstantPoolEntry::Utf8(s) => s.clone(),
-        e => panic!("expected Utf8 at {index}, got {e:?}"),
-    }
-}
-
-fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| utf8(cf, m.name_index) == name && utf8(cf, m.descriptor_index) == desc)
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
+use rustj::testkit::*;
 
 /// 实参:支持 int/long/float/double,按 JVM 调用约定(long/double 占两槽)写入局部变量。
 enum Arg {
@@ -118,10 +58,7 @@ fn run(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, d
 
 #[test]
 fn executes_recursive_int_methods() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
 
     let source = r#"
 public class Recursion {
@@ -170,10 +107,7 @@ public class Recursion {
 
 #[test]
 fn executes_methods_with_mixed_numeric_args() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
 
     let source = r#"
 public class Mixed {

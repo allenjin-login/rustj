@@ -11,89 +11,14 @@
 //!
 //! 需 javac + 本机 jmod;缺一跳过。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::{
     bootstrap_java_lang_invoke, bootstrap_module_system, initialize_system_class,
 };
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    std::env::var("JAVA_HOME")
-        .ok()
-        .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
-        .filter(|p| p.exists())
-}
-
-fn compile_dir(source: &str, public_name: &str) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "rustj-mhlf-{n}-{}-{public_name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-    let out = Command::new("javac")
-        .args(["--add-exports", "java.base/jdk.internal.access=ALL-UNNAMED"])
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        out.status.success(),
-        "javac 失败:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-/// 经解释器在 `Probe` 上跑静态法 `name()I`,返 owned Value。
-fn run_static_int(vm: &mut VmThread, name: &str) -> Result<Value, VmError> {
-    use rustj::constant_pool::ConstantPoolEntry;
-    let reg = vm.registry().expect("类注册表缺失");
-    let lc = reg
-        .get("Probe")
-        .unwrap_or_else(|| panic!("Probe 未加载"));
-    let method = lc
-        .cf
-        .methods
-        .iter()
-        .find(|m| {
-            let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-            let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()I");
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 Probe.{name}()I"));
-    let code = method.code.as_ref().expect("应有 Code");
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    interp.interpret_with(&mut frame, vm)
-}
+use rustj::runtime::{Value, VmError, VmThread};
+use rustj::testkit::*;
 
 const SOURCE: &str = r#"
 import java.lang.invoke.MethodHandle;
@@ -120,7 +45,7 @@ fn setup_vm() -> Option<VmThread> {
         return None;
     }
     let jmod = find_javabase_jmod()?;
-    let dir = compile_dir(SOURCE, "Probe");
+    let dir = compile_dir(SOURCE, "Probe", &["--add-exports", "java.base/jdk.internal.access=ALL-UNNAMED"]);
     let mut registry = ClassRegistry::new();
     registry
         .load(
@@ -160,7 +85,7 @@ fn setup_vm() -> Option<VmThread> {
 #[test]
 fn identity_invoke_exact_via_lambda_form() {
     let Some(mut vm) = setup_vm() else { return };
-    match run_static_int(&mut vm, "identityInvokeExact") {
+    match run_static_in(&mut vm, "Probe", "identityInvokeExact", "()I") {
         Ok(Value::Int(v)) => assert_eq!(v, 42, "identity(42) 经 LF 解释须返 42"),
         Ok(other) => panic!("期望 Int,得 {other:?}"),
         Err(VmError::ThrownException(exc)) => {
@@ -177,7 +102,7 @@ fn identity_invoke_exact_via_lambda_form() {
 #[test]
 fn constant_invoke_exact_via_lambda_form() {
     let Some(mut vm) = setup_vm() else { return };
-    match run_static_int(&mut vm, "constantInvokeExact") {
+    match run_static_in(&mut vm, "Probe", "constantInvokeExact", "()I") {
         Ok(Value::Int(v)) => assert_eq!(v, 42, "constant(42) 经 LF 解释须返 42"),
         Ok(other) => panic!("期望 Int,得 {other:?}"),
         Err(VmError::ThrownException(exc)) => {

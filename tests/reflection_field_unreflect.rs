@@ -10,84 +10,14 @@
 //! `unreflectGetter` 前置:Field 经 `Class.getDeclaredField`(getDeclaredField0 native,4.15a);
 //! MethodHandles.lookup() 经 MethodHandles.<clinit>。需 `javac` + 本机 jmod;缺一跳过。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::{
     bootstrap_java_lang_invoke, bootstrap_module_system, initialize_system_class,
 };
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    std::env::var("JAVA_HOME")
-        .ok()
-        .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
-        .filter(|p| p.exists())
-}
-
-fn compile_dir(source: &str, public_name: &str) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "rustj-fieldunreflect-{n}-{}-{public_name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-    let out = Command::new("javac")
-        .args(["--add-exports", "java.base/jdk.internal.access=ALL-UNNAMED"])
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        out.status.success(),
-        "javac 失败:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-/// 经解释器在 `Probe` 上跑静态法 `name()Ljava/lang/Object;`,返 owned Value。
-fn run_static_object(vm: &mut VmThread, name: &str) -> Result<Value, VmError> {
-    use rustj::constant_pool::ConstantPoolEntry;
-    let reg = vm.registry().expect("类注册表缺失");
-    let lc = reg
-        .get("Probe")
-        .unwrap_or_else(|| panic!("Probe 未加载"));
-    let method = lc.cf.methods.iter().find(|m| {
-        let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-        let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()Ljava/lang/Object;");
-        n && d
-    }).unwrap_or_else(|| panic!("未找到方法 Probe.{name}()Ljava/lang/Object;"));
-    let code = method.code.as_ref().expect("应有 Code");
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    interp.interpret_with(&mut frame, vm)
-}
+use rustj::runtime::{Value, VmError, VmThread};
+use rustj::testkit::*;
 
 const SOURCE: &str = r#"
 import java.lang.reflect.Field;
@@ -118,16 +48,10 @@ public class Probe {
 /// `MethodHandleNatives.resolve/objectFieldOffset` 未绑抛 ULE。修后:返非 null DMH。
 #[test]
 fn unreflect_getter_returns_resolved_dmh() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:无 java.base.jmod");
-        return;
-    };
+    require_javac!();
+    require_javabase!(jmod);
 
-    let dir = compile_dir(SOURCE, "Probe");
+    let dir = compile_dir(SOURCE, "Probe", &["--add-exports", "java.base/jdk.internal.access=ALL-UNNAMED"]);
     let mut registry = ClassRegistry::new();
     registry
         .load(rustj::classfile::parse(&std::fs::read(dir.join("Probe.class")).unwrap()).unwrap())
@@ -159,7 +83,7 @@ fn unreflect_getter_returns_resolved_dmh() {
     bootstrap_java_lang_invoke(&mut vm).expect("Phase 3 lite 应成功");
 
     // 实例字段 getter(Integer.value)。
-    let dmh = match run_static_object(&mut vm, "instanceGetter") {
+    let dmh = match run_static_in(&mut vm, "Probe", "instanceGetter", "()Ljava/lang/Object;") {
         Ok(Value::Reference(r)) => r,
         Ok(other) => panic!("instanceGetter 期望 Reference(DMH),得 {other:?}"),
         Err(VmError::ThrownException(exc)) => {
@@ -171,7 +95,7 @@ fn unreflect_getter_returns_resolved_dmh() {
     assert!(!dmh.is_null(), "实例字段 getter DMH 须非 null");
 
     // 静态字段 getter(Integer.MIN_VALUE)。
-    let sdmh = match run_static_object(&mut vm, "staticGetter") {
+    let sdmh = match run_static_in(&mut vm, "Probe", "staticGetter", "()Ljava/lang/Object;") {
         Ok(Value::Reference(r)) => r,
         Ok(other) => panic!("staticGetter 期望 Reference(DMH),得 {other:?}"),
         Err(VmError::ThrownException(exc)) => {

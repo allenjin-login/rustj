@@ -11,92 +11,14 @@
 //! 包一层(非 DMH)→ 钩子不命中 → 落「MethodHandle 直接调用」墙(顺延候选 g)。故本闸门静态全通、
 //! 实例暂顺延(除非/直到钩子扩展解包 pairwiseConvert 包裹)。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
 use rustj::runtime::interpreter::launch::{
     bootstrap_java_lang_invoke, bootstrap_module_system, initialize_system_class,
 };
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    std::env::var("JAVA_HOME")
-        .ok()
-        .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
-        .filter(|p| p.exists())
-}
-
-fn compile_dir(source: &str, public_name: &str) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "rustj-fieldgetset-{n}-{}-{public_name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-    let out = Command::new("javac")
-        .args(["--add-exports", "java.base/jdk.internal.access=ALL-UNNAMED"])
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        out.status.success(),
-        "javac 失败:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-/// 经解释器在 `Probe` 上跑静态法 `name()I`,失败返异常类名(便于诊断)。
-fn run_static_int(vm: &mut VmThread, name: &str) -> Result<i32, String> {
-    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表缺失"));
-    let lc = reg
-        .get("Probe")
-        .unwrap_or_else(|| panic!("Probe 未加载"));
-    let method = lc.cf.methods.iter().find(|m| {
-        use rustj::constant_pool::ConstantPoolEntry;
-        let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-        let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()I");
-        n && d
-    }).unwrap_or_else(|| panic!("未找到方法 Probe.{name}()I"));
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    match interp.interpret_with(&mut frame, vm) {
-        Ok(Value::Int(n)) => Ok(n),
-        Ok(other) => Err(format!("期望 int,得 {other:?}")),
-        Err(VmError::ThrownException(r)) => {
-            let trace = vm.format_trace(r);
-            Err(trace)
-        }
-        Err(e) => Err(format!("内部错误:{e:?}")),
-    }
-}
+use rustj::runtime::VmThread;
+use rustj::testkit::*;
 
 const SOURCE: &str = r#"
 import java.lang.reflect.Field;
@@ -148,7 +70,7 @@ fn setup_vm() -> Option<VmThread> {
         return None;
     }
     let jmod = find_javabase_jmod()?;
-    let dir = compile_dir(SOURCE, "Probe");
+    let dir = compile_dir(SOURCE, "Probe", &["--add-exports", "java.base/jdk.internal.access=ALL-UNNAMED"]);
     let mut registry = ClassRegistry::new();
     registry
         .load(rustj::classfile::parse(&std::fs::read(dir.join("Probe.class")).unwrap()).unwrap())
@@ -201,17 +123,17 @@ fn setup_vm() -> Option<VmThread> {
 fn field_get_set_static_end_to_end() {
     let Some(mut vm) = setup_vm() else { return };
     assert_eq!(
-        run_static_int(&mut vm, "staticFinalGet"),
+        run_static_int(&mut vm, "Probe", "staticFinalGet"),
         Ok(-2147483648),
         "Field.get(Integer.MIN_VALUE) 须经 accessor→DMH→ConstantValue 返 -2147483648"
     );
     assert_eq!(
-        run_static_int(&mut vm, "staticGet"),
+        run_static_int(&mut vm, "Probe", "staticGet"),
         Ok(123),
         "Field.get(Probe.stat) 须返 123"
     );
     assert_eq!(
-        run_static_int(&mut vm, "staticSet"),
+        run_static_int(&mut vm, "Probe", "staticSet"),
         Ok(999),
         "Field.set(null,999) 写 Probe.stat 后读回 999"
     );
@@ -227,6 +149,6 @@ fn field_get_set_static_end_to_end() {
 #[test]
 fn field_get_set_instance_end_to_end() {
     let Some(mut vm) = setup_vm() else { return };
-    assert_eq!(run_static_int(&mut vm, "instanceGet"), Ok(7), "Field.get(p) 读 Probe.x==7");
-    assert_eq!(run_static_int(&mut vm, "instanceSet"), Ok(99), "Field.set(p, 99) 写后读回 99");
+    assert_eq!(run_static_int(&mut vm, "Probe", "instanceGet"), Ok(7), "Field.get(p) 读 Probe.x==7");
+    assert_eq!(run_static_int(&mut vm, "Probe", "instanceSet"), Ok(99), "Field.set(p, 99) 写后读回 99");
 }

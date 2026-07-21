@@ -149,3 +149,15 @@ fn probe_run_static_int() {
     // seven() 返回 7 (无参 ()I) → run_static_int 解 int。
     assert_eq!(run_static_int(&mut vm, "RunnerProbe", "seven"), Ok(7));
 }
+
+// Task 10b: run_args 探针(带参高层测试)
+#[test]
+fn probe_run_args() {
+    require_javac!();
+    let reg = std::sync::Arc::new(compile_and_load(RUNNER_SRC, "RunnerProbe"));
+    // add(int,int) 带两 int 实参 → 3+4=7。
+    assert_eq!(
+        run_args(&reg, "RunnerProbe", "add", "(II)I", &[Arg::I(3), Arg::I(4)]),
+        rustj::runtime::Value::Int(7)
+    );
+}

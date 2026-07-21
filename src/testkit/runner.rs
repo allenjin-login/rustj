@@ -49,6 +49,34 @@ pub fn run(reg: &Arc<ClassRegistry>, class: &str, name: &str, desc: &str) -> Val
     result.unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
 }
 
+/// 运行 `class.name(desc)`(静态方法),按 `args` 写 locals(经 [`set_args`]),自建 `VmThread`,
+/// 异常 panic,返 `Value`。**带参版** [`run`]:用于需向方法传实参的高层测试(如构造对象后调法、
+/// 多实参 invoke)。提取自 interpret_method_invocation/object_fields 各自重复的 `run(.., args)`。
+pub fn run_args(
+    reg: &Arc<ClassRegistry>,
+    class: &str,
+    name: &str,
+    desc: &str,
+    args: &[Arg],
+) -> Value {
+    let lc = reg
+        .get(class)
+        .unwrap_or_else(|| panic!("类 {class} 未加载"));
+    let m = find_method(&lc.cf, name, desc);
+    let code = m
+        .code
+        .as_ref()
+        .unwrap_or_else(|| panic!("{name} 应有 Code"));
+    let mut frame = Frame::new(code.max_locals, code.max_stack);
+    set_args(&mut frame, args);
+    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table);
+    let mut vm = VmThread::new(Arc::clone(reg));
+    interp
+        .interpret_with(&mut frame, &mut vm)
+        .unwrap_or_else(|e| panic!("{class}.{name}{desc} 执行失败:{e}"))
+}
+
 /// 运行并**期望失败**,返回 `VmError`(如 `ThrownException`)。
 pub fn run_err(reg: &Arc<ClassRegistry>, class: &str, name: &str, desc: &str) -> VmError {
     let (result, _vm) = run_result(reg, class, name, desc);

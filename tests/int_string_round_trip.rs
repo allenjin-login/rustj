@@ -2,13 +2,10 @@
 //! `Integer.parseInt`)。验证 4.10w putByte/getByte + DecimalDigits 链端到端。绿则证明 int↔string
 //! 真实可用;红则首个失败即下一层。需 javac + java.base.jmod;缺一则跳过。
 
-use std::path::PathBuf;
-use std::process::Command;
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, VmError, VmThread};
+use rustj::runtime::VmThread;
 use rustj::testkit::*;
 
 const SOURCE: &str = r#"
@@ -28,46 +25,15 @@ public class IntStr {
 }
 "#;
 
-fn compile_dir(source: &str, public_name: &str) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("rustj-intstr-{n}-{}-{public_name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-    let out = Command::new("javac").arg("-d").arg(&dir).arg(&src).output().expect("javac 执行失败");
-    assert!(out.status.success(), "javac 失败:\n{}", String::from_utf8_lossy(&out.stderr));
-    dir
-}
 
-fn run_int(vm: &mut VmThread, name: &str) -> Result<i32, VmError> {
-    use rustj::constant_pool::ConstantPoolEntry;
-    let reg = vm.registry().expect("类注册表");
-    let lc = reg.get("IntStr").expect("IntStr 须已加载");
-    let method = lc.cf.methods.iter().find(|m| {
-        let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-        let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()I");
-        n && d
-    }).unwrap();
-    let code = method.code.as_ref().unwrap();
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table)
-        .with_identity(lc.name(), name);
-    match interp.interpret_with(&mut frame, vm)? {
-        Value::Int(n) => Ok(n),
-        other => panic!("IntStr.{name} 应返 int,得 {other:?}"),
-    }
-}
 
 /// **探测**:int↔string 全往返。
 #[test]
 fn int_string_round_trip() {
     require_javac!();
-    let Some(jmod) = find_javabase_jmod() else { eprintln!("跳过:无 java.base.jmod"); return; };
+    require_javabase!(jmod);
 
-    let dir = compile_dir(SOURCE, "IntStr");
+    let dir = compile_dir(SOURCE, "IntStr", &[]);
     let mut registry = ClassRegistry::new();
     let cf = rustj::classfile::parse(&std::fs::read(dir.join("IntStr.class")).unwrap()).unwrap();
     registry.load(cf).unwrap();
@@ -80,10 +46,10 @@ fn int_string_round_trip() {
     load_closure(&mut registry, &cp, "java/lang/Integer").unwrap();
 
     let mut vm = VmThread::new(registry);
-    let n = run_int(&mut vm, "sbToStringLen").unwrap_or_else(|e| panic!("sbToStringLen 失败:{e:?}"));
+    let n = run_static_int(&mut vm, "IntStr", "sbToStringLen").unwrap_or_else(|e| panic!("sbToStringLen 失败:{e:?}"));
     assert_eq!(n, 3, "append(123).toString() → \"123\" 长度 3");
-    let v = run_int(&mut vm, "valueOfLen").unwrap_or_else(|e| panic!("valueOfLen 失败:{e:?}"));
+    let v = run_static_int(&mut vm, "IntStr", "valueOfLen").unwrap_or_else(|e| panic!("valueOfLen 失败:{e:?}"));
     assert_eq!(v, 2, "String.valueOf(-5) → \"-5\" 长度 2");
-    let p = run_int(&mut vm, "parse").unwrap_or_else(|e| panic!("parse 失败:{e:?}"));
+    let p = run_static_int(&mut vm, "IntStr", "parse").unwrap_or_else(|e| panic!("parse 失败:{e:?}"));
     assert_eq!(p, 42, "Integer.parseInt(\"42\") → 42");
 }

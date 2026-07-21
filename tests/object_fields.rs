@@ -6,67 +6,10 @@
 //! 源文件含多个顶层类(`Point`/`Counter`/`Holder`/`Objects`),全数加载进同一注册表,
 //! 以覆盖跨类字段访问。
 
-use rustj::oops::{ClassRegistry, Oop};
-use rustj::runtime::{Frame, Interpreter, Value, VmError, VmThread};
+use rustj::runtime::Value;
 use rustj::testkit::*;
 
-/// 实参:按 JVM 调用约定(long/double 占两槽)写入局部变量。
-enum Arg {
-    I(i32),
-    L(i64),
-}
 
-/// 执行静态方法,返回结果值(失败则 panic)。
-fn run(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str, args: &[Arg]) -> Value {
-    let lc = registry
-        .get(class_name)
-        .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
-    let method = find_method(&lc.cf, name, desc);
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let mut slot: u16 = 0;
-    for a in args {
-        match a {
-            Arg::I(v) => {
-                frame.locals.set_int(slot, *v).unwrap();
-                slot += 1;
-            }
-            Arg::L(v) => {
-                frame.locals.set_long(slot, *v).unwrap();
-                slot += 2;
-            }
-        }
-    }
-
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = VmThread::new(std::sync::Arc::clone(registry));
-    interp
-        .interpret_with(&mut frame, &mut vm)
-        .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
-}
-
-/// 执行方法,断言其抛出运行时异常(统一为 `ThrownException`),返回异常对象的类内部名。
-fn run_thrown_class(registry: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> String {
-    let lc = registry
-        .get(class_name)
-        .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
-    let method = find_method(&lc.cf, name, desc);
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool);
-    let mut vm = VmThread::new(std::sync::Arc::clone(registry));
-    let err = interp
-        .interpret_with(&mut frame, &mut vm)
-        .expect_err("期望抛出异常");
-    let VmError::ThrownException(exc) = err else {
-        panic!("应抛 ThrownException, 得 {err:?}")
-    };
-    match vm.heap().get(exc) {
-        Some(Oop::Instance(i)) => i.class_name().to_string(),
-        other => panic!("异常应为实例对象, 得 {other:?}"),
-    }
-}
 
 const SOURCE: &str = r#"
 class Point { int x; int y; long tag; }
@@ -134,11 +77,11 @@ fn new_and_instance_int_fields_round_trip() {
     let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
-        run(&registry, "Objects", "makeAndSum", "(II)I", &[Arg::I(3), Arg::I(4)]),
+        run_args(&registry, "Objects", "makeAndSum", "(II)I", &[Arg::I(3), Arg::I(4)]),
         Value::Int(7)
     );
     assert_eq!(
-        run(&registry, "Objects", "makeAndSum", "(II)I", &[Arg::I(100), Arg::I(-23)]),
+        run_args(&registry, "Objects", "makeAndSum", "(II)I", &[Arg::I(100), Arg::I(-23)]),
         Value::Int(77)
     );
 }
@@ -149,7 +92,7 @@ fn instance_long_field_round_trip() {
     let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
-        run(&registry, "Objects", "tagRoundTrip", "(J)J", &[Arg::L(123_456_789_012)]),
+        run_args(&registry, "Objects", "tagRoundTrip", "(J)J", &[Arg::L(123_456_789_012)]),
         Value::Long(123_456_789_012)
     );
 }
@@ -160,11 +103,11 @@ fn static_int_field_round_trip_and_accumulate() {
     let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
-        run(&registry, "Objects", "staticRoundTrip", "(I)I", &[Arg::I(42)]),
+        run_args(&registry, "Objects", "staticRoundTrip", "(I)I", &[Arg::I(42)]),
         Value::Int(42)
     );
     assert_eq!(
-        run(&registry, "Objects", "staticAccumulate", "(I)I", &[Arg::I(5)]),
+        run_args(&registry, "Objects", "staticAccumulate", "(I)I", &[Arg::I(5)]),
         Value::Int(5)
     );
 }
@@ -175,7 +118,7 @@ fn static_long_field_accumulate() {
     let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
-        run(&registry, "Objects", "staticLongAccumulate", "(I)J", &[Arg::I(100)]),
+        run_args(&registry, "Objects", "staticLongAccumulate", "(I)J", &[Arg::I(100)]),
         Value::Long(100)
     );
 }
@@ -186,7 +129,7 @@ fn reference_field_cross_object_access() {
     let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
-        run(&registry, "Objects", "viaHolder", "(I)I", &[Arg::I(7)]),
+        run_args(&registry, "Objects", "viaHolder", "(I)I", &[Arg::I(7)]),
         Value::Int(7)
     );
 }
@@ -197,7 +140,7 @@ fn new_object_has_default_zero_fields() {
     let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
     assert_eq!(
-        run(&registry, "Objects", "defaultField", "()I", &[]),
+        run_args(&registry, "Objects", "defaultField", "()I", &[]),
         Value::Int(0)
     );
 }
@@ -207,8 +150,6 @@ fn getfield_on_null_is_nullpointer() {
     require_javac!();
     let registry = compile_and_load(SOURCE, "Objects");
     let registry = std::sync::Arc::new(registry);
-    assert_eq!(
-        run_thrown_class(&registry, "Objects", "nullField", "()I"),
-        "java/lang/NullPointerException"
-    );
+    let (r, vm) = run_result(&registry, "Objects", "nullField", "()I");
+    assert_throws!(r, &vm, "java/lang/NullPointerException");
 }

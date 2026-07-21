@@ -71,6 +71,7 @@ public class RunnerProbe {
     public static int add(int a, int b) { return a + b; }
     public static int boom() { int d = 0; return 1 / d; }
     public static double half() { return 2.5; }
+    public static int isNull(RunnerProbe p) { return p == null ? 1 : 0; }
 }
 "#;
 
@@ -160,4 +161,32 @@ fn probe_run_args() {
         run_args(&reg, "RunnerProbe", "add", "(II)I", &[Arg::I(3), Arg::I(4)]),
         rustj::runtime::Value::Int(7)
     );
+}
+
+// Task 10c: run_static_args 探针(复用 vm + Value 实参,含 Reference)
+#[test]
+fn probe_run_static_args() {
+    require_javac!();
+    let reg = std::sync::Arc::new(compile_and_load(RUNNER_SRC, "RunnerProbe"));
+    let mut vm = rustj::runtime::VmThread::new(std::sync::Arc::clone(&reg));
+    // add(int,int) 带两 Value::Int 实参,复用 vm → 3+4=7(验 Value 实参 + 复用 vm 路径)。
+    let v = run_static_args(
+        &mut vm,
+        "RunnerProbe",
+        "add",
+        "(II)I",
+        &[rustj::runtime::Value::Int(3), rustj::runtime::Value::Int(4)],
+    )
+    .unwrap();
+    assert!(matches!(v, rustj::runtime::Value::Int(7)));
+    // isNull(RunnerProbe) 带 Value::Reference(null) 实参 → 1(验 Reference 槽位写入路径)。
+    let n = run_static_args(
+        &mut vm,
+        "RunnerProbe",
+        "isNull",
+        "(LRunnerProbe;)I",
+        &[rustj::runtime::Value::Reference(rustj::runtime::Reference::null())],
+    )
+    .unwrap();
+    assert!(matches!(n, rustj::runtime::Value::Int(1)));
 }

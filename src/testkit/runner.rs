@@ -14,7 +14,7 @@ use crate::metadata::ClassFile;
 use crate::oops::ClassRegistry;
 use crate::runtime::{Frame, Interpreter, Value, VmError, VmThread};
 
-use super::args::{set_args, Arg};
+use super::args::{set_args, set_value_args, Arg};
 use super::lookup::find_method;
 
 // ===== 高层(经 VmThread)=====
@@ -123,6 +123,37 @@ pub fn run_static_int(vm: &mut VmThread, class: &str, name: &str) -> Result<i32,
         Value::Int(n) => Ok(n),
         _other => Err(VmError::BadConstant("run_static_int 期望 int 返回")),
     }
+}
+
+/// 运行 `class.name(desc)`(静态方法),按 `args`(`Value`,含 `Reference`)写 locals,
+/// **复用调用方 `VmThread`**(同 [`run_static_in`] 的堆约束),返 `Result<Value, VmError>`。
+///
+/// 与 [`run_static_in`](无参)对应、与 [`run_args`](自建 vm + `Arg` 原始实参)互补:
+/// 本函数**复用 vm**(跨调用共享堆引用,如多次调法传同一 Thread/对象)+ 接受 **`Value` 实参**
+/// (含对象引用;`Arg` 仅原始类型故不足)。提取自 thread_constructor 的 `run_static(.., &[Value])`。
+pub fn run_static_args(
+    vm: &mut VmThread,
+    class: &str,
+    name: &str,
+    desc: &str,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let reg = vm
+        .registry()
+        .unwrap_or_else(|| panic!("类注册表缺失"));
+    let lc = reg
+        .get(class)
+        .unwrap_or_else(|| panic!("类 {class} 未加载"));
+    let m = find_method(&lc.cf, name, desc);
+    let code = m
+        .code
+        .as_ref()
+        .unwrap_or_else(|| panic!("{name} 应有 Code"));
+    let mut frame = Frame::new(code.max_locals, code.max_stack);
+    set_value_args(&mut frame, args);
+    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
+        .with_exception_table(&code.exception_table);
+    interp.interpret_with(&mut frame, vm)
 }
 
 // ===== 低层(不经 VmThread;纯指令算术)=====

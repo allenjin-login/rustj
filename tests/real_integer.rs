@@ -18,105 +18,12 @@
 //!
 //! 需 `javac`(PATH)与本机 `java.base.jmod`;缺一则跳过。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
+use rustj::constant_pool::ConstantPoolEntry;
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// 找本机首个 `java.base.jmod`;无则 `None`。
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    std::env::var("JAVA_HOME")
-        .ok()
-        .map(|jh| Path::new(&jh).join("jmods/java.base.jmod"))
-        .filter(|p| p.exists())
-}
-
-/// javac 编译单个类到唯一临时目录,返回该目录。`extra` 追加 javac 参数
-/// (如 `--add-exports` 以访问 `jdk.internal.misc`)。
-fn compile_dir(source: &str, public_name: &str, extra: &[&str]) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "rustj-integer-{n}-{}-{public_name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-    let out = Command::new("javac")
-        .args(extra)
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        out.status.success(),
-        "javac 失败:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-/// 解释执行一个**无参静态方法**(用调用者传入的 Vm,**不另建**)。抛 Java 异常时把类名带出,
-/// 便于诊断"下一缺口"。
-///
-/// **关键约束:整段程序须共用同一 Vm。** 静态字段区虽存于共享注册表(跨调用持久),但其值是
-/// **Vm 堆句柄**——堆随 Vm 析构而失效。故引导(写 `VM.savedProps`)与用户代码(读
-/// `VM.savedProps`)必须同一 Vm,否则旧句柄在新堆里指向错对象。这对应真实 JVM 单一全局堆的
-/// 约定:一个 JVM 实例一个堆,贯穿整个程序。
-fn run_static_in(vm: &mut VmThread, class: &str, name: &str, desc: &str) -> Result<Value, String> {
-    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表缺失"));
-    let lc = reg
-        .get(class)
-        .unwrap_or_else(|| panic!("类 {class} 未加载"));
-    let method = lc
-        .cf
-        .methods
-        .iter()
-        .find(|m| {
-            use rustj::constant_pool::ConstantPoolEntry;
-            let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-            let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == desc);
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {class}.{name}{desc}"));
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    match interp.interpret_with(&mut frame, vm) {
-        Ok(v) => Ok(v),
-        Err(VmError::ThrownException(r)) => {
-            let exc_name = match vm.heap().get(r) {
-                Some(rustj::oops::Oop::Instance(i)) => i.class_name().to_string(),
-                o => format!("(非 Instance Oop:{o:?})"),
-            };
-            Err(exc_name)
-        }
-        Err(e) => Err(format!("内部错误:{e:?}")),
-    }
-}
+use rustj::runtime::{Value, VmThread};
+use rustj::testkit::*;
 
 const SOURCE: &str = r#"
 public class IntegerGate {
@@ -144,14 +51,8 @@ class RustjBootstrap {
 /// 端到端。先运行 `RustjBootstrap.init()` 设 `savedProps`,再跑 `IntegerGate.run()` → 42。
 #[test]
 fn real_integer_valueof_intvalue_runs() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:无 java.base.jmod");
-        return;
-    };
+    require_javac!();
+    require_javabase!(jmod);
 
     // 1) javac 编译 IntegerGate + RustjBootstrap;载入注册表。
     let dir = compile_dir(SOURCE, "IntegerGate", &[]);
@@ -190,7 +91,6 @@ fn real_integer_valueof_intvalue_runs() {
         .methods
         .iter()
         .find(|m| {
-            use rustj::constant_pool::ConstantPoolEntry;
             let n = matches!(int_lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "intValue");
             let d = matches!(int_lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()I");
             n && d
@@ -210,32 +110,10 @@ fn real_integer_valueof_intvalue_runs() {
     }
 
     // 5) 跑 IntegerGate.run():Integer.<clinit>→ IntegerCache.<clinit>(VM.getSavedProperty 现可读
-    //    savedProps)→ valueOf(42)(命中缓存)→ intValue()→ 42。
-    let ng_lc = registry.get("IntegerGate").expect("IntegerGate 须已注册");
-    let method = ng_lc
-        .cf
-        .methods
-        .iter()
-        .find(|m| {
-            use rustj::constant_pool::ConstantPoolEntry;
-            let n = matches!(ng_lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "run");
-            let d = matches!(ng_lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == "()I");
-            n && d
-        })
-        .expect("IntegerGate 须有 run()I");
-    let code = method.code.as_ref().expect("run 须有 Code");
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &ng_lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    match interp.interpret_with(&mut frame, &mut vm) {
-        Ok(v) => assert_eq!(v, Value::Int(42), "valueOf(42).intValue() 须为 42"),
-        Err(VmError::ThrownException(r)) => {
-            let cls = match vm.heap().get(r).expect("异常引用须在堆") {
-                rustj::oops::Oop::Instance(i) => i.class_name().to_string(),
-                o => format!("(非 Instance Oop:{o:?})"),
-            };
-            panic!("跑 IntegerGate.run 抛出 Java 异常:{cls}");
-        }
-        Err(e) => panic!("跑 IntegerGate.run 内部错误:{e:?}"),
-    }
+    //    savedProps)→ valueOf(42)(命中缓存)→ intValue()→ 42。复用同一 Vm(同上堆约束)。
+    assert_eq!(
+        run_static_in(&mut vm, "IntegerGate", "run", "()I").unwrap(),
+        Value::Int(42),
+        "valueOf(42).intValue() 须为 42"
+    );
 }

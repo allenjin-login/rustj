@@ -9,93 +9,11 @@
 //!
 //! 需 `javac`(PATH)与本机 `java.base.jmod`;缺一则跳过。
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use rustj::oops::ClassRegistry;
 use rustj::runtime::class_loader::class_path::ClassPath;
 use rustj::runtime::class_loader::loader::load_closure;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    std::env::var("JAVA_HOME")
-        .ok()
-        .map(|jh| Path::new(&jh).join("jmods/java.base.jmod"))
-        .filter(|p| p.exists())
-}
-
-fn compile_dir(source: &str, public_name: &str, extra: &[&str]) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "rustj-hashmap-{n}-{}-{public_name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-    let out = Command::new("javac")
-        .args(extra)
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        out.status.success(),
-        "javac 失败:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-fn run_static_in(vm: &mut VmThread, class: &str, name: &str, desc: &str) -> Result<Value, String> {
-    let reg = vm.registry().unwrap_or_else(|| panic!("类注册表"));
-    let lc = reg.get(class).unwrap_or_else(|| panic!("类 {class} 未加载"));
-    let method = lc
-        .cf
-        .methods
-        .iter()
-        .find(|m| {
-            use rustj::constant_pool::ConstantPoolEntry;
-            let n = matches!(lc.cf.constant_pool.get(m.name_index), Ok(ConstantPoolEntry::Utf8(s)) if s == name);
-            let d = matches!(lc.cf.constant_pool.get(m.descriptor_index), Ok(ConstantPoolEntry::Utf8(s)) if s == desc);
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {class}.{name}{desc}"));
-    let code = method.code.as_ref().unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool)
-        .with_exception_table(&code.exception_table);
-    match interp.interpret_with(&mut frame, vm) {
-        Ok(v) => Ok(v),
-        Err(VmError::ThrownException(r)) => {
-            let exc_name = match vm.heap().get(r) {
-                Some(rustj::oops::Oop::Instance(i)) => i.class_name().to_string(),
-                o => format!("(非 Instance Oop:{o:?})"),
-            };
-            Err(exc_name)
-        }
-        Err(e) => Err(format!("内部错误:{e:?}")),
-    }
-}
+use rustj::runtime::{Value, VmThread};
+use rustj::testkit::*;
 
 const SOURCE: &str = r#"
 import java.util.HashMap;
@@ -140,14 +58,8 @@ class RustjBootstrap {
 /// **集成闸门**:真 `java.util.HashMap` 端到端。
 #[test]
 fn real_hashmap_end_to_end() {
-    if !javac_available() {
-        eprintln!("跳过:无 javac");
-        return;
-    }
-    let Some(jmod) = find_javabase_jmod() else {
-        eprintln!("跳过:无 java.base.jmod");
-        return;
-    };
+    require_javac!();
+    require_javabase!(jmod);
 
     let dir = compile_dir(SOURCE, "HashMapGate", &[]);
     let bdir = compile_dir(

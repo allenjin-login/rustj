@@ -7,25 +7,9 @@
 //!
 //! 需本机 `java.base.jmod`;缺则跳过。
 
-use std::path::PathBuf;
-
 use rustj::classfile::parse;
 use rustj::metadata::ModuleDescriptor;
-
-fn find_javabase_jmod() -> Option<PathBuf> {
-    for ver in ["jdk-25.0.2", "jdk-24", "jdk-21", "jdk-17", "jdk-11.0.30"] {
-        let p = std::path::Path::new("C:/Program Files/Java")
-            .join(ver)
-            .join("jmods/java.base.jmod");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    std::env::var("JAVA_HOME")
-        .ok()
-        .map(|jh| PathBuf::from(jh).join("jmods/java.base.jmod"))
-        .filter(|p| p.exists())
-}
+use rustj::testkit::*;
 
 /// 从 jmod(zip 前 4 字节 magic 前缀;`ZipReader::new` 内部已修正偏移)提取
 /// `classes/module-info.class` 的原始字节。
@@ -37,13 +21,7 @@ fn extract_module_info(jmod: &std::path::Path) -> Option<Vec<u8>> {
 
 #[test]
 fn gate_parse_javabase_module_info() {
-    let jmod = match find_javabase_jmod() {
-        Some(p) => p,
-        None => {
-            eprintln!("跳过:本机未找到 java.base.jmod");
-            return;
-        }
-    };
+    require_javabase!(jmod);
     let bytes = match extract_module_info(&jmod) {
         Some(b) => b,
         None => {

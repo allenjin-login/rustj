@@ -7,17 +7,22 @@
 //! 在 crate 根,`use rustj::testkit::*;` 亦经下方 `pub use` 引入。
 
 pub mod args;
+pub mod asserts;
 pub mod compile;
 pub mod env;
 pub mod lookup;
 pub mod runner;
 
 pub use args::{set_args, Arg};
+pub use asserts::as_int;
 pub use compile::{compile, compile_and_load, compile_dir, load_dir};
 pub use env::{find_javabase_jmod, javac_available};
 pub use lookup::{find_method, utf8};
 pub use runner::{run, run_err, run_result, run_static_in, run_raw_int, run_raw_value};
-pub use crate::{require_javabase, require_javac};
+pub use crate::{
+    assert_double, assert_float, assert_int, assert_is_thrown, assert_long, assert_throws,
+    require_javabase, require_javac,
+};
 
 // Task 1 feature 机制探针(保留,T11 决定去留)。
 pub fn probe() -> bool {

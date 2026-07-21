@@ -109,3 +109,34 @@ fn probe_run_raw() {
     assert_eq!(run_raw_int(&lc.cf, "add", "(II)I", &[3, 4]), 7);
     assert!(matches!(run_raw_value(&lc.cf, "add", "(II)I", &[Arg::I(3), Arg::I(4)]), rustj::runtime::Value::Int(7)));
 }
+
+// Task 8: 断言探针(as_int + assert_int!/assert_long!/assert_double!/assert_float! + assert_throws!/assert_is_thrown!)
+const ASSERT_SRC: &str = r#"
+public class AssertProbe {
+    public static int i() { return 7; }
+    public static long l() { return 3000000000L; }
+    public static double d() { return 2.5; }
+    public static float f() { return 3.0f; }
+    public static int boom() { int z = 0; return 1 / z; }
+}
+"#;
+
+#[test]
+fn probe_as_and_assert_values() {
+    require_javac!();
+    let reg = std::sync::Arc::new(compile_and_load(ASSERT_SRC, "AssertProbe"));
+    assert_eq!(as_int(run(&reg, "AssertProbe", "i", "()I")), 7);
+    assert_int!(run(&reg, "AssertProbe", "i", "()I"), 7);
+    assert_long!(run(&reg, "AssertProbe", "l", "()J"), 3000000000_i64);
+    assert_double!(run(&reg, "AssertProbe", "d", "()D"), 2.5);
+    assert_float!(run(&reg, "AssertProbe", "f", "()F"), 3.0_f32);
+}
+
+#[test]
+fn probe_assert_throws_and_is_thrown() {
+    require_javac!();
+    let reg = std::sync::Arc::new(compile_and_load(ASSERT_SRC, "AssertProbe"));
+    assert_is_thrown!(run_err(&reg, "AssertProbe", "boom", "()I"));
+    let (r, vm) = run_result(&reg, "AssertProbe", "boom", "()I");
+    assert_throws!(r, vm, "java/lang/ArithmeticException");
+}

@@ -7,111 +7,7 @@
 //! (3) `catch` 超类型(`Exception`/`Throwable`)经引导桩层次 `is_instance` 命中子类。
 //! 异常根类(`Throwable`/`Exception`/`NullPointerException` 等)由引导桩(Stage A)装好。
 
-use std::process::Command;
-
-use rustj::classfile::parse;
-use rustj::constant_pool::ConstantPoolEntry;
-use rustj::metadata::{ClassFile, MethodInfo};
-use rustj::oops::ClassRegistry;
-use rustj::runtime::{Frame, Interpreter, Value, VmThread, VmError};
-
-fn javac_available() -> bool {
-    Command::new("javac")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn compile_and_load(source: &str, public_name: &str) -> ClassRegistry {
-    let s = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "rustj-th-{pid}-{s}-{public_name}",
-        pid = std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!("{public_name}.java"));
-    std::fs::write(&src, source).unwrap();
-    let out = Command::new("javac")
-        .arg("-d")
-        .arg(&dir)
-        .arg(&src)
-        .output()
-        .expect("javac 执行失败");
-    assert!(
-        out.status.success(),
-        "javac 编译失败:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let mut reg = ClassRegistry::new();
-    for e in std::fs::read_dir(&dir).unwrap() {
-        let p = e.unwrap().path();
-        if p.extension().and_then(|x| x.to_str()) == Some("class") {
-            reg.load(parse(&std::fs::read(&p).unwrap()).expect("解析应成功"))
-                .expect("加载应成功");
-        }
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    reg
-}
-
-fn find_method<'a>(cf: &'a ClassFile, name: &str, desc: &str) -> &'a MethodInfo {
-    cf.methods
-        .iter()
-        .find(|m| {
-            let n = matches!(
-                cf.constant_pool.get(m.name_index),
-                Ok(ConstantPoolEntry::Utf8(s)) if s == name
-            );
-            let d = matches!(
-                cf.constant_pool.get(m.descriptor_index),
-                Ok(ConstantPoolEntry::Utf8(s)) if s == desc
-            );
-            n && d
-        })
-        .unwrap_or_else(|| panic!("未找到方法 {name}{desc}"))
-}
-
-/// 运行 `class_name.name(desc)`,带其**异常表**(同帧 try/catch 与跨帧捕获的调用者表)。
-fn run(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> Value {
-    let lc = reg
-        .get(class_name)
-        .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
-    let m = find_method(&lc.cf, name, desc);
-    let code = m
-        .code
-        .as_ref()
-        .unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    // 入口解释器必须带上本方法异常表:同帧 athrow 靠它找处理者;跨帧时它作为
-    // 调用者表供 invoke 的 finish_invoke 扫描。
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = VmThread::new(std::sync::Arc::clone(reg));
-    interp
-        .interpret_with(&mut frame, &mut vm)
-        .unwrap_or_else(|e| panic!("{name}{desc} 执行失败:{e}"))
-}
-
-/// 运行并断言失败:捕获未处理的用户异常以 `ThrownException` 上传。
-fn run_err(reg: &std::sync::Arc<ClassRegistry>, class_name: &str, name: &str, desc: &str) -> VmError {
-    let lc = reg
-        .get(class_name)
-        .unwrap_or_else(|| panic!("类 {class_name} 未加载"));
-    let m = find_method(&lc.cf, name, desc);
-    let code = m
-        .code
-        .as_ref()
-        .unwrap_or_else(|| panic!("{name} 应有 Code"));
-    let mut frame = Frame::new(code.max_locals, code.max_stack);
-    let interp = Interpreter::new(&code.code, &lc.cf.constant_pool).with_exception_table(&code.exception_table);
-    let mut vm = VmThread::new(std::sync::Arc::clone(reg));
-    interp
-        .interpret_with(&mut frame, &mut vm)
-        .expect_err("期望失败")
-}
+use rustj::testkit::*;
 
 const SOURCE: &str = r#"
 public class ThrowGate {
@@ -247,23 +143,9 @@ public class ThrowGate {
 }
 "#;
 
-fn as_int(v: Value) -> i32 {
-    match v {
-        Value::Int(x) => x,
-        other => panic!("期望 int,得 {other:?}"),
-    }
-}
-
-fn is_thrown(err: VmError) -> bool {
-    matches!(err, VmError::ThrownException(_))
-}
-
 #[test]
 fn caught_exact_type() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtExact", "()I")), 1);
@@ -271,10 +153,7 @@ fn caught_exact_type() {
 
 #[test]
 fn caught_supertype() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtSuper", "()I")), 2);
@@ -282,10 +161,7 @@ fn caught_supertype() {
 
 #[test]
 fn caught_after_skipping_non_matching() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtAfterSkip", "()I")), 3);
@@ -293,10 +169,7 @@ fn caught_after_skipping_non_matching() {
 
 #[test]
 fn caught_cross_frame_via_invoke() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtCrossFrame", "()I")), 4);
@@ -304,10 +177,7 @@ fn caught_cross_frame_via_invoke() {
 
 #[test]
 fn caught_finally_catch_all() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "caughtFinally", "()I")), 5);
@@ -315,23 +185,17 @@ fn caught_finally_catch_all() {
 
 #[test]
 fn uncaught_propagates_as_thrown_exception() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
-    assert!(is_thrown(run_err(&reg, "ThrowGate", "uncaught", "()I")));
+    assert_is_thrown!(run_err(&reg, "ThrowGate", "uncaught", "()I"));
 }
 
 // ---- JVM 抛出的运行时异常(Stage B 统一)被 javac try/catch 捕获 ----
 
 #[test]
 fn jvm_thrown_npe_is_caught() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchNpe", "()I")), 1);
@@ -339,10 +203,7 @@ fn jvm_thrown_npe_is_caught() {
 
 #[test]
 fn jvm_thrown_arithmetic_is_caught() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchArithmetic", "()I")), 1);
@@ -350,10 +211,7 @@ fn jvm_thrown_arithmetic_is_caught() {
 
 #[test]
 fn jvm_thrown_aioobe_is_caught() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchAioobe", "()I")), 1);
@@ -361,10 +219,7 @@ fn jvm_thrown_aioobe_is_caught() {
 
 #[test]
 fn jvm_thrown_cce_is_caught() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchCce", "()I")), 1);
@@ -372,10 +227,7 @@ fn jvm_thrown_cce_is_caught() {
 
 #[test]
 fn jvm_thrown_npe_caught_by_supertype_exception() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchNpeAsException", "()I")), 1);
@@ -383,10 +235,7 @@ fn jvm_thrown_npe_caught_by_supertype_exception() {
 
 #[test]
 fn jvm_thrown_npe_caught_by_throwable() {
-    if !javac_available() {
-        eprintln!("跳过:未找到 javac");
-        return;
-    }
+    require_javac!();
     let reg = compile_and_load(SOURCE, "ThrowGate");
     let reg = std::sync::Arc::new(reg);
     assert_eq!(as_int(run(&reg, "ThrowGate", "catchNpeAsThrowable", "()I")), 1);
